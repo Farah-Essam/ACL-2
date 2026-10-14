@@ -1,0 +1,27 @@
+csv_line,anomaly_type,anomaly_detail,driverId,driverRef,number,code,forename,surname,dob,nationality,url
+61,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",60,mazzacane,\N,\N,Gastón,Mazzacane,1975-05-08,Argentine,http://en.wikipedia.org/wiki/Gast%C3%B3n_Mazzacane
+75,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",74,tuero,\N,\N,Esteban,Tuero,1978-04-22,Argentine,http://en.wikipedia.org/wiki/Esteban_Tuero
+83,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",82,fontana,\N,\N,Norberto,Fontana,1975-01-20,Argentine,http://en.wikipedia.org/wiki/Norberto_Fontana
+166,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",165,larrauri,\N,\N,Oscar,Larrauri,1954-08-19,Argentine,http://en.wikipedia.org/wiki/Oscar_Larrauri
+200,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",199,reutemann,\N,\N,Carlos,Reutemann,1942-04-12,Argentine,http://en.wikipedia.org/wiki/Carlos_Reutemann
+216,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",215,guerra,\N,\N,Miguel Ángel,Guerra,1953-08-31,Argentine,http://en.wikipedia.org/wiki/Miguel_Angel_Guerra
+218,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",217,zunino,\N,\N,Ricardo,Zunino,1949-04-13,Argentine,http://en.wikipedia.org/wiki/Ricardo_Zunino
+440,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",439,estefano,\N,\N,Nasif,Estéfano,1932-11-18,Argentine,http://en.wikipedia.org/wiki/Nasif_Est%C3%A9fano
+487,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",485,bordeu,\N,\N,Juan Manuel,Bordeu,1934-01-28,Argentine,http://en.wikipedia.org/wiki/Juan_Manuel_Bordeu
+498,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",496,menditeguy,\N,\N,Carlos,Menditeguy,1914-08-10,Argentine,http://en.wikipedia.org/wiki/Carlos_Menditeguy
+499,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",497,larreta,\N,\N,Alberto Rodriguez,Larreta,1934-01-14,Argentine,http://en.wikipedia.org/wiki/Alberto_Rodriguez_Larreta
+500,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",498,gonzalez,\N,\N,José Froilán,González,1922-10-05,Argentine,http://en.wikipedia.org/wiki/Jos%C3%A9_Froil%C3%A1n_Gonz%C3%A1lez
+501,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",499,bonomi,\N,\N,Roberto,Bonomi,1919-09-30,Argentine,http://en.wikipedia.org/wiki/Roberto_Bonomi
+581,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",579,fangio,\N,\N,Juan,Fangio,1911-06-24,Argentine,http://en.wikipedia.org/wiki/Juan_Manuel_Fangio
+645,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",643,mieres,\N,\N,Roberto,Mieres,1924-12-03,Argentine,http://en.wikipedia.org/wiki/Roberto_Mieres
+647,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",645,bucci,\N,\N,Clemar,Bucci,1920-09-04,Argentine,http://en.wikipedia.org/wiki/Clemar_Bucci
+648,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",646,iglesias,\N,\N,Jesús,Iglesias,1922-02-22,Argentine,http://en.wikipedia.org/wiki/Jes%C3%BAs_Iglesias
+651,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",649,birger,\N,\N,Pablo,Birger,1924-01-07,Argentine,http://en.wikipedia.org/wiki/Pablo_Birger
+672,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",670,marimon,\N,\N,Onofre,Marimón,1923-12-19,Argentine,http://en.wikipedia.org/wiki/Onofre_Marim%C3%B3n
+674,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",672,daponte,\N,\N,Jorge,Daponte,1923-06-05,Argentine,http://en.wikipedia.org/wiki/Jorge_Daponte
+697,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",695,galvez,\N,\N,Oscar,Gálvez,1913-08-17,Argentine,http://en.wikipedia.org/wiki/%C3%93scar_Alfredo_G%C3%A1lvez
+700,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",698,cruz,\N,\N,Adolfo,Cruz,1923-06-28,Argentine,http://en.wikipedia.org/wiki/Adolfo_Schewelm_Cruz
+763,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",761,crespo,\N,\N,Alberto,Crespo,1920-01-16,Argentine,http://en.wikipedia.org/wiki/Alberto_Crespo
+794,label synonym,"nationality 'Argentine' has a synonym in ['Argentine', 'Argentinian']",792,pian,\N,\N,Alfredo,Pián,1912-10-21,Argentine,http://en.wikipedia.org/wiki/Alfredo_Pi%C3%A0n
+861,label synonym,"nationality 'Argentinian' has a synonym in ['Argentine', 'Argentinian']",861,colapinto,43,COL,Franco,Colapinto,2003-05-27,Argentinian ,http://en.wikipedia.org/wiki/Franco_Colapinto
+861,padded text,nationality has leading/trailing spaces: 'Argentinian ',861,colapinto,43,COL,Franco,Colapinto,2003-05-27,Argentinian ,http://en.wikipedia.org/wiki/Franco_Colapinto

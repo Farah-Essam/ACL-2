@@ -1,0 +1,23 @@
+table,anomaly_type,rows
+circuits,label synonym,12
+constructors,(none found),0
+constructor_results,unusual status value,17
+constructor_standings,non-numeric positionText,17
+drivers,label synonym,25
+drivers,padded text,1
+driver_standings,non-numeric positionText,1
+races,(none found),0
+results,grid = 0 (no grid slot),1638
+results,duplicate key,176
+results,shared result (different drivers),115
+results,race has > 3 podium rows,76
+results,constructor differs from qualifying,10
+results,missing car number,6
+qualifying,empty-string sentinel,68
+qualifying,constructor differs from results,10
+qualifying,duration outlier,1
+lap_times,duration outlier,626
+pit_stops,duration outlier,517
+sprint_results,grid = 0 (no grid slot),11
+seasons,(none found),0
+status,(none found),0

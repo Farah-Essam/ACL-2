@@ -1,0 +1,13 @@
+csv_line,anomaly_type,anomaly_detail,circuitId,circuitRef,name,location,country,lat,lng,alt,url
+20,label synonym,"country 'USA' has a synonym in ['USA', 'United States']",19,indianapolis,Indianapolis Motor Speedway,Indianapolis,USA,39.795,-86.2347,223,http://en.wikipedia.org/wiki/Indianapolis_Motor_Speedway
+24,label synonym,"country 'United States' has a synonym in ['USA', 'United States']",80,vegas,Las Vegas Strip Street Circuit,Las Vegas,United States,36.1147,-115.173,642,https://en.wikipedia.org/wiki/Las_Vegas_Grand_Prix#Circuit
+34,label synonym,"country 'USA' has a synonym in ['USA', 'United States']",33,phoenix,Phoenix street circuit,Phoenix,USA,33.4479,-112.075,345,http://en.wikipedia.org/wiki/Phoenix_street_circuit
+38,label synonym,"country 'USA' has a synonym in ['USA', 'United States']",37,detroit,Detroit Street Circuit,Detroit,USA,42.3298,-83.0401,177,http://en.wikipedia.org/wiki/Detroit_street_circuit
+43,label synonym,"country 'USA' has a synonym in ['USA', 'United States']",42,dallas,Fair Park,Dallas,USA,32.7774,-96.7587,139,http://en.wikipedia.org/wiki/Fair_Park
+44,label synonym,"country 'USA' has a synonym in ['USA', 'United States']",43,long_beach,Long Beach,California,USA,33.7651,-118.189,12,"http://en.wikipedia.org/wiki/Long_Beach,_California"
+45,label synonym,"country 'USA' has a synonym in ['USA', 'United States']",44,las_vegas,Las Vegas Street Circuit,Nevada,USA,36.1162,-115.174,639,http://en.wikipedia.org/wiki/Las_Vegas_Street_Circuit
+47,label synonym,"country 'USA' has a synonym in ['USA', 'United States']",46,watkins_glen,Watkins Glen,New York State,USA,42.3369,-76.9272,485,http://en.wikipedia.org/wiki/Watkins_Glen_International
+61,label synonym,"country 'USA' has a synonym in ['USA', 'United States']",60,riverside,Riverside International Raceway,California,USA,33.937,-117.273,470,http://en.wikipedia.org/wiki/Riverside_International_Raceway
+64,label synonym,"country 'USA' has a synonym in ['USA', 'United States']",63,sebring,Sebring International Raceway,Florida,USA,27.4547,-81.3483,18,http://en.wikipedia.org/wiki/Sebring_Raceway
+70,label synonym,"country 'USA' has a synonym in ['USA', 'United States']",69,americas,Circuit of the Americas,Austin,USA,30.1328,-97.6411,161,http://en.wikipedia.org/wiki/Circuit_of_the_Americas
+78,label synonym,"country 'USA' has a synonym in ['USA', 'United States']",79,miami,Miami International Autodrome,Miami,USA,25.9581,-80.2389,0,http://en.wikipedia.org/wiki/Miami_International_Autodrome

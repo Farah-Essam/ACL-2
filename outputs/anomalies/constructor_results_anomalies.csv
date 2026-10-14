@@ -1,0 +1,18 @@
+csv_line,anomaly_type,anomaly_detail,constructorResultsId,raceId,constructorId,points,status
+187,unusual status value,status = 'D' (all other rows are \N),186,36,1,14,D
+197,unusual status value,status = 'D' (all other rows are \N),196,37,1,18,D
+209,unusual status value,status = 'D' (all other rows are \N),208,38,1,12,D
+220,unusual status value,status = 'D' (all other rows are \N),219,39,1,14,D
+230,unusual status value,status = 'D' (all other rows are \N),229,40,1,18,D
+241,unusual status value,status = 'D' (all other rows are \N),240,41,1,12,D
+252,unusual status value,status = 'D' (all other rows are \N),251,42,1,18,D
+264,unusual status value,status = 'D' (all other rows are \N),263,43,1,8,D
+275,unusual status value,status = 'D' (all other rows are \N),274,44,1,14,D
+285,unusual status value,status = 'D' (all other rows are \N),284,45,1,10,D
+296,unusual status value,status = 'D' (all other rows are \N),295,46,1,15,D
+308,unusual status value,status = 'D' (all other rows are \N),307,47,1,10,D
+318,unusual status value,status = 'D' (all other rows are \N),317,48,1,18,D
+330,unusual status value,status = 'D' (all other rows are \N),329,49,1,11,D
+340,unusual status value,status = 'D' (all other rows are \N),339,50,1,10,D
+352,unusual status value,status = 'D' (all other rows are \N),351,51,1,8,D
+363,unusual status value,status = 'D' (all other rows are \N),362,52,1,8,D

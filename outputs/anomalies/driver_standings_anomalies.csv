@@ -1,0 +1,2 @@
+csv_line,anomaly_type,anomaly_detail,driverStandingsId,raceId,driverId,points,position,positionText,wins
+4377,non-numeric positionText,positionText = 'D',11031,223,30,78,26,D,5

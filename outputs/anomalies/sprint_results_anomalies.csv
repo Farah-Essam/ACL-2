@@ -1,0 +1,12 @@
+csv_line,anomaly_type,anomaly_detail,resultId,raceId,driverId,constructorId,number,grid,position,positionText,positionOrder,points,laps,time,milliseconds,fastestLap,fastestLapTime,statusId
+81,grid = 0 (no grid slot),pit-lane / no-grid sprint start,80,1077,855,51,24,0,\N,R,20,0,0,\N,\N,\N,\N,31
+139,grid = 0 (no grid slot),pit-lane / no-grid sprint start,138,1101,839,214,31,0,18,18,18,0,17,+1:00.621,2058288,15,1:45.090,1
+141,grid = 0 (no grid slot),pit-lane / no-grid sprint start,140,1101,858,3,2,0,\N,W,20,0,0,\N,\N,\N,\N,3
+161,grid = 0 (no grid slot),pit-lane / no-grid sprint start,160,1107,822,51,77,0,20,20,20,0,24,+1:16.435,1903165,22,1:16.758,1
+298,grid = 0 (no grid slot),pit-lane / no-grid sprint start,297,1131,848,3,23,0,17,17,17,0,23,+44.673,1646062,8,1:10.562,1
+318,grid = 0 (no grid slot),pit-lane / no-grid sprint start,317,1139,848,3,23,0,17,17,17,0,19,+44.564,1910710,17,1:39.198,1
+338,grid = 0 (no grid slot),pit-lane / no-grid sprint start,337,1141,855,15,24,0,17,17,17,0,24,+54.139,1840184,3,1:13.559,1
+339,grid = 0 (no grid slot),pit-lane / no-grid sprint start,338,1141,4,117,14,0,18,18,18,0,24,+56.537,1842582,16,1:13.111,1
+340,grid = 0 (no grid slot),pit-lane / no-grid sprint start,339,1141,840,117,18,0,19,19,19,0,24,+57.983,1844028,3,1:13.560,1
+359,grid = 0 (no grid slot),pit-lane / no-grid sprint start,358,1143,861,3,43,0,18,18,18,0,19,+35.639,1658649,18,1:25.599,1
+361,grid = 0 (no grid slot),pit-lane / no-grid sprint start,360,1143,815,9,11,0,20,20,20,0,19,+1:14.371,1697381,18,1:24.892,1

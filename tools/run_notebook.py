@@ -12,7 +12,8 @@ try:
         if cell["cell_type"] != "code":
             continue
         n += 1
-        msg_id = kc.execute(cell["source"])
+        src = cell["source"]
+        msg_id = kc.execute("".join(src) if isinstance(src, list) else src)
         outputs = []
         while True:
             msg = kc.get_iopub_msg(timeout=900)

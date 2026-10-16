@@ -37,7 +37,7 @@ python tools/run_notebook.py  f1_podium_prediction.ipynb    # execute top to bot
 
 ### Git
 - Work happens on branch **`youssef`** (pushed to `origin`, repo `Farah-Essam/ACL-2`).
-- Commits so far: audit + cleaning + questions (`d7fda8a`), then the cleaning review fixes, Indianapolis 500 removal, cleaned-dataset export and the approved section-4 plan. `Project.code-workspace` is a local editor file and is not committed.
+- Commits so far: audit + cleaning + questions (`d7fda8a`); cleaning review fixes, Indianapolis 500 removal, cleaned-dataset export and the approved section-4 plan (`45d54b0`); section 4 feature selection & engineering (16 Oct 2026). `Project.code-workspace` is a local editor file and is not committed.
 - Commit or push only when the user asks.
 
 ---
@@ -65,10 +65,11 @@ python tools/run_notebook.py  f1_podium_prediction.ipynb    # execute top to bot
 | **1. Data Audit** (1.0–1.13) | done | Read-only audit, anomaly CSV export, raw-file fingerprint check |
 | **2. Data Cleaning** (2.1–2.13) | **closed** (review fixes applied 15 Oct 2026; 2.13 exports the cleaned dataset to `outputs/clean_data/`) | All cleaning applied in memory on copies. 2.9.1 status mapping with row counts; 2.10 re-validation (all 21 FKs); 2.10.2 proof that standings are post-race; 2.11 six before/after plot pairs |
 | **3. Data-Engineering Questions** (3.1–3.3) | done | Q1 (+ two robustness sections), Q2, Q3, each with plots and plain-language answers |
-| 4. Feature engineering | **next** | see section 7 of this README |
-| 5+. Split, models, experiments, XAI, inference | to do | |
+| **4. Feature Selection & Engineering** (4.1–4.6) | done (16 Oct 2026) | split, 22 candidate features with leakage asserts, evidence plots (train only), redundancy, trials on validation, final 18-feature table. Results in README 7.1 |
+| 5. Pre-processing | **next** | decisions pending (README 7.2) |
+| 6+. Models, experiments, XAI, inference | to do | |
 
-Variables available after running sections 1–3:
+Variables available after running sections 1–4:
 - `RAW`: dict of raw tables, **all strings** (`dtype=str`, `keep_default_na=False`).
 - `NAIVE`: default `pd.read_csv` (comparison only).
 - `CLEAN`: cleaned tables (dict).
@@ -76,6 +77,7 @@ Variables available after running sections 1–3:
 - `INDY500_RESULTS`: the 381 cleaned Indianapolis 500 rows set aside in 2.6.1, used only by the Q2 robustness column.
 - `model_base`: 2003+, pre-race columns + target only; the start of the modeling table.
 - Helpers: `is_missing`, `duration_to_seconds`, `log_step`, `STATUS_GROUPS`, `STATUS_CATEGORIES`, `NON_START_STATUSES`, `RULE_B_OVERRIDES`, `UNUSED_TABLES`, `DEFERRED_TABLES`, `NATIONALITY_TO_COUNTRY`, `season_order`, `CLEAN_DATA_DIR`, `load_clean(name)` (reads an exported table back with its exact types).
+- Section 4: `feat` (all 24,645 rows 1950–2024: keys, `year`, `split`, `podium`, every candidate feature), `season_split(year)`, `FEATURE_GROUPS`, `ALL_CANDIDATES`, `FINAL_FEATURES` (the 18 chosen), `TRAIN_A` / `VAL` (model-A training rows, validation rows), `TRIALS` (every trial's scores), `form_features(n)`, `run_trial`, `gain_interval`.
 
 ---
 
@@ -157,9 +159,9 @@ Validation (2.10): 15 automated checks all pass (unique keys, **all 21 FKs** wit
 
 ## 7. Next steps (agreed but not done)
 
-### 7.1 Section 4: Feature selection & engineering. APPROVED PLAN (15 Oct 2026), not started
+### 7.1 Section 4: Feature selection & engineering. Plan approved 15 Oct 2026, BUILT 16 Oct 2026
 
-Nothing is built yet. Start only when the user says so. Notebook layout:
+Notebook layout:
 4.1 split + checks · 4.2 build candidate features (+ leakage asserts) · 4.3 evidence per group · 4.4 redundancy · 4.5 feature trials on validation · 4.6 final feature table.
 
 **Split (by season, never random; a race is never split):**
@@ -193,7 +195,24 @@ Nothing is built yet. Start only when the user says so. Notebook layout:
 
 **Trials (4.5):** logistic regression, **grid only** first, then **add one group at a time**, scored by **validation PR-AUC**. **Every trial in its own cell**, all kept in the notebook. This is feature selection; the full ablation (all models) is in the experiments section.
 
-### 7.2 Later steps
+**Results (built 16 Oct 2026):**
+- Split sizes: model A train 6,381 rows / 300 races, validation 1,199 / 60, test 1,354 / 68 (test podium rate deliberately not inspected). Model B train 22,092 rows / 986 races.
+- Leakage asserts pass: 686 first driver races and 263 first constructor races have no form; 500 random rows match a hand recomputation from earlier races only.
+- **Keep rule (changed with the user, 16 Oct):** keep a group if (1) its 4.3 plots show a clear link with podiums and (2) it doesn't lower validation PR-AUC. My first rule (gain ≥ 0.005) was dropped: validation has only 60 races, PR-AUC moves by about ±0.047 between race resamples, so every decision now also shows a 95% race-resampling interval for the gain.
+- Redundancy: `grid` kept, `quali_pos` dropped (Spearman 0.97; info kept through `grid_minus_quali` + `gap_q1_pct`). Driver: championship **position** kept over points share (−0.95; 0.854 vs 0.852 AUC alone). Constructor: **points share** kept over position (−0.93; 0.856 vs 0.826).
+- Trials (logistic regression, validation PR-AUC): grid 0.6765 → + qualifying 0.7208 (+0.044, interval +0.019 to +0.070, the only gain clearly above noise) → + standings 0.7339 → + form 0.7362 → + context 0.7376 → + home race 0.7343 (**dropped**, interval entirely below 0).
+- Written trials: gap from Q1 0.7208 vs best-of-sessions 0.7093 (2006–2009: pole-sitter not fastest by best time in 9–11 races per season); form window 5 races (0.7362) beats 3 (0.7341) and 10 (0.7301).
+- Fix found while plotting: in round 1 nobody has standings, so "behind everyone ranked" had become position 1 for everyone. Now round-1 rows are set to the back (number of starters), with the `no_standing_yet` flag.
+- **Final 18 features (`FINAL_FEATURES`):** grid `grid`, `pit_lane_start` · qualifying `gap_q1_pct`, `grid_minus_quali`, `reached_q3`, `no_q3_format`, `quali_missing` · standings `drv_champ_pos`, `cons_points_share`, `drv_no_standing_yet`, `cons_no_standing_yet` · form `drv_podium_rate_5`, `drv_avg_finish_5`, `drv_dnf_rate_5`, `cons_podium_rate_5` · context `n_starters`, `drv_experience`, `drv_age`. Model B uses the same 18.
+
+### 7.2 Section 5: Pre-processing. DECISIONS NEEDED
+
+- How to fill missing values: form for a debut (1.1% of train rows), team form for a new team, `reached_q3` before 2006 (16.6% of model-A train), `gap_q1_pct` (1.8%), all qualifying features for model B before 2003. (Section 4 used a provisional median + "was missing" indicator.)
+- Scaling for logistic regression and the NN (standardise? robust scaler?), fitted on training seasons only.
+- Grid shape: the podium rate falls steeply from pole (79%, 62%, 50%, ...). A transform (e.g. log or 1/grid) may help the linear model.
+- The two (or more) pre-processing-order experiments to report.
+
+### 7.3 Later steps
 
 1. **Models:** baseline (e.g. logistic regression on grid) + ≥ 2 statistical models + shallow NN; ROC-AUC, PR-AUC, F1 on val/test; threshold chosen on validation. Podium rate ~14%, so PR-AUC matters.
 2. **Two model versions on the same validation/test seasons:** **A** = 2003+ (full qualifying); **B** = all years 1950–2018 for training, missing qualifying left as NaN + flag. (Replaces the earlier "grid only, all seasons" idea.)

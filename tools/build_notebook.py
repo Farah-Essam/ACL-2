@@ -2472,6 +2472,700 @@ md(r"""
 *Caution:* in 2022–2024 each team has at most ~136 starts, so one extra failure moves the rate by ~0.7 points. The differences between the middle teams are small.
 """)
 
+# ================================================================ 4. FEATURE SELECTION & ENGINEERING
+md(r"""
+# 4. Feature Selection & Engineering
+
+**Goal:** choose the inputs the models will use, with evidence for each choice. Every feature must be **known after qualifying and before the race starts**.
+
+How this section works:
+1. **4.1 Split** the seasons into train / validation / test first, so every later decision can be made **without looking at the test seasons**.
+2. **4.2 Build** the candidate features in five groups (grid, qualifying, standings, form, context), with checks that none of them uses the current race's result.
+3. **4.3 Evidence:** one plot per group, on the **training seasons only**.
+4. **4.4 Redundancy:** features that say almost the same thing; which one we keep and why.
+5. **4.5 Trials:** a simple logistic regression, starting from grid only and adding one group at a time, scored on the **validation** seasons. Every trial is kept.
+6. **4.6 Final feature set**, with the reason each feature is allowed.
+
+The **test seasons (2022–2024) are not used** for any plot, correlation or decision in this section.
+""")
+
+# ---------------------------------------------------------------- 4.1
+md(r"""
+## 4.1 Train / validation / test split
+
+We split **by season**, never randomly:
+
+| Set | Model A (2003+) | Model B (all years) |
+|---|---|---|
+| Train | 2003–2018 | 1950–2018 (missing qualifying kept as NaN + a flag) |
+| Validation | 2019–2021 | 2019–2021 |
+| Test | 2022–2024 | 2022–2024 |
+
+**Why by season:**
+- **No peeking at the future.** Form and standings features look back in time. With a random split, the model would train on 2023 races and be tested on 2015 races, learning from the future.
+- **A race is never split.** In each race exactly 3 drivers get a podium, so the rows of one race depend on each other. Splitting by season keeps every race whole inside one set.
+- **An honest test.** 2022 brought completely new car rules, so 2022–2024 tests whether the model still works after a big change, as it would in real use.
+- **Validation** (2019–2021) is the most recent period before the test. It's used to compare feature sets now, and to tune models and thresholds later.
+""")
+
+code(r'''
+SPLIT_YEARS = {"train": (2003, 2018), "validation": (2019, 2021), "test": (2022, 2024)}
+MODEL_B_TRAIN_START = 1950
+
+
+def season_split(year):
+    year = np.asarray(year, dtype=int)
+    return np.select([year <= 2018, year <= 2021], ["train", "validation"], "test")
+
+
+split_summary = []
+for model, start in [("A (2003+)", MODEL_START_YEAR), ("B (all years)", MODEL_B_TRAIN_START)]:
+    rows = results_full[results_full["year"] >= start]
+    sp = season_split(rows["year"])
+    for s in ["train", "validation", "test"]:
+        part = rows[sp == s]
+        split_summary.append({"model": model, "set": s, "seasons": f"{part['year'].min()}-{part['year'].max()}",
+                              "races": part["raceId"].nunique(), "rows": len(part),
+                              # the test podium rate is deliberately not looked at
+                              "podium rate %": round(100 * part["podium"].mean(), 1) if s != "test" else "not inspected"})
+split_summary = pd.DataFrame(split_summary)
+display(split_summary)
+
+# A race can only belong to one set (a race lies inside one season).
+race_sets = results_full.assign(set=season_split(results_full["year"])).groupby("raceId")["set"].nunique()
+assert (race_sets == 1).all(), "a race is split across sets"
+print("Every race belongs to exactly one set.")
+''')
+
+md(r"""
+**What this shows.** Model A trains on 16 seasons (6,381 rows) and model B on 69 (22,092 rows); both are validated on the same 3 seasons and will be tested on the same 3 seasons, so their scores can be compared directly. The training podium rate of model A is close to the validation rate, so the class balance is similar in both. The test podium rate is intentionally not printed.
+""")
+
+# ---------------------------------------------------------------- 4.2
+md(r"""
+## 4.2 Building the candidate features
+
+All features are computed for **every season** (1950–2024), because model B needs the old seasons and form features need each driver's earlier races. Building a feature for the test seasons is fine: it uses only information from before each race. Choosing features is what must not look at the test seasons.
+
+| Group | Features | Known before the race because... |
+|---|---|---|
+| **Grid** | `grid`, `pit_lane_start` | the starting order is fixed before the start |
+| **Qualifying** | `quali_pos`, `gap_q1_pct` (gap to the fastest Q1 time, %), `grid_minus_quali` (penalty indicator), `reached_q3` (+ `no_q3_format` flag before 2006), `quali_missing` flag | qualifying is finished |
+| **Standings** | driver and constructor championship **position** and **share of the leader's points** (from the **previous** race), `no_standing_yet` flags. No standing yet = behind everyone ranked with 0% of the leader's points; in round 1 nobody is ranked, so everyone is set to the back (number of starters) | the previous race's standings are known; never the current race's (2.10.2) |
+| **Form** | driver podium rate, average finish and retirement rate over the **last 5 races**; constructor podium rate over its last 5 races | computed with `shift(1)`, so only earlier races are used |
+| **Context** | `n_starters`, `drv_experience` (career starts so far), `drv_age`, `home_race` | known from the entry list, the calendar and the driver's birth date |
+""")
+
+code(r'''
+# Race order over all seasons: (year, round) -> 0, 1, 2, ...
+race_seq = CLEAN["races"].sort_values(["year", "round"])[["raceId"]].reset_index(drop=True)
+race_seq["race_seq"] = np.arange(len(race_seq))
+
+feat = (results_full[["raceId", "driverId", "constructorId", "circuitId", "year", "round", "date", "grid",
+                      "pit_lane_start", "podium"]]
+        .merge(race_seq, on="raceId", how="left", validate="many_to_one"))
+feat["split"] = season_split(feat["year"])
+
+# --- Grid ------------------------------------------------------------------------------------------
+feat["grid"] = feat["grid"].astype(float)
+feat["pit_lane_start"] = feat["pit_lane_start"].astype(float)
+
+# --- Qualifying --------------------------------------------------------------------------------------
+q = CLEAN["qualifying"][["raceId", "driverId", "position", "q1_sec", "q2_sec", "q3_sec"]].copy()
+q["gap_q1_pct"] = 100 * (q["q1_sec"] / q.groupby("raceId")["q1_sec"].transform("min") - 1)
+q["best_sec"] = q[["q1_sec", "q2_sec", "q3_sec"]].min(axis=1)          # only for the trial in 4.5
+q["gap_best_pct"] = 100 * (q["best_sec"] / q.groupby("raceId")["best_sec"].transform("min") - 1)
+q["reached_q3"] = q["q3_sec"].notna().astype(float)
+feat = feat.merge(q[["raceId", "driverId", "position", "gap_q1_pct", "gap_best_pct", "reached_q3"]]
+                  .rename(columns={"position": "quali_pos"}), on=["raceId", "driverId"], how="left", validate="one_to_one")
+feat["quali_pos"] = feat["quali_pos"].astype(float)
+feat["quali_missing"] = feat["quali_pos"].isna().astype(float)
+feat["grid_minus_quali"] = feat["grid"] - feat["quali_pos"]
+feat["no_q3_format"] = (feat["year"] < 2006).astype(float)          # the Q1/Q2/Q3 knockout started in 2006
+feat.loc[feat["no_q3_format"] == 1, "reached_q3"] = np.nan          # not defined before 2006
+
+# --- Standings (previous race only) ---------------------------------------------------------------------
+
+
+def prerace_features(table, key, prefix):
+    s = CLEAN[table][["raceId", key, "pre_points", "pre_position"]].copy()
+    leader = s.groupby("raceId")["pre_points"].transform("max")
+    s[f"{prefix}_points_share"] = np.where(leader > 0, s["pre_points"] / leader, 0.0)
+    s[f"{prefix}_champ_pos"] = s["pre_position"].astype(float)
+    out = feat[["raceId", key]].merge(s[["raceId", key, f"{prefix}_points_share", f"{prefix}_champ_pos"]],
+                                      on=["raceId", key], how="left", validate="many_to_one")
+    ranked = s.groupby("raceId")["pre_position"].max().astype(float)
+    out[f"{prefix}_no_standing_yet"] = out[f"{prefix}_champ_pos"].isna().astype(float)
+    # No standing yet: behind everyone ranked, 0% of the leader's points. In round 1 nobody is ranked yet,
+    # so every driver is set to the back (= number of starters), not to position 1.
+    starters = feat.groupby("raceId")["driverId"].transform("size").to_numpy()
+    behind = (out["raceId"].map(ranked) + 1).fillna(pd.Series(starters, index=out.index).astype(float))
+    out[f"{prefix}_champ_pos"] = out[f"{prefix}_champ_pos"].fillna(behind)
+    out[f"{prefix}_points_share"] = out[f"{prefix}_points_share"].fillna(0.0)
+    return out.drop(columns=["raceId", key])
+
+
+feat = pd.concat([feat, prerace_features("driver_standings_prerace", "driverId", "drv"),
+                  prerace_features("constructor_standings_prerace", "constructorId", "cons")], axis=1)
+
+# --- Form (earlier races only) -------------------------------------------------------------------------
+FORM_WINDOW = 5
+hist = (results_full[["raceId", "driverId", "constructorId", "positionOrder", "podium", "status_category"]]
+        .merge(race_seq, on="raceId"))
+hist["finish"] = hist["positionOrder"].astype(float)
+hist["dnf"] = (hist["status_category"] != "finished").astype(float)
+hist["podium_f"] = hist["podium"].astype(float)
+
+
+def past_mean(values, keys, n):
+    """Mean of the previous n values within each key, excluding the current row (shift(1))."""
+    return values.groupby(keys).transform(lambda s: s.shift(1).rolling(n, min_periods=1).mean())
+
+
+def form_features(n):
+    h = hist.sort_values(["driverId", "race_seq"])
+    out = pd.DataFrame({"raceId": h["raceId"], "driverId": h["driverId"]})
+    out[f"drv_podium_rate_{n}"] = past_mean(h["podium_f"], h["driverId"], n)
+    out[f"drv_avg_finish_{n}"] = past_mean(h["finish"], h["driverId"], n)
+    out[f"drv_dnf_rate_{n}"] = past_mean(h["dnf"], h["driverId"], n)
+    # Constructor: share of its car-starts on the podium over its previous n races.
+    team = (hist.groupby(["constructorId", "raceId", "race_seq"])["podium_f"].agg(["sum", "size"])
+            .reset_index().sort_values(["constructorId", "race_seq"]))
+    roll = lambda col: team.groupby("constructorId")[col].transform(lambda s: s.shift(1).rolling(n, min_periods=1).sum())
+    team[f"cons_podium_rate_{n}"] = roll("sum") / roll("size")
+    out = out.merge(feat[["raceId", "driverId", "constructorId"]], on=["raceId", "driverId"])
+    out = out.merge(team[["constructorId", "raceId", f"cons_podium_rate_{n}"]], on=["constructorId", "raceId"], how="left")
+    return out.drop(columns="constructorId")
+
+
+form5 = form_features(FORM_WINDOW)
+feat = feat.merge(form5, on=["raceId", "driverId"], how="left", validate="one_to_one")
+
+# --- Context ----------------------------------------------------------------------------------------------
+feat["n_starters"] = feat.groupby("raceId")["driverId"].transform("size").astype(float)
+exp = hist.sort_values(["driverId", "race_seq"])
+exp["drv_experience"] = exp.groupby("driverId").cumcount().astype(float)          # starts BEFORE this race
+feat = feat.merge(exp[["raceId", "driverId", "drv_experience"]], on=["raceId", "driverId"], validate="one_to_one")
+feat = feat.merge(CLEAN["drivers"][["driverId", "dob", "home_country"]], on="driverId", how="left")
+feat["drv_age"] = (feat["date"] - feat["dob"]).dt.days / 365.25
+feat = feat.merge(CLEAN["circuits"][["circuitId", "country"]], on="circuitId", how="left")
+feat["home_race"] = (feat["home_country"] == feat["country"]).astype(float)
+feat = feat.drop(columns=["dob", "home_country", "country"]).sort_values(["race_seq", "grid"]).reset_index(drop=True)
+
+FEATURE_GROUPS = {
+    "grid": ["grid", "pit_lane_start"],
+    "qualifying": ["quali_pos", "gap_q1_pct", "grid_minus_quali", "reached_q3", "no_q3_format", "quali_missing"],
+    "standings": ["drv_champ_pos", "drv_points_share", "drv_no_standing_yet",
+                  "cons_champ_pos", "cons_points_share", "cons_no_standing_yet"],
+    "form": [f"drv_podium_rate_{FORM_WINDOW}", f"drv_avg_finish_{FORM_WINDOW}", f"drv_dnf_rate_{FORM_WINDOW}",
+             f"cons_podium_rate_{FORM_WINDOW}"],
+    "context": ["n_starters", "drv_experience", "drv_age", "home_race"],
+}
+ALL_CANDIDATES = [c for cols in FEATURE_GROUPS.values() for c in cols]
+print(f"Feature table: {len(feat):,} rows (1950-2024), {len(ALL_CANDIDATES)} candidate features in {len(FEATURE_GROUPS)} groups")
+display(feat[ALL_CANDIDATES].describe().T.round(2))
+''')
+
+md(r"""
+**Leakage checks.** The form features are the riskiest, because they are built from race results. The checks below prove they only use **earlier** races:
+- every driver's (and constructor's) **first** race has no form value;
+- for 500 random rows, the form value is recomputed by hand from the races **strictly before** that race, and it must match exactly;
+- no post-race column (finishing position, points, status, ...) is a candidate feature.
+""")
+
+code(r'''
+form_cols = FEATURE_GROUPS["form"]
+by_driver = feat.sort_values(["driverId", "race_seq"])
+first_drv = by_driver.groupby("driverId").head(1)
+assert first_drv[[c for c in form_cols if c.startswith("drv_")]].isna().all().all(), "a driver's first race has a form value"
+first_team_race = hist.groupby("constructorId")["race_seq"].min()
+first_cons = feat[feat["race_seq"] == feat["constructorId"].map(first_team_race)]
+assert first_cons[f"cons_podium_rate_{FORM_WINDOW}"].isna().all(), "a constructor's first race has a form value"
+
+rng = np.random.default_rng(0)
+sample = feat.iloc[rng.choice(len(feat), 500, replace=False)]
+for r in sample.itertuples():
+    past = hist[(hist["driverId"] == r.driverId) & (hist["race_seq"] < r.race_seq)].sort_values("race_seq").tail(FORM_WINDOW)
+    expected = past["podium_f"].mean() if len(past) else np.nan
+    got = getattr(r, f"drv_podium_rate_{FORM_WINDOW}")
+    assert (np.isnan(expected) and np.isnan(got)) or np.isclose(expected, got), f"form leak at raceId {r.raceId}"
+    team_past = hist[(hist["constructorId"] == r.constructorId) & (hist["race_seq"] < r.race_seq)]
+    last_races = team_past["race_seq"].drop_duplicates().nlargest(FORM_WINDOW)
+    tp = team_past[team_past["race_seq"].isin(last_races)]
+    expected_c = tp["podium_f"].mean() if len(tp) else np.nan
+    got_c = getattr(r, f"cons_podium_rate_{FORM_WINDOW}")
+    assert (np.isnan(expected_c) and np.isnan(got_c)) or np.isclose(expected_c, got_c), f"team form leak at raceId {r.raceId}"
+
+assert not set(ALL_CANDIDATES) & set(POST_RACE), "a post-race column is a candidate feature"
+print(f"Leakage checks passed: {len(first_drv)} first driver races and {len(first_cons)} first constructor races have no form; "
+      f"500 random rows match a hand recomputation from earlier races only; no post-race column is a feature.")
+''')
+
+md(r"""
+**Missing values in the candidates (training seasons of model A).** Some gaps are expected and meaningful: a driver's first race has no form, a new team has no team form, `reached_q3` doesn't exist before 2006. How to fill them is a **pre-processing** decision for the next section; for the trials in 4.5 a simple provisional fill is used (median + a "was missing" indicator).
+""")
+
+code(r'''
+TRAIN_A = feat[(feat["split"] == "train") & (feat["year"] >= MODEL_START_YEAR)]
+VAL = feat[feat["split"] == "validation"]
+missing = pd.DataFrame({"train A missing %": 100 * TRAIN_A[ALL_CANDIDATES].isna().mean(),
+                        "validation missing %": 100 * VAL[ALL_CANDIDATES].isna().mean()}).round(1)
+display(missing[missing.max(axis=1) > 0])
+''')
+
+# ---------------------------------------------------------------- 4.3
+md(r"""
+## 4.3 Evidence for each feature group (training seasons only)
+
+Each plot shows the **podium rate** for groups of training rows (2003–2018) with similar values of a feature. A feature is useful if the podium rate **changes clearly** across its values. The number of rows behind each bar is shown, so small groups aren't over-read.
+""")
+
+code(r'''
+def rate_plot(ax, df, col, bins=None, labels=None, title=None, xlabel=None):
+    x = df[col] if bins is None else pd.cut(df[col], bins=bins, labels=labels, include_lowest=True)
+    t = df.groupby(x, observed=True)["podium"].agg(["mean", "size"])
+    ax.bar(t.index.astype(str), 100 * t["mean"], color="#4C72B0")
+    for i, (m, n) in enumerate(zip(t["mean"], t["size"])):
+        ax.text(i, 100 * m + 1, f"n={n}", ha="center", fontsize=7, rotation=90 if len(t) > 12 else 0)
+    ax.set_title(title or col, fontsize=10)
+    ax.set_xlabel(xlabel or col)
+    ax.set_ylabel("podium %")
+    ax.tick_params(axis="x", labelsize=8)
+
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 3.8))
+rate_plot(axes[0], TRAIN_A[TRAIN_A["grid"] <= 24].assign(grid=lambda d: d["grid"].astype(int)), "grid",
+          title="Grid: podium rate by starting position")
+rate_plot(axes[1], TRAIN_A, "pit_lane_start", title="Pit-lane start (1 = yes)")
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**Grid:** the strongest single signal. From pole, 79% of drivers finish on the podium; from 2nd 62%, 3rd 50%, 5th 22%, and from 8th or lower under 5%. The drop is steep, not a straight line, which matters for the linear model (it can only draw a gradual curve). `pit_lane_start` has only 7 training rows (none on the podium), so it can't show a pattern on its own; it is kept with `grid` because it tells the model that the grid number of those rows is a recode (2.6), not a real slot.
+""")
+
+code(r'''
+fig, axes = plt.subplots(1, 3, figsize=(16, 3.8))
+rate_plot(axes[0], TRAIN_A, "gap_q1_pct", bins=[0, 0.25, 0.5, 1, 1.5, 2, 3, 5, 100],
+          labels=["0-0.25", "0.25-0.5", "0.5-1", "1-1.5", "1.5-2", "2-3", "3-5", "5+"],
+          title="Qualifying: gap to fastest Q1 time", xlabel="gap to fastest Q1 (%)")
+rate_plot(axes[1], TRAIN_A, "grid_minus_quali", bins=[-30, -1, 0, 2, 5, 30],
+          labels=["moved up", "same", "+1-2", "+3-5", "+6 or more"],
+          title="grid - qualifying position (penalties)", xlabel="started this many places behind qualifying")
+rate_plot(axes[2], TRAIN_A[TRAIN_A["no_q3_format"] == 0], "reached_q3", title="Reached Q3 (2006-2018)")
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**Qualifying:** pace matters on top of grid position. Drivers within 0.25% of the fastest Q1 time reach the podium 54% of the time; at 0.5–1% it is 20%, and beyond 2% almost never. Reaching Q3 (2006–2018): 30% vs 1%. The middle plot (`grid − qualifying position`) mixes all grid positions, so on its own it looks odd. The fair comparison is inside the same grid slots (3.1.2): drivers who qualified in the top 3 but started 6th or lower because of a penalty still reached the podium **32%** of the time vs **3.4%** for others starting there. That is the information this feature carries.
+""")
+
+code(r'''
+fig, axes = plt.subplots(1, 3, figsize=(16, 3.8))
+ranked_drv = TRAIN_A[TRAIN_A["drv_no_standing_yet"] == 0]
+ranked_cons = TRAIN_A[TRAIN_A["cons_no_standing_yet"] == 0]
+rate_plot(axes[0], ranked_drv, "drv_champ_pos", bins=[0, 1, 2, 3, 5, 10, 200], labels=["1", "2", "3", "4-5", "6-10", "11+"],
+          title="Driver championship position (before the race)", xlabel="position")
+rate_plot(axes[1], ranked_drv, "drv_points_share",
+          bins=[-0.01, 0, 0.1, 0.25, 0.5, 0.75, 0.99, 1], labels=["0", "0-10%", "10-25%", "25-50%", "50-75%", "75-99%", "leader"],
+          title="Driver: share of the leader's points", xlabel="share")
+rate_plot(axes[2], ranked_cons, "cons_champ_pos", bins=[0, 1, 2, 3, 5, 100], labels=["1", "2", "3", "4-5", "6+"],
+          title="Constructor championship position", xlabel="position")
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**Standings (ranked drivers and teams only):** the championship leader before the race reaches the podium 67% of the time, 2nd 57%, 3rd 42%, and from 11th down about 1%. Share of the leader's points tells the same story (leader 67%, under 10% of the leader's points about 1–2%). Constructor position is even sharper at the bottom (6th or lower: 2%). Rows with no standing yet (round 1, or no points so far) are left out of these plots; the `no_standing_yet` flags carry them.
+""")
+
+code(r'''
+fig, axes = plt.subplots(1, 3, figsize=(16, 3.8))
+rate_plot(axes[0], TRAIN_A, f"drv_podium_rate_{FORM_WINDOW}", bins=[-0.01, 0, 0.2, 0.4, 0.6, 0.8, 1],
+          labels=["0", "1 of 5", "2 of 5", "3 of 5", "4 of 5", "5 of 5"],
+          title="Driver podiums in the last 5 races", xlabel="podium rate (last 5)")
+rate_plot(axes[1], TRAIN_A, f"cons_podium_rate_{FORM_WINDOW}", bins=[-0.01, 0, 0.1, 0.25, 0.5, 0.75, 1],
+          labels=["0", "0-10%", "10-25%", "25-50%", "50-75%", "75%+"],
+          title="Team podium rate, last 5 races", xlabel="share of the team's starts on the podium")
+rate_plot(axes[2], TRAIN_A, f"drv_dnf_rate_{FORM_WINDOW}", bins=[-0.01, 0, 0.2, 0.4, 1],
+          labels=["0", "1 of 5", "2 of 5", "3+ of 5"], title="Driver retirements in the last 5 races", xlabel="DNF rate (last 5)")
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**Form (last 5 races, current race excluded):** a driver with no podium in the last 5 races gets one only 3% of the time; with 2 of 5 it is 39%, with 4–5 of 5 about 65–69%. The team's recent podium rate shows the same climb (2% → 70%). Recent retirements lower the chance too (no DNF in 5 races: 21%; 3 or more: 4%).
+""")
+
+code(r'''
+fig, axes = plt.subplots(1, 4, figsize=(18, 3.8))
+rate_plot(axes[0], TRAIN_A, "n_starters", bins=[0, 18, 20, 22, 24, 30], labels=["<=18", "19-20", "21-22", "23-24", "25+"],
+          title="Number of starters", xlabel="starters in the race")
+rate_plot(axes[1], TRAIN_A, "drv_experience", bins=[-1, 0, 10, 30, 60, 100, 400],
+          labels=["debut", "1-10", "11-30", "31-60", "61-100", "100+"], title="Driver experience", xlabel="career starts before the race")
+rate_plot(axes[2], TRAIN_A, "drv_age", bins=[0, 23, 26, 29, 32, 35, 50], labels=["<23", "23-26", "26-29", "29-32", "32-35", "35+"],
+          title="Driver age", xlabel="age (years)")
+rate_plot(axes[3], TRAIN_A, "home_race", title="Home race (1 = yes)")
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**Context:** weaker effects, but real ones. Fewer starters means a higher podium rate (19% with 18 or fewer cars vs 12.5% with 23–24), simply because 3 podium places are shared by fewer drivers. Experience rises steadily (debut 3%, 100+ starts 23%). Age peaks at 29–32 (21%) and is lower for young (<23: 7%) and older (35+: 12.5%) drivers. **Home race** shows 12.4% vs 14.2%, the same misleading raw gap as Q2 (home drivers start further back). Q2 found no effect once grid is accounted for.
+""")
+
+code(r'''
+# One number per feature: how well does it rank podium finishers on its own? (training seasons of model A)
+from sklearn.metrics import roc_auc_score
+
+single = []
+for group, cols in FEATURE_GROUPS.items():
+    for c in cols:
+        d = TRAIN_A[[c, "podium"]].dropna()
+        if d[c].nunique() < 2:
+            continue
+        auc = roc_auc_score(d["podium"], d[c])
+        single.append({"group": group, "feature": c, "rows": len(d),
+                       "AUC alone": round(max(auc, 1 - auc), 3), "direction": "higher -> more podiums" if auc >= 0.5 else "lower -> more podiums"})
+single = pd.DataFrame(single).sort_values("AUC alone", ascending=False).reset_index(drop=True)
+display(single)
+''')
+
+md(r"""
+**Ranking the features one at a time.** "AUC alone" is the chance that a random podium row has a "better" value than a random non-podium row (0.5 = useless, 1 = perfect). Starting position (grid 0.907, qualifying position 0.909) is the best single signal, followed by team form (0.872), the driver's recent average finish (0.862) and the standings (0.83–0.86). The flags (`no_standing_yet`, `quali_missing`, `no_q3_format`, `pit_lane_start`) score about 0.5 on purpose: they don't predict podiums on their own; they tell the model when another feature is missing or means something different.
+""")
+
+# ---------------------------------------------------------------- 4.4
+md(r"""
+## 4.4 Redundancy: features that say the same thing
+
+Two features that move together carry almost the same information. Keeping both makes a linear model's coefficients unstable and its explanations harder to read, without adding much. We look at the **Spearman correlation** (rank-based, so it works for positions) on the training seasons.
+""")
+
+code(r'''
+corr = TRAIN_A[ALL_CANDIDATES].corr(method="spearman")
+fig, ax = plt.subplots(figsize=(11, 9))
+im = ax.imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1)
+ax.set_xticks(range(len(corr)), corr.columns, rotation=90, fontsize=8)
+ax.set_yticks(range(len(corr)), corr.columns, fontsize=8)
+for i in range(len(corr)):
+    for j in range(len(corr)):
+        if i != j and abs(corr.iloc[i, j]) >= 0.7:
+            ax.text(j, i, f"{corr.iloc[i, j]:.2f}", ha="center", va="center", fontsize=6)
+fig.colorbar(im, ax=ax, shrink=0.8, label="Spearman correlation")
+ax.set_title("Correlation between candidate features (training seasons 2003-2018)")
+plt.tight_layout()
+plt.show()
+
+pairs = (corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1)).stack().rename("spearman").reset_index()
+         .rename(columns={"level_0": "feature 1", "level_1": "feature 2"}))
+display(pairs[pairs["spearman"].abs() >= 0.7].sort_values("spearman", key=abs, ascending=False).round(2).reset_index(drop=True))
+''')
+
+code(r'''
+auc_alone = single.set_index("feature")["AUC alone"]
+DECISIONS = []
+
+# 1. grid vs qualifying position: keep grid (where the car actually starts) and express qualifying as
+#    the difference grid - quali_pos, so the penalty information stays without a near-duplicate column.
+DECISIONS.append(("grid vs quali_pos", "keep grid + grid_minus_quali, drop quali_pos",
+                  f"Spearman {corr.loc['grid', 'quali_pos']:.2f}; AUC alone grid {auc_alone['grid']:.3f} vs quali_pos {auc_alone['quali_pos']:.3f}"))
+
+# 2. championship position vs points share (driver and constructor): keep the one that ranks podiums better on its own.
+STANDINGS_KEEP = []
+for who in ["drv", "cons"]:
+    pos, share = f"{who}_champ_pos", f"{who}_points_share"
+    keep = share if auc_alone[share] >= auc_alone[pos] else pos
+    STANDINGS_KEEP.append(keep)
+    DECISIONS.append((f"{pos} vs {share}", f"keep {keep}",
+                      f"Spearman {corr.loc[pos, share]:.2f}; AUC alone {pos} {auc_alone[pos]:.3f} vs {share} {auc_alone[share]:.3f}"))
+display(pd.DataFrame(DECISIONS, columns=["pair", "decision", "evidence (training seasons)"]))
+
+FEATURE_GROUPS["qualifying"] = ["gap_q1_pct", "grid_minus_quali", "reached_q3", "no_q3_format", "quali_missing"]
+FEATURE_GROUPS["standings"] = STANDINGS_KEEP + ["drv_no_standing_yet", "cons_no_standing_yet"]
+print("Qualifying group now:", FEATURE_GROUPS["qualifying"])
+print("Standings group now: ", FEATURE_GROUPS["standings"])
+''')
+
+md(r"""
+**Decisions.**
+- **grid vs qualifying position (correlation 0.97): keep `grid`**, drop `quali_pos`. Grid is where the car actually starts the race. The qualifying information isn't lost: `grid_minus_quali` keeps the penalty signal and `gap_q1_pct` keeps the pace. (For a linear model, `grid` + `quali_pos` and `grid` + `grid − quali_pos` hold exactly the same information, so this costs nothing and avoids two near-identical columns.)
+- **Driver: championship position vs share of the leader's points (−0.95): keep position.** They rank podiums almost equally well on their own (0.854 vs 0.852); position is the simpler one to explain.
+- **Constructor: position vs points share (−0.93): keep points share**, which ranks podiums clearly better (0.856 vs 0.826). It also shows *how far* ahead the top team is, not just its rank.
+- **Other strongly linked pairs are kept on purpose:** driver vs team standings (0.89–0.93), form vs standings (~0.8), experience vs age (0.81). Each pair measures something different (the driver vs the car; recent races vs the whole season; years of racing vs age). The trials in 4.5 check whether they add anything.
+""")
+
+# ---------------------------------------------------------------- 4.5
+md(r"""
+## 4.5 Feature trials on the validation seasons
+
+**Method:** a **logistic regression** (the simplest reasonable model) is trained on the training seasons (2003–2018) and scored on the validation seasons (2019–2021).
+- We start with **grid only**, then add **one group at a time**.
+- **Score: PR-AUC** (average precision). Podiums are only ~15% of rows, and PR-AUC focuses on how well the true podium finishers are ranked at the top. ROC-AUC is shown too.
+- **Keep rule:** a group is kept if **(1)** its plots in 4.3 show a clear link with podiums, and **(2)** adding it **does not lower** validation PR-AUC.
+- **Noise:** the validation period has only 60 races, so the score moves by luck. For every decision we also show a **95% interval for the gain**, from resampling the validation races 500 times. An interval that includes 0 means "too small to call either way". The groups then stand on their 4.3 evidence, and the ablation with stronger models later measures their real contribution.
+- **Provisional pre-processing** (the final choice comes in the next section): missing values are filled with the training median plus a "was missing" indicator, then features are standardised. Both are fitted on the training seasons only.
+
+Every trial has its own cell and is collected in `TRIALS`.
+""")
+
+code(r'''
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+TRIALS = []
+PREDS = {}                                   # validation predictions of each trial (for the gain intervals)
+val_y = VAL["podium"].to_numpy()
+val_race = VAL["raceId"].to_numpy()
+rng_boot = np.random.default_rng(42)
+BOOT_RACES = [rng_boot.choice(np.unique(val_race), len(np.unique(val_race))) for _ in range(500)]
+BOOT_IDX = [np.concatenate([np.flatnonzero(val_race == r) for r in races]) for races in BOOT_RACES]
+
+
+def run_trial(name, cols, note=""):
+    tr, va = TRAIN_A, VAL
+    model = make_pipeline(SimpleImputer(strategy="median", add_indicator=True), StandardScaler(),
+                          LogisticRegression(max_iter=5000))
+    model.fit(tr[cols].astype(float), tr["podium"])
+    p_tr = model.predict_proba(tr[cols].astype(float))[:, 1]
+    p_va = model.predict_proba(va[cols].astype(float))[:, 1]
+    PREDS[name] = p_va
+    res = {"trial": name, "n features": len(cols),
+           "train PR-AUC": round(average_precision_score(tr["podium"], p_tr), 4),
+           "val PR-AUC": round(average_precision_score(va["podium"], p_va), 4),
+           "val ROC-AUC": round(roc_auc_score(va["podium"], p_va), 4), "note": note}
+    TRIALS.append(res)
+    display(pd.DataFrame([res]))
+    return name
+
+
+def gain_interval(before, after):
+    """95% interval of the PR-AUC gain, resampling the validation races (same resamples for both)."""
+    pa, pb = PREDS[before], PREDS[after]
+    gains = [average_precision_score(val_y[i], pb[i]) - average_precision_score(val_y[i], pa[i]) for i in BOOT_IDX]
+    return np.percentile(gains, [2.5, 97.5])
+
+
+def decide(group, before, after):
+    s_before = next(t["val PR-AUC"] for t in TRIALS if t["trial"] == before)
+    s_after = next(t["val PR-AUC"] for t in TRIALS if t["trial"] == after)
+    gain = s_after - s_before
+    lo, hi = gain_interval(before, after)
+    kept = gain >= 0
+    print(f"{group}: validation PR-AUC {s_before:.4f} -> {s_after:.4f}, gain {gain:+.4f} "
+          f"(95% interval {lo:+.4f} to {hi:+.4f}) -> {'KEEP' if kept else 'DROP'}")
+    TRIALS[-1].update({"gain": round(gain, 4), "gain 95% interval": f"[{lo:+.3f}, {hi:+.3f}]",
+                       "note": "keep" if kept else "drop"})
+    return kept
+
+
+print(f"Training rows: {len(TRAIN_A):,} | validation rows: {len(VAL):,} ({int(VAL['podium'].sum())} podiums)")
+''')
+
+md(r"""
+### Trial 1: grid only (baseline)
+""")
+
+code(r'''
+current = list(FEATURE_GROUPS["grid"])
+best = run_trial("1. grid only", current, "baseline")
+''')
+
+md(r"""
+### Trial 2: + qualifying
+""")
+
+code(r'''
+s = run_trial("2. + qualifying (gap from Q1)", current + FEATURE_GROUPS["qualifying"])
+if decide("qualifying", best, s):
+    current, best = current + FEATURE_GROUPS["qualifying"], s
+''')
+
+md(r"""
+### Trial 2b: gap to pole from Q1 only vs from the best session (written trial)
+
+The gap to pole could also use each driver's **best time of Q1/Q2/Q3**. We use **Q1 only**, because:
+- **2006–2009:** Q3 was run with the **race fuel load** on board, so Q3 times were slower than Q2 times and depended on each team's fuel strategy, not just pace.
+- **Early 2005** (first 6 races): two sessions whose times were **added together**; the best single session isn't what decided the grid.
+- **Everyone runs Q1**, under the same conditions, so Q1 times are comparable across the whole field.
+
+The table shows how often the pole-sitter was **not** the fastest driver by best-of-sessions time, per season (training seasons only), followed by the trial.
+""")
+
+code(r'''
+qq = CLEAN["qualifying"].merge(CLEAN["races"][["raceId", "year"]], on="raceId")
+qq = qq[qq["year"].between(2003, 2018)]
+qq["best_sec"] = qq[["q1_sec", "q2_sec", "q3_sec"]].min(axis=1)
+pole = qq[qq["position"] == 1].set_index("raceId")["best_sec"]
+fastest = qq.groupby("raceId")["best_sec"].min()
+not_fastest = (pole > fastest.loc[pole.index]).groupby(qq.drop_duplicates("raceId").set_index("raceId").loc[pole.index, "year"]).sum()
+display(not_fastest.rename("races where the pole-sitter isn't fastest by best-of-sessions").to_frame().T)
+
+swap = [c if c != "gap_q1_pct" else "gap_best_pct" for c in current] if "gap_q1_pct" in current \
+    else current + [c if c != "gap_q1_pct" else "gap_best_pct" for c in FEATURE_GROUPS["qualifying"]]
+s_best = run_trial("2b. qualifying with gap from best-of-Q1/Q2/Q3", swap, "written trial: alternative gap definition")
+s_q1 = run_trial("2b. qualifying with gap from Q1 (same set)", [c for c in swap if c != "gap_best_pct"] + ["gap_q1_pct"],
+                 "written trial: chosen gap definition")
+score_of = {t["trial"]: t["val PR-AUC"] for t in TRIALS}
+print(f"Gap from Q1: {score_of[s_q1]:.4f} | gap from best session: {score_of[s_best]:.4f}")
+lo, hi = gain_interval(s_best, s_q1)
+print(f"Q1 minus best-of-sessions: {score_of[s_q1] - score_of[s_best]:+.4f} (95% interval {lo:+.4f} to {hi:+.4f})")
+''')
+
+md(r"""
+**Result of trial 2b:** the gap from **Q1** scores better than the gap from the best session (0.7208 vs 0.7093). The difference is within the noise of 60 races (95% interval −0.008 to +0.033), so the decision rests mainly on the reasoning above, which the data confirms: in 2006–2009 the pole-sitter was **not** the fastest driver by best-of-sessions time in 9–11 races every season (race-fuel Q3), against 0–3 races in other seasons. **We keep the Q1 gap.**
+""")
+
+md(r"""
+### Trial 3: + standings
+""")
+
+code(r'''
+s = run_trial("3. + standings", current + FEATURE_GROUPS["standings"])
+if decide("standings", best, s):
+    current, best = current + FEATURE_GROUPS["standings"], s
+''')
+
+md(r"""
+### Trial 4: + form (last 5 races)
+""")
+
+code(r'''
+s = run_trial(f"4. + form (last {FORM_WINDOW})", current + FEATURE_GROUPS["form"])
+if decide("form", best, s):
+    current, best = current + FEATURE_GROUPS["form"], s
+''')
+
+md(r"""
+### Trial 4b: how many past races for form? (3 vs 5 vs 10)
+""")
+
+code(r'''
+base_wo_form = [c for c in current if c not in FEATURE_GROUPS["form"]]
+window_scores = {}
+for n in [3, 5, 10]:
+    f_n = form_features(n)
+    cols_n = [c for c in f_n.columns if c not in ("raceId", "driverId")]
+    tmp = feat.drop(columns=[c for c in feat.columns if c in cols_n]).merge(f_n, on=["raceId", "driverId"], how="left")
+    TRAIN_A_n = tmp[(tmp["split"] == "train") & (tmp["year"] >= MODEL_START_YEAR)]
+    VAL_n = tmp[tmp["split"] == "validation"]
+    model = make_pipeline(SimpleImputer(strategy="median", add_indicator=True), StandardScaler(), LogisticRegression(max_iter=5000))
+    model.fit(TRAIN_A_n[base_wo_form + cols_n].astype(float), TRAIN_A_n["podium"])
+    window_scores[n] = average_precision_score(VAL_n["podium"], model.predict_proba(VAL_n[base_wo_form + cols_n].astype(float))[:, 1])
+    TRIALS.append({"trial": f"4b. form window = last {n} races", "n features": len(base_wo_form + cols_n),
+                   "val PR-AUC": round(window_scores[n], 4), "note": "written trial: form window"})
+display(pd.Series(window_scores, name="validation PR-AUC").rename_axis("form window (races)").round(4).to_frame().T)
+''')
+
+md(r"""
+**Result of trial 4b:** the last **5** races works best (0.7362), ahead of 3 races (0.7341) and 10 races (0.7301). Three races react too much to one lucky or unlucky weekend; ten races still remember the car the team had months ago. **We keep 5.**
+""")
+
+md(r"""
+### Trial 5: + context (starters, experience, age)
+""")
+
+code(r'''
+context_core = ["n_starters", "drv_experience", "drv_age"]
+s = run_trial("5. + context", current + context_core)
+if decide("context", best, s):
+    current, best = current + context_core, s
+''')
+
+md(r"""
+### Trial 6: + home race
+
+Q2 found no home advantage once starting position is accounted for, so we expect no gain. This trial checks it on the validation seasons.
+""")
+
+code(r'''
+s = run_trial("6. + home race", current + ["home_race"])
+if decide("home race", best, s):
+    current, best = current + ["home_race"], s
+''')
+
+md(r"""
+### Summary of all trials
+""")
+
+code(r'''
+trials_df = pd.DataFrame(TRIALS)
+display(trials_df)
+
+main = trials_df[trials_df["trial"].str.match(r"^\d\. ")]
+fig, ax = plt.subplots(figsize=(10, 3.8))
+colors = ["#55A868" if ("keep" in str(n) or n == "baseline") else "#C44E52" for n in main["note"]]
+ax.barh(main["trial"], main["val PR-AUC"], color=colors)
+for y, v in enumerate(main["val PR-AUC"]):
+    ax.text(v + 0.003, y, f"{v:.3f}", va="center", fontsize=8)
+ax.invert_yaxis()
+ax.set_xlim(0, max(main["val PR-AUC"]) * 1.15)
+ax.set_xlabel("validation PR-AUC (2019-2021)")
+ax.set_title("Adding one feature group at a time (green = kept, red = dropped)")
+plt.tight_layout()
+plt.show()
+print("Final feature set:", current)
+''')
+
+md(r"""
+**What the trials show.**
+- **Grid alone** already gives validation PR-AUC **0.676**.
+- **Qualifying** adds the most (+0.044 to **0.721**). It is the only gain clearly larger than the noise (95% interval +0.019 to +0.070).
+- **Standings** (+0.013), **form** (+0.002) and **context** (+0.001) each raise the score a little. Their intervals include 0, so for this linear model they overlap with what grid and qualifying already say. All three are **kept**: their 4.3 plots show a clear link with podiums and they don't lower the score. Form is also required by the brief, and the ablation with stronger models (section 5) will measure each group's real contribution.
+- **Home race** lowers the score (−0.003, interval entirely below 0) and is **dropped**, as Q2 predicted.
+- The model doesn't overfit: training PR-AUC (0.69) is close to validation (0.74). Validation being slightly higher is most likely because a few teams dominated 2019–2021, which makes podiums easier to predict.
+- **Final set: 18 features** in four groups (grid, qualifying, standings, form) plus context. Final validation PR-AUC **0.738** for this simple model, up from 0.676 with grid only.
+""")
+
+# ---------------------------------------------------------------- 4.6
+md(r"""
+## 4.6 Final feature set
+
+The features below are used by all models in the next sections (model A, and model B with the same features). For each one: the group, why it is known **before the race**, and the evidence behind it.
+""")
+
+code(r'''
+WHY_PRE_RACE = {
+    "grid": "starting order, fixed before the start", "pit_lane_start": "known from the starting order",
+    "gap_q1_pct": "Q1 lap times, set before the race", "grid_minus_quali": "grid and qualifying, both known before the start",
+    "reached_q3": "qualifying result", "no_q3_format": "qualifying format of the season", "quali_missing": "whether qualifying data exists",
+    "quali_pos": "qualifying result",
+    "drv_champ_pos": "standings after the PREVIOUS race", "drv_points_share": "standings after the PREVIOUS race",
+    "drv_no_standing_yet": "standings after the PREVIOUS race", "cons_champ_pos": "standings after the PREVIOUS race",
+    "cons_points_share": "standings after the PREVIOUS race", "cons_no_standing_yet": "standings after the PREVIOUS race",
+    f"drv_podium_rate_{FORM_WINDOW}": "earlier races only (shift(1), asserted)", f"drv_avg_finish_{FORM_WINDOW}": "earlier races only (shift(1), asserted)",
+    f"drv_dnf_rate_{FORM_WINDOW}": "earlier races only (shift(1), asserted)", f"cons_podium_rate_{FORM_WINDOW}": "earlier races only (shift(1), asserted)",
+    "n_starters": "entry list / starting grid", "drv_experience": "count of earlier starts", "drv_age": "birth date and race date",
+    "home_race": "nationality and circuit country",
+}
+group_of = {c: g for g, cols in FEATURE_GROUPS.items() for c in cols}
+TRIAL_OF_GROUP = {"grid": 1, "qualifying": 2, "standings": 3, "form": 4, "context": 5}
+FINAL_FEATURES = list(current)
+final_table = pd.DataFrame({
+    "feature": FINAL_FEATURES,
+    "group": [group_of.get(c, "context") for c in FINAL_FEATURES],
+    "known before the race because": [WHY_PRE_RACE[c] for c in FINAL_FEATURES],
+    "AUC alone (train)": [auc_alone.get(c, np.nan) for c in FINAL_FEATURES],
+    "evidence": [f"4.3 plot + trial {TRIAL_OF_GROUP[group_of.get(c, 'context')]} (4.5)" for c in FINAL_FEATURES],
+})
+display(final_table)
+
+dropped = [c for c in ALL_CANDIDATES + ["quali_pos", "drv_champ_pos", "drv_points_share", "cons_champ_pos", "cons_points_share"]
+           if c not in FINAL_FEATURES]
+print("Candidates not used:", sorted(set(dropped)))
+assert not set(FINAL_FEATURES) & set(POST_RACE)
+''')
+
+md(r"""
+**Summary.** The models will use **18 features**: grid (2), qualifying (5, including the format flags), standings (4), form (4) and context (3). Every one is known before the race starts. Standings come from the previous race, and form was proven by the asserts in 4.2 to use only earlier races. Not used: `quali_pos` and `drv_points_share` / `cons_champ_pos` (near-duplicates, 4.4), and `home_race` (lowered the score, 4.5). Model B uses the same 18 features; its `quali_missing` flag marks the seasons without qualifying data. Missing values (a driver's first race, `reached_q3` before 2006) are handled in the pre-processing section.
+""")
+
+
 nb = {
     "cells": cells,
     "metadata": {

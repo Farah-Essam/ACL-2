@@ -2068,7 +2068,7 @@ md(r"""
 md(r"""
 # 3. Data-Engineering Questions
 
-Each question is answered from the **cleaned** tables (section 2) using multi-table joins. For every question we state:
+Each question is answered from the **cleaned dataset files** in `outputs/clean_data/` (written in 2.13), read back with `load_clean()`, using multi-table joins. The questions don't use the in-memory tables, so they show that the exported files alone are enough. For every question we state:
 - **Tables & joins:** which tables are combined, and on which keys.
 - **Grain:** what one row represents.
 - **Missingness:** what is missing and how it is handled.
@@ -2078,9 +2078,36 @@ Then come the result, a plot, and a plain-language answer.
 """)
 
 code(r'''
-circuits_c = CLEAN["circuits"][["circuitId", "name", "country"]].rename(columns={"name": "circuit"})
-constructors_c = CLEAN["constructors"][["constructorId", "name"]].rename(columns={"name": "constructor"})
-quali_pos = CLEAN["qualifying"][["raceId", "driverId", "position"]].rename(columns={"position": "quali_pos"})
+# Section 3 reads the cleaned dataset from its files (written in 2.13), not from the in-memory tables.
+CLEAN_DIR_CANDIDATES = [os.environ.get("F1_CLEAN"), str(CLEAN_DATA_DIR),
+                        *map(str, Path("/kaggle/input").glob("*/clean_data"))]
+QA_CLEAN_DIR = next(Path(c) for c in filter(None, CLEAN_DIR_CANDIDATES)
+                    if (Path(c) / "results_full.csv").exists())
+print("Cleaned data source:", QA_CLEAN_DIR.resolve())
+
+results_full_c = load_clean("results_full", QA_CLEAN_DIR)
+races_c = load_clean("races", QA_CLEAN_DIR)
+qualifying_c = load_clean("qualifying", QA_CLEAN_DIR)
+drivers_c = load_clean("drivers", QA_CLEAN_DIR)
+circuits_c = load_clean("circuits", QA_CLEAN_DIR)[["circuitId", "name", "country"]].rename(columns={"name": "circuit"})
+constructors_c = (load_clean("constructors", QA_CLEAN_DIR)[["constructorId", "name"]]
+                  .rename(columns={"name": "constructor"}))
+race_info_c = races_c[["raceId", "year", "round", "date", "circuitId", "name"]].rename(columns={"name": "race_name"})
+quali_pos = qualifying_c[["raceId", "driverId", "position"]].rename(columns={"position": "quali_pos"})
+
+# Checks on what we loaded: keys unique and non-null, and every foreign key found.
+for name, df, key in [("results_full", results_full_c, ["raceId", "driverId"]), ("races", races_c, ["raceId"]),
+                      ("qualifying", qualifying_c, ["raceId", "driverId"]), ("drivers", drivers_c, ["driverId"]),
+                      ("circuits", circuits_c, ["circuitId"]), ("constructors", constructors_c, ["constructorId"])]:
+    assert df[key].notna().all().all() and not df.duplicated(key).any(), name
+for col, parent in [("circuitId", circuits_c), ("driverId", drivers_c), ("constructorId", constructors_c)]:
+    assert results_full_c[col].isin(parent[col]).all(), col
+assert results_full_c["raceId"].isin(races_c["raceId"]).all()
+assert results_full_c["status_category"].notna().all()
+
+display(pd.DataFrame({"rows": [len(results_full_c), len(races_c), len(qualifying_c), len(drivers_c),
+                               len(circuits_c), len(constructors_c)]},
+                     index=["results_full", "races", "qualifying", "drivers", "circuits", "constructors"]))
 ''')
 
 # ---------------------------------------------------------------- Q1
@@ -2089,7 +2116,7 @@ md(r"""
 
 **In simple words:** if a driver starts in the first two places, how often does he finish in the top three, and at which tracks is that most likely?
 
-- **Tables & joins:** `results_full` (grid, podium, circuit, year) ⟶ `qualifying` on `raceId + driverId` (qualifying position) ⟶ `circuits` on `circuitId` (circuit name).
+- **Tables & joins:** `clean_data/results_full.csv` (grid, podium, circuit, year) ⟶ `clean_data/qualifying.csv` on `raceId + driverId` (qualifying position) ⟶ `clean_data/circuits.csv` on `circuitId` (circuit name).
 - **Grain:** one row = one driver in one race.
 - **Two definitions of "front row"**, because they differ (penalties):
   - **started** on the front row = `grid` 1 or 2 (the main answer: it's where the car actually lined up);
@@ -2100,7 +2127,7 @@ md(r"""
 
 code(r'''
 ERAS = ["2003-2013 (pre-hybrid)", "2014-2024 (hybrid)"]
-q1 = (results_full[results_full["year"] >= 2003]
+q1 = (results_full_c[results_full_c["year"] >= 2003]
       .merge(quali_pos, on=["raceId", "driverId"], how="left", validate="one_to_one")
       .merge(circuits_c, on="circuitId", how="left", validate="many_to_one"))
 q1["era"] = np.where(q1["year"] >= 2014, ERAS[1], ERAS[0])
@@ -2183,7 +2210,7 @@ Does that give a different (or better) answer?
 
 code(r'''
 ERAS_ALL = ["1950-2013 (all pre-hybrid)", "2014-2024 (hybrid)"]
-q1_all = results_full.merge(circuits_c, on="circuitId", how="left", validate="many_to_one")
+q1_all = results_full_c.merge(circuits_c, on="circuitId", how="left", validate="many_to_one")
 q1_all["era"] = np.where(q1_all["year"] >= 2014, ERAS_ALL[1], ERAS_ALL[0])
 fr_all = q1_all[q1_all["grid"] <= 2]
 
@@ -2248,10 +2275,10 @@ Grid is the starting position, so it's the primary measure. The question is whet
 """)
 
 code(r'''
-q_best = CLEAN["qualifying"][["raceId", "driverId", "position", "q1_sec", "q2_sec", "q3_sec"]].copy()
+q_best = qualifying_c[["raceId", "driverId", "position", "q1_sec", "q2_sec", "q3_sec"]].copy()
 q_best["best_sec"] = q_best[["q1_sec", "q2_sec", "q3_sec"]].min(axis=1)
 q_best["gap_to_pole_pct"] = 100 * (q_best["best_sec"] / q_best.groupby("raceId")["best_sec"].transform("min") - 1)
-qg = results_full[results_full["year"] >= 2003].merge(q_best[["raceId", "driverId", "position", "gap_to_pole_pct"]],
+qg = results_full_c[results_full_c["year"] >= 2003].merge(q_best[["raceId", "driverId", "position", "gap_to_pole_pct"]],
                                                       on=["raceId", "driverId"], how="left", validate="one_to_one")
 print(f"Since 2003, grid differs from qualifying position in {100 * (qg['grid'] != qg['position'])[qg['position'].notna()].mean():.0f}% of rows.")
 
@@ -2305,9 +2332,9 @@ md(r"""
 
 **In simple words:** a British driver at Silverstone, a Dutch driver at Zandvoort... do they do better than usual? To be fair, we must compare drivers who **started from similar places**. Otherwise "home advantage" could just mean "the home driver qualified well".
 
-- **Tables & joins:** `results_full` ⟶ `drivers` on `driverId` (`home_country`, built in 2.4) ⟶ `circuits` on `circuitId` (`country`). **Home race** = `home_country == circuit country`.
+- **Tables & joins:** `clean_data/results_full.csv` ⟶ `clean_data/drivers.csv` on `driverId` (`home_country`, built in 2.4) ⟶ `clean_data/circuits.csv` on `circuitId` (`country`). **Home race** = `home_country == circuit country`.
 - **Grain:** one row = one driver starting one race (all seasons; non-starters were removed in 2.6, and the Indianapolis 500 in 2.6.1).
-- **Why no Indianapolis 500:** in 1950–1960 it was a separate American race. Almost every starter was an American at a US circuit (a "home" start), with no away drivers in the same race to compare with. It would have made up 16% of all home starts. The result with Indy put back is shown as a robustness column.
+- **Why no Indianapolis 500:** in 1950–1960 it was a separate American race. Almost every starter was an American at a US circuit (a "home" start), with no away drivers in the same race to compare with. It would have made up 16% of all home starts. The result with Indy put back is shown as a robustness column. Those rows are removed by cleaning, so they are not in the clean files: this one column takes them from memory (`INDY500_RESULTS`, 2.6.1).
 - **Controlling for starting position:** drivers are grouped into **grid bands** (1–3, 4–6, 7–10, 11+). Home and away drivers are compared **inside the same band**. The band differences are then averaged, weighted by how many home starts fall in each band ("grid-adjusted difference").
 - **Uncertainty:** a bootstrap (resampling the rows 500 times) gives a 95% interval for the adjusted difference.
 - **Missingness:** none. Every driver has a `home_country`, and every cleaned row has a valid grid.
@@ -2315,7 +2342,7 @@ md(r"""
 """)
 
 code(r'''
-nat = CLEAN["drivers"][["driverId", "home_country"]]
+nat = drivers_c[["driverId", "home_country"]]
 GRID_BANDS = ["1-3", "4-6", "7-10", "11+"]
 
 
@@ -2327,9 +2354,9 @@ def home_table(res):
     return df
 
 
-q2 = home_table(results_full)
+q2 = home_table(results_full_c)
 # Robustness only: put back the Indianapolis 500 rows removed in 2.6.1.
-q2_with_indy = home_table(pd.concat([results_full, INDY500_RESULTS.merge(race_info, on="raceId", how="left")]))
+q2_with_indy = home_table(pd.concat([results_full_c, INDY500_RESULTS.merge(race_info_c, on="raceId", how="left")]))
 
 
 def adjusted_home_diff(df):
@@ -2411,21 +2438,36 @@ md(r"""
 
 **In simple words:** out of all the races a team's cars started, how often did one stop because something on the car broke?
 
-- **Tables & joins:** `results_full` (already joined to `status` and its category in 2.5–2.6) ⟶ `constructors` on `constructorId` (team name), filtered by `year` (from `races`).
+- **Data source:** this question reads the **cleaned CSVs directly from the clean-data folder** (`outputs/clean_data/`, written in 2.13, loaded at the start of section 3), not the raw files and not the in-memory tables. `results_full.csv` there already has the cleaning applied: non-starters, duplicate rows and the Indianapolis 500 removed, and every status mapped to a `status_category` (2.5–2.6).
+- **Tables & joins:** `clean_data/results_full.csv` ⟶ `clean_data/races.csv` on `raceId` (for `year`) ⟶ `clean_data/constructors.csv` on `constructorId` (team name).
 - **Grain:** one row = one car starting one race. **Rate = mechanical retirements ÷ race starts** for that team in that period.
 - **Mechanical retirement:** `status_category == "mechanical"` (engine, gearbox, hydraulics, power unit, ...; 2.5). Crashes, driver problems and regulation decisions are excluded, as the brief defines. Statuses whose cause is unclear (`Retired`, `Wheel`, `Puncture`, `Damage`, ...) are excluded from the main (**strict**) rate and added in the **broad** rate (mechanical + unclear, an upper bound).
-- **Missingness:** none. Every status has a category, and non-starters were removed, so the denominator counts real starts only.
+- **Missingness:** none. Every status has a category, and non-starters were removed, so the denominator counts real starts only (checked below).
 - **Small teams:** only teams with **≥ 40 starts** in a period are ranked. Team names follow the dataset: renamed teams (e.g. Toro Rosso → AlphaTauri → RB, Force India → Racing Point → Aston Martin) appear as separate entries.
 - **Cutoff:** not relevant. This is a historical post-race analysis, not a feature.
 """)
 
 code(r'''
+# Same clean-data folder as the rest of section 3.
+q3_results = results_full_c[["raceId", "driverId", "constructorId", "status", "status_category"]]
+q3_races = races_c[["raceId", "year"]]
+q3_teams = constructors_c
+
+# Checks on what we loaded: unique grain, no missing categories, every key found.
+assert not q3_results.duplicated(["raceId", "driverId"]).any()
+assert q3_results["status_category"].notna().all()
+assert q3_results["raceId"].isin(q3_races["raceId"]).all()
+assert q3_results["constructorId"].isin(q3_teams["constructorId"]).all()
+
 PERIODS = ["2014-2021", "2022-2024"]
-q3 = (results_full[results_full["year"] >= 2014]
-      .merge(constructors_c, on="constructorId", how="left", validate="many_to_one"))
+q3 = (q3_results
+      .merge(q3_races, on="raceId", how="left", validate="many_to_one")
+      .merge(q3_teams, on="constructorId", how="left", validate="many_to_one"))
+q3 = q3[q3["year"] >= 2014].copy()
 q3["period"] = np.where(q3["year"] <= 2021, PERIODS[0], PERIODS[1])
 q3["mechanical"] = q3["status_category"] == "mechanical"
 q3["mechanical_or_unclear"] = q3["status_category"].isin(["mechanical", "unclear"])
+print(f"Race starts 2014-2024: {len(q3):,}")
 
 MIN_TEAM_STARTS = 40
 q3_rates = (q3.groupby(["period", "constructor"])
@@ -2550,9 +2592,9 @@ All features are computed for **every season** (1950–2024), because model B ne
 | Group | Features | Known before the race because... |
 |---|---|---|
 | **Grid** | `grid`, `pit_lane_start` | the starting order is fixed before the start |
-| **Qualifying** | `quali_pos`, `gap_q1_pct` (gap to the fastest Q1 time, %), `grid_minus_quali` (penalty indicator), `reached_q3` (+ `no_q3_format` flag before 2006), `quali_missing` flag | qualifying is finished |
+| **Qualifying** | `quali_pos`, `gap_q1_pct` (gap to the fastest Q1 time, %), `grid_minus_quali` (penalty indicator), `reached_q3` (advanced to Q3: a Q3 time, **or** a Q2 time ranked inside that race's Q3 places; + `no_q3_format` flag before 2006), `quali_missing` flag | qualifying is finished |
 | **Standings** | driver and constructor championship **position** and **share of the leader's points** (from the **previous** race), `no_standing_yet` flags. No standing yet = behind everyone ranked with 0% of the leader's points; in round 1 nobody is ranked, so everyone is set to the back (number of starters) | the previous race's standings are known; never the current race's (2.10.2) |
-| **Form** | driver podium rate, average finish and retirement rate over the **last 5 races**; constructor podium rate over its last 5 races | computed with `shift(1)`, so only earlier races are used |
+| **Form** | driver podium rate, average finish and retirement rate over the **last 5 races**; constructor podium rate over its last 5 races, **restarted after a long absence** (see the checks below) | computed with `shift(1)`, so only earlier races are used |
 | **Context** | `n_starters`, `drv_experience` (career starts so far), `drv_age`, `home_race` | known from the entry list, the calendar and the driver's birth date |
 """)
 
@@ -2575,7 +2617,22 @@ q = CLEAN["qualifying"][["raceId", "driverId", "position", "q1_sec", "q2_sec", "
 q["gap_q1_pct"] = 100 * (q["q1_sec"] / q.groupby("raceId")["q1_sec"].transform("min") - 1)
 q["best_sec"] = q[["q1_sec", "q2_sec", "q3_sec"]].min(axis=1)          # only for the trial in 4.5
 q["gap_best_pct"] = 100 * (q["best_sec"] / q.groupby("raceId")["best_sec"].transform("min") - 1)
-q["reached_q3"] = q["q3_sec"].notna().astype(float)
+
+# reached_q3 = the driver advanced to Q3. A Q3 lap time is not the only evidence: drivers who advanced but set no
+# Q3 time (engine-change penalty, crash, tyre saving, Q3 cancelled) still advanced.
+# Rule: every driver with a Q3 time reached Q3; the Q3 places left over go to the fastest Q2 times among the
+# drivers WITHOUT a Q3 time (ties broken by qualifying position). Anchoring on Q3 times matters: in a few races the
+# recorded Q2 time isn't the lap that counted, so a plain Q2 ranking would let an extra driver in.
+# Qualifying position alone isn't used, because it sometimes already includes a penalty (2007 Belgian/Japanese GP).
+# Q3 places: 10 in the knockout format (2006+), except the 2016 Australian and Bahrain GP (elimination format: 8).
+ELIMINATION_FORMAT = CLEAN["races"].query("year == 2016 and name in ['Australian Grand Prix', 'Bahrain Grand Prix']")["raceId"]
+assert len(ELIMINATION_FORMAT) == 2
+q["q3_places"] = np.where(q["raceId"].isin(ELIMINATION_FORMAT), 8, 10)
+q["q3_times"] = q.groupby("raceId")["q3_sec"].transform("count")
+no_q3_time = q[q["q3_sec"].isna() & q["q2_sec"].notna()].sort_values(["raceId", "q2_sec", "position"])
+q["q2_order_no_q3"] = no_q3_time.groupby("raceId").cumcount() + 1     # 1 = fastest Q2 among drivers without a Q3 time
+q["reached_q3_time_only"] = q["q3_sec"].notna().astype(float)          # the old definition, kept only for the check in 4.2.1
+q["reached_q3"] = (q["q3_sec"].notna() | (q["q2_order_no_q3"] <= q["q3_places"] - q["q3_times"])).astype(float)
 feat = feat.merge(q[["raceId", "driverId", "position", "gap_q1_pct", "gap_best_pct", "reached_q3"]]
                   .rename(columns={"position": "quali_pos"}), on=["raceId", "driverId"], how="left", validate="one_to_one")
 feat["quali_pos"] = feat["quali_pos"].astype(float)
@@ -2622,16 +2679,28 @@ def past_mean(values, keys, n):
     return values.groupby(keys).transform(lambda s: s.shift(1).rolling(n, min_periods=1).mean())
 
 
-def form_features(n):
+# Constructor history segments. A constructorId can come back after decades (Mercedes 1955 -> 2010), so its
+# "previous races" would describe another era's team. A gap of more than TEAM_GAP_DAYS between two races of the
+# same constructor starts a new segment, and team form only looks back inside the current segment.
+TEAM_GAP_DAYS = 550
+TEAM_RACES = (hist.groupby(["constructorId", "raceId", "race_seq"])["podium_f"].agg(["sum", "size"])
+              .reset_index().sort_values(["constructorId", "race_seq"]))
+TEAM_RACES["date"] = TEAM_RACES["raceId"].map(CLEAN["races"].set_index("raceId")["date"])
+TEAM_RACES["gap_days"] = TEAM_RACES.groupby("constructorId")["date"].diff().dt.days
+TEAM_RACES["team_segment"] = (TEAM_RACES["gap_days"] > TEAM_GAP_DAYS).groupby(TEAM_RACES["constructorId"]).cumsum()
+
+
+def form_features(n, reset_gap=True):
     h = hist.sort_values(["driverId", "race_seq"])
     out = pd.DataFrame({"raceId": h["raceId"], "driverId": h["driverId"]})
     out[f"drv_podium_rate_{n}"] = past_mean(h["podium_f"], h["driverId"], n)
     out[f"drv_avg_finish_{n}"] = past_mean(h["finish"], h["driverId"], n)
     out[f"drv_dnf_rate_{n}"] = past_mean(h["dnf"], h["driverId"], n)
-    # Constructor: share of its car-starts on the podium over its previous n races.
-    team = (hist.groupby(["constructorId", "raceId", "race_seq"])["podium_f"].agg(["sum", "size"])
-            .reset_index().sort_values(["constructorId", "race_seq"]))
-    roll = lambda col: team.groupby("constructorId")[col].transform(lambda s: s.shift(1).rolling(n, min_periods=1).sum())
+    # Constructor: podium finishes / car-starts over its previous n races (both cars of a race count),
+    # within the current history segment (reset_gap=False is the old version, kept only for the check in 4.2).
+    team = TEAM_RACES.copy()
+    keys = ["constructorId", "team_segment"] if reset_gap else ["constructorId"]
+    roll = lambda col: team.groupby(keys)[col].transform(lambda s: s.shift(1).rolling(n, min_periods=1).sum())
     team[f"cons_podium_rate_{n}"] = roll("sum") / roll("size")
     out = out.merge(feat[["raceId", "driverId", "constructorId"]], on=["raceId", "driverId"])
     out = out.merge(team[["constructorId", "raceId", f"cons_podium_rate_{n}"]], on=["constructorId", "raceId"], how="left")
@@ -2668,8 +2737,8 @@ display(feat[ALL_CANDIDATES].describe().T.round(2))
 
 md(r"""
 **Leakage checks.** The form features are the riskiest, because they are built from race results. The checks below prove they only use **earlier** races:
-- every driver's (and constructor's) **first** race has no form value;
-- for 500 random rows, the form value is recomputed by hand from the races **strictly before** that race, and it must match exactly;
+- every driver's **first** race has no form value, and so does every constructor's first race of a history segment (its first race ever, or its first race after a long absence, see 4.2.1);
+- for 500 random rows, the form value is recomputed by hand from the races **strictly before** that race (for the team: inside the same history segment), and it must match exactly;
 - no post-race column (finishing position, points, status, ...) is a candidate feature.
 """)
 
@@ -2678,9 +2747,11 @@ form_cols = FEATURE_GROUPS["form"]
 by_driver = feat.sort_values(["driverId", "race_seq"])
 first_drv = by_driver.groupby("driverId").head(1)
 assert first_drv[[c for c in form_cols if c.startswith("drv_")]].isna().all().all(), "a driver's first race has a form value"
-first_team_race = hist.groupby("constructorId")["race_seq"].min()
-first_cons = feat[feat["race_seq"] == feat["constructorId"].map(first_team_race)]
-assert first_cons[f"cons_podium_rate_{FORM_WINDOW}"].isna().all(), "a constructor's first race has a form value"
+# First race of each constructor history segment (its first race ever, or its first race after a long absence).
+seg_start = TEAM_RACES.loc[TEAM_RACES.groupby(["constructorId", "team_segment"]).cumcount() == 0, ["constructorId", "raceId"]]
+first_cons = feat.merge(seg_start, on=["constructorId", "raceId"])
+assert first_cons[f"cons_podium_rate_{FORM_WINDOW}"].isna().all(), "a constructor's first race (of a segment) has a form value"
+segment_of = TEAM_RACES.set_index(["constructorId", "raceId"])["team_segment"]
 
 rng = np.random.default_rng(0)
 sample = feat.iloc[rng.choice(len(feat), 500, replace=False)]
@@ -2689,7 +2760,10 @@ for r in sample.itertuples():
     expected = past["podium_f"].mean() if len(past) else np.nan
     got = getattr(r, f"drv_podium_rate_{FORM_WINDOW}")
     assert (np.isnan(expected) and np.isnan(got)) or np.isclose(expected, got), f"form leak at raceId {r.raceId}"
-    team_past = hist[(hist["constructorId"] == r.constructorId) & (hist["race_seq"] < r.race_seq)]
+    same_segment = TEAM_RACES[(TEAM_RACES["constructorId"] == r.constructorId)
+                              & (TEAM_RACES["team_segment"] == segment_of.loc[(r.constructorId, r.raceId)])]
+    team_past = hist[(hist["constructorId"] == r.constructorId) & (hist["race_seq"] < r.race_seq)
+                     & hist["raceId"].isin(same_segment["raceId"])]
     last_races = team_past["race_seq"].drop_duplicates().nlargest(FORM_WINDOW)
     tp = team_past[team_past["race_seq"].isin(last_races)]
     expected_c = tp["podium_f"].mean() if len(tp) else np.nan
@@ -2697,8 +2771,102 @@ for r in sample.itertuples():
     assert (np.isnan(expected_c) and np.isnan(got_c)) or np.isclose(expected_c, got_c), f"team form leak at raceId {r.raceId}"
 
 assert not set(ALL_CANDIDATES) & set(POST_RACE), "a post-race column is a candidate feature"
-print(f"Leakage checks passed: {len(first_drv)} first driver races and {len(first_cons)} first constructor races have no form; "
+print(f"Leakage checks passed: {len(first_drv)} first driver races and {len(first_cons)} first constructor races "
+      f"(including restarts after a long absence) have no form; "
       f"500 random rows match a hand recomputation from earlier races only; no post-race column is a feature.")
+''')
+
+md(r"""
+### 4.2.1 Checks for two corrected features: `reached_q3` and team form
+
+A review of the first version found two features that were computed wrongly for a small number of rows. Both are fixed above; the cells below show what changed and prove the fixes.
+
+**`reached_q3`.** The first version used "has a Q3 lap time". But some drivers **advanced to Q3 without setting a Q3 time** (an engine-change penalty made a lap pointless, a crash, saving tyres, or Q3 was cancelled), so they were wrongly marked as eliminated. The corrected rule: every driver **with a Q3 time** reached Q3, and the **Q3 places left over** go to the fastest Q2 times among the drivers without a Q3 time. Format exceptions and data quirks:
+- **Q3 places = 10** in the knockout format (2006 onwards), except the **2016 Australian and Bahrain GP**: the short-lived "elimination" format sent only **8** drivers to Q3, so a plain "qualified in the top 10" rule would be wrong there.
+- **Not the qualifying position:** in a few races the recorded position already includes a penalty (e.g. 2007 Belgian GP: Kubica is listed 14th although he ran in Q3), so it doesn't show who advanced.
+- **Anchored on Q3 times, not a plain Q2 ranking:** in a few races the recorded Q2 time isn't the lap that counted (e.g. Heidfeld, 2008 Turkish GP, listed 14th in Q2 but ran in Q3), so ranking Q2 times alone would let an 11th driver into Q3. Equal Q2 times at the cut-off (2011 Indian GP) are separated by qualifying position.
+- **2015 US GP:** Q3 was cancelled by rain (no Q3 times at all); the 10 drivers who advanced from Q2 count as having reached Q3.
+- Before 2006 there was no Q3: `reached_q3` stays missing and `no_q3_format = 1`, as before.
+- **Check:** in every one of the 375 knockout races, exactly 10 drivers (8 in the two elimination-format races) reached Q3.
+
+**Team form.** A `constructorId` can return after decades: Mercedes raced in 1954–1955 and came back in 2010 with the same ID, so its first 2010 races were using 1955 results as "recent form". Team form now only looks back inside a **history segment**: a new segment starts when the team's previous race was more than **550 days** (about 18 months) earlier.
+- **Why 550 days:** a normal winter break is 3–7 months. Small 1950s–60s teams that entered only a few races a season can go about a year between races while still racing every season. More than 18 months means the team missed at least a whole season. In 2003+ **every** reset is a gap of 4 years or more, so any threshold between 1 and 2 years gives exactly the same model-A features (the sensitivity table below shows it); the choice only affects a few pre-2003 rows used by model B.
+- The first race of a new segment has **no** team form (missing, like a new team); from its second race the form uses the races available in the segment, up to 5. The formula is unchanged: podium finishes divided by car-starts over those races.
+- **Limitation (documented, not changed):** renamed teams have different IDs (Toro Rosso → AlphaTauri → RB, Force India → Racing Point → Aston Martin, Renault → Alpine, ...). Their form starts again after a rename even though the factory is the same. We don't merge IDs: which renames are "the same team" is a judgement call, and these rows are few.
+""")
+
+code(r'''
+nm = (CLEAN["drivers"].assign(driver=CLEAN["drivers"]["forename"] + " " + CLEAN["drivers"]["surname"])[["driverId", "driver"]])
+rc = CLEAN["races"][["raceId", "name"]].rename(columns={"name": "race"})
+
+# --- reached_q3 ---------------------------------------------------------------------------------------------
+# In every knockout race (qualifying table, all entrants), exactly the number of Q3 places reached Q3.
+knockout = q[q["raceId"].isin(CLEAN["races"].loc[CLEAN["races"]["year"] >= 2006, "raceId"])]
+per_race = knockout.groupby("raceId").agg(reached=("reached_q3", "sum"), places=("q3_places", "first"))
+assert (per_race["reached"] == per_race["places"]).all(), "a race has the wrong number of drivers in Q3"
+print(f"All {len(per_race)} knockout races (2006+) have exactly their number of Q3 places marked as reached Q3.")
+
+# Rows of the feature table (starters, 2006+): old definition (Q3 time only) vs corrected.
+q3c = (feat.loc[feat["no_q3_format"] == 0, ["raceId", "driverId", "year", "split", "quali_pos", "grid", "reached_q3"]]
+       .merge(q[["raceId", "driverId", "q2_sec", "q3_sec", "q3_places", "reached_q3_time_only"]], on=["raceId", "driverId"], how="left")
+       .merge(nm, on="driverId").merge(rc, on="raceId"))
+q3c = q3c[q3c["reached_q3"].notna()]
+q3_changed = q3c[q3c["reached_q3"] != q3c["reached_q3_time_only"]]
+print(f"reached_q3 ({len(q3c):,} starters with qualifying, 2006+): {len(q3_changed)} values changed, "
+      f"all from 0 to 1: {bool((q3_changed['reached_q3'] == 1).all())}")
+display(q3_changed.groupby("split").size().rename("changed rows").to_frame().T)
+
+show = ["year", "race", "driver", "quali_pos", "grid", "q2_sec", "q3_sec", "q3_places", "reached_q3_time_only", "reached_q3"]
+print("Examples: advanced to Q3 without setting a Q3 time (0 before, 1 now)")
+display(q3_changed[show].head(6))
+print("Format exceptions: 2016 elimination format (8 places), 2007 position that includes a penalty, "
+      "2008 recorded Q2 time not the one that counted, 2015 US GP (Q3 cancelled)")
+special = q3c[(q3c["raceId"].isin(ELIMINATION_FORMAT) & q3c["quali_pos"].between(8, 11))
+              | ((q3c["year"] == 2007) & (q3c["race"] == "Belgian Grand Prix") & q3c["quali_pos"].between(9, 14))
+              | ((q3c["year"] == 2008) & (q3c["race"] == "Turkish Grand Prix") & q3c["quali_pos"].between(9, 11))
+              | ((q3c["year"] == 2015) & (q3c["race"] == "United States Grand Prix") & q3c["quali_pos"].between(9, 11))]
+display(special[show].sort_values(["year", "race", "quali_pos"]).reset_index(drop=True))
+''')
+
+code(r'''
+# --- Team form: threshold evidence -----------------------------------------------------------------------------
+gaps = TEAM_RACES["gap_days"].dropna()
+gap_bins = pd.cut(gaps, [0, 120, 250, 365, 550, 730, 1095, 100000],
+                  labels=["<=4 months", "4-8 months", "8-12 months", "12-18 months", "18-24 months", "2-3 years", "3+ years"])
+print("Days between two consecutive races of the same constructor (all seasons):")
+display(gap_bins.value_counts().sort_index().rename("gaps").to_frame().T)
+modern = TEAM_RACES["date"].dt.year >= MODEL_START_YEAR
+print(f"Longest gap in {MODEL_START_YEAR}+ that is NOT a reset: {int(TEAM_RACES.loc[modern & (TEAM_RACES['gap_days'] <= TEAM_GAP_DAYS), 'gap_days'].max())} days")
+display(pd.DataFrame([{"threshold (days)": t, "resets, all seasons": int((gaps > t).sum()),
+                       f"resets, {MODEL_START_YEAR}+": int((modern & (TEAM_RACES["gap_days"] > t)).sum())}
+                      for t in [365, 450, 550, 730]]).set_index("threshold (days)").T)
+
+# --- Team form: old (no reset) vs corrected ----------------------------------------------------------------------
+col = f"cons_podium_rate_{FORM_WINDOW}"
+old_team = form_features(FORM_WINDOW, reset_gap=False)[["raceId", "driverId", col]].rename(columns={col: "old (no reset)"})
+tc = feat[["raceId", "driverId", "constructorId", "year", "split", col]].merge(old_team, on=["raceId", "driverId"], validate="one_to_one")
+same = (tc[col].isna() & tc["old (no reset)"].isna()) | np.isclose(tc[col], tc["old (no reset)"])
+team_changed = tc[~same]
+
+# Only the first FORM_WINDOW races of a restarted segment may change; every other window must be identical.
+pos_in_segment = TEAM_RACES.groupby(["constructorId", "team_segment"]).cumcount()
+may_change = TEAM_RACES.loc[(TEAM_RACES["team_segment"] > 0) & (pos_in_segment < FORM_WINDOW), ["constructorId", "raceId"]]
+assert team_changed.merge(may_change, on=["constructorId", "raceId"]).shape[0] == len(team_changed), \
+    "team form changed outside the first races of a restarted segment"
+restarts = TEAM_RACES[TEAM_RACES["gap_days"] > TEAM_GAP_DAYS][["constructorId", "raceId"]]
+assert feat.merge(restarts, on=["constructorId", "raceId"])[col].isna().all(), "the first race after a reset has a form value"
+print(f"Team form: {len(team_changed)} rows changed ({team_changed.groupby('split').size().to_dict()}); "
+      f"all inside the first {FORM_WINDOW} races after a reset. All other rows are unchanged.")
+
+modern_resets = (TEAM_RACES[modern & (TEAM_RACES["gap_days"] > TEAM_GAP_DAYS)]
+                 .merge(CLEAN["constructors"][["constructorId", "name"]].rename(columns={"name": "team"}), on="constructorId")
+                 .merge(rc, on="raceId"))
+modern_resets["previous race"] = modern_resets["date"] - pd.to_timedelta(modern_resets["gap_days"], unit="D")
+first_rows =tc.merge(modern_resets[["constructorId", "raceId"]], on=["constructorId", "raceId"]).groupby(["constructorId", "raceId"]).first()
+modern_resets = modern_resets.join(first_rows[["old (no reset)", col]], on=["constructorId", "raceId"])
+print(f"Resets in {MODEL_START_YEAR}+ (the team's form at its comeback race, before and after the fix):")
+display(modern_resets[["team", "race", "date", "previous race", "gap_days", "old (no reset)", col]]
+        .rename(columns={"gap_days": "gap (days)", col: "corrected"}).sort_values("date").reset_index(drop=True))
 ''')
 
 md(r"""
@@ -2759,7 +2927,7 @@ plt.show()
 ''')
 
 md(r"""
-**Qualifying:** pace matters on top of grid position. Drivers within 0.25% of the fastest Q1 time reach the podium 54% of the time; at 0.5–1% it is 20%, and beyond 2% almost never. Reaching Q3 (2006–2018): 30% vs 1%. The middle plot (`grid − qualifying position`) mixes all grid positions, so on its own it looks odd. The fair comparison is inside the same grid slots (3.1.2): drivers who qualified in the top 3 but started 6th or lower because of a penalty still reached the podium **32%** of the time vs **3.4%** for others starting there. That is the information this feature carries.
+**Qualifying:** pace matters on top of grid position. Drivers within 0.25% of the fastest Q1 time reach the podium 54% of the time; at 0.5–1% it is 20%, and beyond 2% almost never. Reaching Q3 (2006–2018): 29% vs 1%. The middle plot (`grid − qualifying position`) mixes all grid positions, so on its own it looks odd. The fair comparison is inside the same grid slots (3.1.2): drivers who qualified in the top 3 but started 6th or lower because of a penalty still reached the podium **32%** of the time vs **3.4%** for others starting there. That is the information this feature carries.
 """)
 
 code(r'''
@@ -2905,7 +3073,7 @@ md(r"""
 - We start with **grid only**, then add **one group at a time**.
 - **Score: PR-AUC** (average precision). Podiums are only ~15% of rows, and PR-AUC focuses on how well the true podium finishers are ranked at the top. ROC-AUC is shown too.
 - **Keep rule:** a group is kept if **(1)** its plots in 4.3 show a clear link with podiums, and **(2)** adding it **does not lower** validation PR-AUC.
-- **Noise:** the validation period has only 60 races, so the score moves by luck. For every decision we also show a **95% interval for the gain**, from resampling the validation races 500 times. An interval that includes 0 means "too small to call either way". The groups then stand on their 4.3 evidence, and the ablation with stronger models later measures their real contribution.
+- **Noise:** the validation period has only 60 races, so the score moves by luck. For every decision we also show a **95% interval for the gain**, from resampling the validation races 500 times. An interval that includes 0 means "too small to call either way". The groups then stand on their 4.3 evidence, and the feature-group ablation in the model-experiments section (after pre-processing) measures their contribution for every model.
 - **Provisional pre-processing** (the final choice comes in the next section): missing values are filled with the training median plus a "was missing" indicator, then features are standardised. Both are fitted on the training seasons only.
 
 Every trial has its own cell and is collected in `TRIALS`.
@@ -2992,7 +3160,12 @@ md(r"""
 The gap to pole could also use each driver's **best time of Q1/Q2/Q3**. We use **Q1 only**, because:
 - **2006–2009:** Q3 was run with the **race fuel load** on board, so Q3 times were slower than Q2 times and depended on each team's fuel strategy, not just pace.
 - **Early 2005** (first 6 races): two sessions whose times were **added together**; the best single session isn't what decided the grid.
-- **Everyone runs Q1**, under the same conditions, so Q1 times are comparable across the whole field.
+- **Almost every driver sets a Q1 time**, so the Q1 gap exists for nearly the whole field, while Q2/Q3 times exist only for the faster drivers.
+
+**Limits of the Q1 gap (it is not a perfectly equal comparison):**
+- **2003–2005:** there was no knockout. `q1` is the single qualifying lap that set the grid, and from 2003 to most of 2005 it was run **with race fuel**, so these gaps also mix in fuel strategy (the same problem as the 2006–2009 Q3). In the first 6 races of 2005, `q1` is only the first of two sessions whose times were added together.
+- **Within one session,** conditions still differ: track grip improves, rain can arrive mid-session, and top teams sometimes do just enough in Q1 to get through. The Q1 gap is therefore a **noisy** pace measure, not an exact one.
+- These limits affect every gap definition. The choice of Q1 rests on it being the most widely available and least strategy-dependent time, plus the check below.
 
 The table shows how often the pole-sitter was **not** the fastest driver by best-of-sessions time, per season (training seasons only), followed by the trial.
 """)
@@ -3018,7 +3191,7 @@ print(f"Q1 minus best-of-sessions: {score_of[s_q1] - score_of[s_best]:+.4f} (95%
 ''')
 
 md(r"""
-**Result of trial 2b:** the gap from **Q1** scores better than the gap from the best session (0.7208 vs 0.7093). The difference is within the noise of 60 races (95% interval −0.008 to +0.033), so the decision rests mainly on the reasoning above, which the data confirms: in 2006–2009 the pole-sitter was **not** the fastest driver by best-of-sessions time in 9–11 races every season (race-fuel Q3), against 0–3 races in other seasons. **We keep the Q1 gap.**
+**Result of trial 2b:** the gap from **Q1** scores a little better than the gap from the best session (0.7210 vs 0.7099). The difference is within the noise of 60 races (95% interval −0.0082 to +0.0325), so the trial doesn't prove Q1 is better; the decision rests mainly on the reasoning above, and the data supports that reasoning: in 2006–2009 the pole-sitter was **not** the fastest driver by best-of-sessions time in 9–11 races every season (race-fuel Q3), against 0–3 races in other seasons. **We keep the Q1 gap**, with the limits listed above.
 """)
 
 md(r"""
@@ -3056,14 +3229,20 @@ for n in [3, 5, 10]:
     VAL_n = tmp[tmp["split"] == "validation"]
     model = make_pipeline(SimpleImputer(strategy="median", add_indicator=True), StandardScaler(), LogisticRegression(max_iter=5000))
     model.fit(TRAIN_A_n[base_wo_form + cols_n].astype(float), TRAIN_A_n["podium"])
-    window_scores[n] = average_precision_score(VAL_n["podium"], model.predict_proba(VAL_n[base_wo_form + cols_n].astype(float))[:, 1])
+    assert (VAL_n["raceId"].to_numpy() == val_race).all()          # same validation rows, same order
+    PREDS[f"4b. window {n}"] = model.predict_proba(VAL_n[base_wo_form + cols_n].astype(float))[:, 1]
+    window_scores[n] = average_precision_score(VAL_n["podium"], PREDS[f"4b. window {n}"])
     TRIALS.append({"trial": f"4b. form window = last {n} races", "n features": len(base_wo_form + cols_n),
                    "val PR-AUC": round(window_scores[n], 4), "note": "written trial: form window"})
 display(pd.Series(window_scores, name="validation PR-AUC").rename_axis("form window (races)").round(4).to_frame().T)
+for other in [3, 10]:
+    lo, hi = gain_interval(f"4b. window {other}", f"4b. window {FORM_WINDOW}")
+    print(f"window {FORM_WINDOW} minus window {other}: {window_scores[FORM_WINDOW] - window_scores[other]:+.4f} "
+          f"(95% interval {lo:+.4f} to {hi:+.4f})")
 ''')
 
 md(r"""
-**Result of trial 4b:** the last **5** races works best (0.7362), ahead of 3 races (0.7341) and 10 races (0.7301). Three races react too much to one lucky or unlucky weekend; ten races still remember the car the team had months ago. **We keep 5.**
+**Result of trial 4b:** the last **5** races scores highest (0.7382), ahead of 3 races (0.7351) and 10 races (0.7302), but the differences are small and **both 95% intervals include 0**, so this trial does **not** show that 5 is better. **We keep 5 as a reasonable middle value**, chosen before the trial: 3 races can swing on one lucky or unlucky weekend, and 10 races reach back about half a season, to a car that may have changed. The trial only confirms that 5 isn't worse than the alternatives.
 """)
 
 md(r"""
@@ -3115,9 +3294,11 @@ print("Final feature set:", current)
 md(r"""
 **What the trials show.**
 - **Grid alone** already gives validation PR-AUC **0.676**.
-- **Qualifying** adds the most (+0.044 to **0.721**). It is the only gain clearly larger than the noise (95% interval +0.019 to +0.070).
-- **Standings** (+0.013), **form** (+0.002) and **context** (+0.001) each raise the score a little. Their intervals include 0, so for this linear model they overlap with what grid and qualifying already say. All three are **kept**: their 4.3 plots show a clear link with podiums and they don't lower the score. Form is also required by the brief, and the ablation with stronger models (section 5) will measure each group's real contribution.
-- **Home race** lowers the score (−0.003, interval entirely below 0) and is **dropped**, as Q2 predicted.
+- **Qualifying** adds the most (+0.045 to **0.721**). Together with grid, it is the clearest evidence of predictive value: it is the only gain whose 95% interval is entirely above 0 (+0.019 to +0.071).
+- **Standings** (+0.013), **form** (+0.004) and **context** (+0.0002) each raise the score only a little, and **all three intervals include 0**. So this trial does **not** show that they help; for this linear model, most of what they say is already in grid and qualifying.
+- They are **kept** for two reasons, not because of these gains: (1) their 4.3 plots on the training seasons show a clear link with podiums, and (2) adding them doesn't clearly lower the validation score. Form is also required by the brief.
+- These trials use **logistic regression only**. A feature that adds little to a linear model can still help a tree model or a neural network (or the reverse), so the feature-group ablation in the **model-experiments section** (after pre-processing) re-tests each group with every model.
+- **Home race** lowers the score (−0.003, interval entirely below 0) and is **dropped**. That drop is small too; the main reason is Q2, which found no home advantage once the starting position is known.
 - The model doesn't overfit: training PR-AUC (0.69) is close to validation (0.74). Validation being slightly higher is most likely because a few teams dominated 2019–2021, which makes podiums easier to predict.
 - **Final set: 18 features** in four groups (grid, qualifying, standings, form) plus context. Final validation PR-AUC **0.738** for this simple model, up from 0.676 with grid only.
 """)
@@ -3162,8 +3343,49 @@ assert not set(FINAL_FEATURES) & set(POST_RACE)
 ''')
 
 md(r"""
-**Summary.** The models will use **18 features**: grid (2), qualifying (5, including the format flags), standings (4), form (4) and context (3). Every one is known before the race starts. Standings come from the previous race, and form was proven by the asserts in 4.2 to use only earlier races. Not used: `quali_pos` and `drv_points_share` / `cons_champ_pos` (near-duplicates, 4.4), and `home_race` (lowered the score, 4.5). Model B uses the same 18 features; its `quali_missing` flag marks the seasons without qualifying data. Missing values (a driver's first race, `reached_q3` before 2006) are handled in the pre-processing section.
+**Summary.** The models will use **18 features**: grid (2), qualifying (5, including the format flags), standings (4), form (4) and context (3). Every one is known before the race starts. Standings come from the previous race, and form was proven by the asserts in 4.2 to use only earlier races. Not used: `quali_pos` and `drv_points_share` / `cons_champ_pos` (near-duplicates, 4.4), and `home_race` (lowered the score, 4.5). Model B uses the same 18 features; its `quali_missing` flag marks the seasons without qualifying data. Missing values (a driver's first race, a team's first race or first race after a long absence, `reached_q3` before 2006) are handled in the pre-processing section.
+
+**How strong is the evidence?** Grid and qualifying clearly help (4.5). Standings, form and context are kept because of their training-season plots (4.3) and because they don't clearly hurt the validation score; their gains in the logistic-regression trials are small and uncertain. Whether they help the other models is tested in the feature-group ablation of the model-experiments section.
 """)
+
+# ---------------------------------------------------------------- 4.7
+md(r"""
+## 4.7 Export: the final feature table
+
+The engineered features are saved to **`outputs/final_features.csv`**, next to the cleaned dataset (`outputs/clean_data/`), so the next sections (and teammates) can start from them. The file is rewritten on every run.
+- **Rows:** every row of `feat`, i.e. all seasons 1950–2024 with their `split` label, so both model A (2003+) and model B (all years) can use the same file. Test rows are saved, but nothing in this notebook uses their outcomes to make a decision.
+- **Columns (23):** `raceId`, `driverId`, `year`, `split`, the target `podium`, and the **18 final features** in the order of `FINAL_FEATURES`. No rejected candidates and no post-race columns.
+- **Missing values stay missing** (empty cells). No filling or scaling here: those steps are fitted on the training seasons in the pre-processing section.
+- Rows are sorted by race (in calendar order), then grid position, then `driverId`, so the file is identical on every run.
+""")
+
+code(r'''
+FINAL_FEATURES_PATH = CLEAN_DATA_DIR.parent / "final_features.csv"   # outputs/ (on Kaggle: /kaggle/working/outputs/)
+FINAL_FEATURES_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+EXPORT_COLUMNS = ["raceId", "driverId", "year", "split", "podium"] + list(FINAL_FEATURES)
+assert len(FINAL_FEATURES) == 18 and len(EXPORT_COLUMNS) == 23 and len(set(EXPORT_COLUMNS)) == 23
+assert not set(FINAL_FEATURES) & set(POST_RACE)
+
+final_features_df = (feat.sort_values(["race_seq", "grid", "driverId"])[EXPORT_COLUMNS]
+                     .reset_index(drop=True))
+assert not final_features_df.duplicated(["raceId", "driverId"]).any()
+assert len(final_features_df) == len(feat)
+final_features_df.to_csv(FINAL_FEATURES_PATH, index=False)
+
+# Read the file back: same rows, same values, missing values still missing.
+back = pd.read_csv(FINAL_FEATURES_PATH, keep_default_na=False, na_values=[""], float_precision="round_trip")
+assert list(back.columns) == EXPORT_COLUMNS
+pd.testing.assert_frame_equal(back, final_features_df, check_dtype=False, check_exact=True)
+print(f"Saved {FINAL_FEATURES_PATH}: {len(back):,} rows x {back.shape[1]} columns, read back identical.")
+
+print("Missing values per feature (%), only features with gaps; 'train' here is all training seasons 1950-2018:")
+display(pd.DataFrame({f"{s} {lo}-{hi}": back.loc[back["split"] == s, FINAL_FEATURES].isna().mean().mul(100).round(1)
+                      for s, (lo, hi) in [("train", (back["year"].min(), SPLIT_YEARS["train"][1])),
+                                          ("validation", SPLIT_YEARS["validation"]), ("test", SPLIT_YEARS["test"])]})
+        .loc[lambda d: d.max(axis=1) > 0])
+display(back["split"].value_counts().rename("rows").to_frame().T)
+''')
 
 
 nb = {

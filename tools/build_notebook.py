@@ -639,11 +639,11 @@ md(r"""
 | Rule | How | Pros | Cons |
 |---|---|---|---|
 | A. Best result | keep the row with the lowest `positionOrder` | Target = "did this driver get podium credit at all", matches the official record | The kept row's `grid`/car may be one the driver **didn't start in**. Its pre-race features then describe another car (subtle leakage: the row was chosen *because* of its outcome) |
-| B. Starting entry | keep the row the driver actually **started** in (grid > 0, then lowest `resultId`) | Selection uses only pre-race info, so features and target describe the same car. Consistent with the cutoff | May label a driver "no podium" even though he shared a podium car later in the race |
+| B. Starting entry | keep the row the driver actually **started** in. In practice: the lowest `resultId`, as a proxy for the starting car, plus a short list of verified overrides (2.6) | Selection uses only pre-race info, so features and target describe the same car. Consistent with the cutoff | May label a driver "no podium" even though he shared a podium car later in the race. The proxy can be wrong for a few pairs |
 | C. Hybrid | features from the starting entry, target = podium in **any** of his rows | Keeps the official credit and pre-race-consistent features | Mixes two rows into one, which is harder to explain and test |
 | D. Drop all duplicated pairs | remove these 176 rows | Simplest, no arbitrary choice | Loses data (small), and removes some genuine podiums from 1950s races |
 
-Practical note: if the modeling window starts where qualifying data exists (1994+, see 1.7), **none of these rows reach the model**. The rule still matters for the data-engineering questions if they use all years, and the brief requires a documented rule.
+Practical note: these rows are all from 1950-1978, so they never reach a 2003+ model. They do reach an all-years model and the data-engineering questions that use all seasons, and the brief requires a documented rule.
 """)
 
 # ---------------------------------------------------------------- 1.7 qualifying coverage
@@ -1033,12 +1033,13 @@ Decisions taken (evidence in section 1):
 
 | Decision | Choice | Why |
 |---|---|---|
-| Duplicate (raceId, driverId) | **Rule B**: keep the entry the driver **started** in (grid > 0 first, then lowest `resultId`) | the row is chosen with pre-race information only, so features and target describe the same car (1.6) |
+| Duplicate (raceId, driverId) | **Rule B**: keep the row with the **lowest `resultId`**, as a proxy for the car the driver started in, plus 3 verified overrides where the proxy is wrong | the row is chosen without looking at the result, so features and target describe the same car (1.6, 2.6) |
 | Non-starters | **removed**: non-start status (DNQ, DNPQ, Withdrew, 107%) with 0 laps, or no grid slot and 0 laps | they never took the start, so they aren't a "driver entering the race" and would be easy fake negatives (1.8) |
+| Indianapolis 500 (1950–1960) | **removed** from the cleaned results (kept aside only for a Q2 robustness check) | a separate American race inside the championship: its own drivers and cars, a 33-car oval field; it distorts Q2 and an all-years model (2.6.1) |
 | `grid = 0` (pit-lane start) | that race's last grid slot + 1, plus a `pit_lane_start` flag | 0 would look *better* than pole (1.8) |
-| Modeling window | **2003+** | qualifying coverage is ~100% only from 2003 (1.7) |
-| Standings | use the standings **after the previous round**, never the current race | same-race standings already contain the result (1.10) |
-| Unused tables | `seasons`, `lap_times`, `pit_stops` | only a link / in-race data (1.10) |
+| Modeling window | `model_base` = **2003+**; every pre-2003 row is cleaned too (`results_full`) | qualifying coverage is ~100% only from 2003 (1.7). A later all-years model version (missing qualifying left as NaN + a flag) needs the older rows clean as well |
+| Standings | use the standings **after the previous round**, never the current race | same-race standings already contain the result (1.10, proven in 2.10.2) |
+| Unused / deferred tables | `seasons`, `lap_times`, `pit_stops`, `constructor_results` not used; `sprint_results` cleaned but deferred | one-line reason per table in 2.1 |
 """)
 
 # ---------------------------------------------------------------- 2.1
@@ -1047,10 +1048,18 @@ md(r"""
 """)
 
 code(r'''
+# Tables not carried into CLEAN at all.
 UNUSED_TABLES = {
-    "seasons": "only year + Wikipedia url; races.year already holds the season (FK verified in 1.5)",
-    "lap_times": "recorded during the race = post-race information for the race we predict (1.10)",
-    "pit_stops": "recorded during the race = post-race information for the race we predict (1.10)",
+    "seasons": "not used: it only lists the years already in races.year (plus a Wikipedia url)",
+    "lap_times": "not used as features: recorded during the race (post-race information, 1.10)",
+    "pit_stops": "not used as features: recorded during the race (post-race information, 1.10)",
+}
+# Tables cleaned (so their keys are re-validated in 2.10) but not used by the questions or the current models.
+DEFERRED_TABLES = {
+    "constructor_results": "not used: per-race team points are already in results and constructor_standings; "
+                           "its status column is 99.9% empty",
+    "sprint_results": "cleaned but not used in the current models; to be tested later as an optional feature "
+                      "(sprint finish + has_sprint flag)",
 }
 CLEAN = {t: RAW[t].copy() for t in TABLES if t not in UNUSED_TABLES}
 cleaning_log = []
@@ -1069,7 +1078,9 @@ for t, df in CLEAN.items():
     counts["leading/trailing spaces stripped"] += int(((df != stripped) & (stripped != "")).sum().sum())
     CLEAN[t] = stripped.mask(stripped.isin([SENTINEL, ""]))  # both placeholder spellings become real missing values
 
-display(pd.Series(UNUSED_TABLES, name="reason not used").to_frame())
+display(pd.DataFrame([(t, "not carried", why) for t, why in UNUSED_TABLES.items()]
+                     + [(t, "cleaned, not used", why) for t, why in DEFERRED_TABLES.items()],
+                     columns=["table", "status", "reason"]))
 display(pd.Series(counts, name="cells").to_frame())
 ''')
 
@@ -1086,7 +1097,11 @@ display(accented)
 
 md(r"""
 **What this did.** `\N` **and** empty strings are now both real missing values (`NaN`), so later steps can't confuse a placeholder with data. Stray spaces are gone (`'Argentinian '` → `'Argentinian'`).
-`seasons`, `lap_times` and `pit_stops` aren't carried forward.
+**Unused and deferred tables (one line each, see the table above):**
+- `seasons`: not used; it only lists the years already in `races.year`.
+- `lap_times`, `pit_stops`: not used as features; they are recorded during the race.
+- `constructor_results`: not used; its per-race team points are already in `results` and `constructor_standings`, and its `status` column is 99.9% empty. It is still cleaned so its keys are checked in 2.10.
+- `sprint_results`: cleaned but not used in the current models; to be tested later as an optional feature (sprint finish + `has_sprint` flag).
 
 **Encoding:** there is nothing to fix. No cell contains mis-decoded characters, and accented names (e.g. *Räikkönen*) read correctly because the files are valid UTF-8. We document the check instead of "repairing" text that isn't broken.
 """)
@@ -1142,6 +1157,9 @@ def to_numeric_if_possible(s):
 for t in CLEAN:
     CLEAN[t] = CLEAN[t].apply(to_numeric_if_possible)
 
+# Points are always float, even where every value happens to be whole (sprint points: 8, 7, ... 1).
+CLEAN["sprint_results"]["points"] = CLEAN["sprint_results"]["points"].astype("float64")
+
 # Dates (and race start as a timestamp where the start time is recorded)
 races_c = CLEAN["races"]
 races_c["start_utc"] = pd.to_datetime(races_c["date"] + " " + races_c["time"], format="%Y-%m-%d %H:%M:%S")
@@ -1165,6 +1183,7 @@ md(r"""
 **What this did.** Every column that only holds numbers is now numeric. Columns with gaps use the **nullable** `Int64` type, so a missing value stays missing instead of becoming 0 or forcing floats.
 Dates are real dates (needed to order races in time), and lap times are seconds (`q1_sec`, ...), so they can be compared and averaged.
 The only text columns left are genuine labels (names, nationality, country, status).
+`sprint_results.points` holds only whole numbers, so the automatic typing made it an integer. It is set to float like `results.points`, so the two can be added or compared without a type mismatch.
 """)
 
 # ---------------------------------------------------------------- 2.4
@@ -1210,32 +1229,44 @@ Choices to defend: dual nationalities use the first one listed (the nationality 
 md(r"""
 ## 2.5 Status taxonomy (for Q3 and the non-starter rule)
 
-Every status is mapped to one category. The brief defines a **mechanical retirement** as a car component failing, excluding crashes, the driver, and regulation decisions.
-Statuses whose cause can't be told from the label go to **unclear** instead of being guessed. Q3 can then report the result with and without them.
+Every status is mapped to exactly one of **six categories**: finished, mechanical, accident, regulation, driver, unclear. The brief defines a **mechanical retirement** as a car component failing on its own, excluding crashes, the driver, and regulation decisions.
+Statuses whose cause can't be told from the label go to **unclear** instead of being guessed.
+
+The **non-starter rule** in 2.6 doesn't use these categories. It has its own list of statuses that mean "never took the start" (`NON_START_STATUSES`).
 """)
 
 code(r'''
 import re
 
+# Statuses that mean the car never took the start (used by the non-starter rule in 2.6, together with laps == 0).
+NON_START_STATUSES = {"Did not qualify", "Did not prequalify", "Withdrew", "107% Rule"}
+
 STATUS_GROUPS = {
-    "did not start": {"Did not qualify", "Did not prequalify", "Withdrew", "107% Rule"},
-    "regulation": {"Disqualified", "Excluded", "Underweight", "Not classified"},
+    # failed to qualify, or excluded / disqualified by the rules
+    "regulation": {"Disqualified", "Excluded", "Underweight", "Not classified",
+                   "Did not qualify", "Did not prequalify", "107% Rule"},
     "accident": {"Accident", "Collision", "Collision damage", "Spun off", "Fatal accident"},
     "driver": {"Injury", "Injured", "Illness", "Driver unwell", "Physical", "Eye injury"},
-    "unclear": {"Retired", "Damage", "Debris", "Puncture", "Tyre puncture", "Tyre", "Out of fuel", "Not restarted",
-                "Stalled", "Safety concerns", "Safety", "Fuel rig", "Refuelling", "Wheel nut", "Front wing", "Broken wing"},
+    # cause can't be told from the label: often contact or a pit error, a symptom rather than a part, or no cause given
+    "unclear": {"Retired", "Withdrew", "Out of fuel", "Damage", "Debris", "Puncture", "Tyre puncture", "Tyre",
+                "Not restarted", "Stalled", "Safety concerns", "Safety", "Fuel rig", "Refuelling",
+                "Wheel", "Wheel nut", "Front wing", "Rear wing", "Broken wing", "Undertray", "Vibrations"},
+    # a part of the car that fails on its own
     "mechanical": {
         "Engine", "Gearbox", "Transmission", "Clutch", "Hydraulics", "Electrical", "Radiator", "Suspension", "Brakes",
         "Differential", "Overheating", "Mechanical", "Driver Seat", "Driveshaft", "Fuel pressure", "Water pressure",
-        "Wheel", "Throttle", "Steering", "Technical", "Electronics", "Heat shield fire", "Exhaust", "Oil leak",
+        "Throttle", "Steering", "Technical", "Electronics", "Heat shield fire", "Exhaust", "Oil leak",
         "Wheel rim", "Water leak", "Fuel pump", "Track rod", "Oil pressure", "Engine fire", "Engine misfire",
-        "Pneumatics", "Handling", "Rear wing", "Fire", "Wheel bearing", "Fuel system", "Oil line", "Launch control",
-        "Fuel", "Power loss", "Vibrations", "Drivetrain", "Ignition", "Chassis", "Battery", "Halfshaft", "Crankshaft",
+        "Pneumatics", "Handling", "Fire", "Wheel bearing", "Fuel system", "Oil line", "Launch control",
+        "Fuel", "Power loss", "Drivetrain", "Ignition", "Chassis", "Battery", "Halfshaft", "Crankshaft",
         "Alternator", "Safety belt", "Oil pump", "Fuel leak", "Injection", "Distributor", "Turbo", "CV joint",
         "Water pump", "Spark plugs", "Fuel pipe", "Oil pipe", "Axle", "Water pipe", "Magneto", "Supercharger",
-        "Power Unit", "ERS", "Brake duct", "Seat", "Undertray", "Cooling system",
+        "Power Unit", "ERS", "Brake duct", "Seat", "Cooling system",
     },
 }
+STATUS_CATEGORIES = ["finished", "mechanical", "accident", "regulation", "driver", "unclear"]
+all_listed = [s for names in STATUS_GROUPS.values() for s in names]
+assert len(all_listed) == len(set(all_listed)), "a status is listed in two categories"
 
 
 def status_category(name):
@@ -1247,14 +1278,22 @@ def status_category(name):
 CLEAN["status"]["status_category"] = CLEAN["status"]["status"].map(status_category)
 unmapped = CLEAN["status"].loc[CLEAN["status"]["status_category"].isna(), "status"].tolist()
 assert not unmapped, f"unmapped statuses: {unmapped}"
+assert set(CLEAN["status"]["status_category"]) == set(STATUS_CATEGORIES)
 
 display(CLEAN["status"].groupby("status_category")["status"]
-        .agg(n_statuses="size", statuses=lambda s: ", ".join(sorted(s)[:12]) + (" ..." if len(s) > 12 else "")))
+        .agg(n_statuses="size", statuses=lambda s: ", ".join(sorted(s)[:12]) + (" ..." if len(s) > 12 else ""))
+        .loc[STATUS_CATEGORIES])
 ''')
 
 md(r"""
-**What this did.** All 139 statuses have a category, and the code asserts none is missed. `+N Laps` counts as *finished* (the car was running at the end, just lapped).
-Borderline calls to defend: `Puncture`, `Damage`, `Debris` and `Front wing` are usually caused by contact, and `Retired` gives no cause, so they are *unclear*, not mechanical. `Not classified` (running but too few laps) is a *regulation* outcome.
+**What this did.** All 139 statuses have exactly one of the six categories, and the code asserts that none is missed or listed twice. `+N Laps` counts as *finished* (the car was running at the end, just lapped).
+
+**What changed and why (after review):** the assignment is now consistent.
+- **mechanical** holds only parts that fail on their own (engine, gearbox, hydraulics, brakes, suspension, electrical, ...), plus `Technical` and `Seat`.
+- **unclear** now also holds `Wheel`, `Rear wing`, `Undertray` and `Vibrations`. They join `Wheel nut` and `Front wing`, which were already there: these are often caused by contact or a pit-stop error, or are a symptom rather than a failed part. `Retired`, `Out of fuel` and `Withdrew` (during the race) give no cause, so they are *unclear* too.
+- The old extra group *did not start* is gone. `Did not qualify`, `Did not prequalify` and `107% Rule` are **regulation** outcomes; `Withdrew` is *unclear*. The non-starter rule keeps its own status list, so it is unaffected.
+
+**Note for Q3:** the constructor ranking is reported twice, **strict** (mechanical only) and **broad** (mechanical + unclear). A team that ranks high in both is unreliable whichever way the borderline statuses are counted.
 """)
 
 # ---------------------------------------------------------------- 2.6
@@ -1269,8 +1308,7 @@ res_c = CLEAN["results"].merge(CLEAN["status"], on="statusId", how="left", valid
 res_c["podium"] = (res_c["positionOrder"] <= 3).astype("int8")   # target: positionOrder <= 3
 
 # --- Non-starters --------------------------------------------------------------------------------
-NON_START = STATUS_GROUPS["did not start"]
-by_status = res_c["status"].isin(NON_START) & (res_c["laps"] == 0)
+by_status = res_c["status"].isin(NON_START_STATUSES) & (res_c["laps"] == 0)
 no_slot = (res_c["grid"] == 0) & (res_c["laps"] == 0)
 non_starter = by_status | no_slot
 
@@ -1289,19 +1327,54 @@ log_step("remove non-starters", "results", n, len(res_c), "non-start status with
 ''')
 
 code(r'''
-# --- Duplicates: rule B (keep the entry the driver started in) ------------------------------------
+# --- Duplicates: rule B ----------------------------------------------------------------------------
+# Keep the row with the lowest resultId, as a proxy for the car the driver started in.
+# Verified overrides: pairs where the proxy is known to keep the car the driver took over mid-race.
+# In each case the proxy's row is an exact copy (car, grid, laps, finish) of another driver's only row,
+# i.e. that car was the other driver's start.
+RULE_B_OVERRIDES = pd.DataFrame([
+    (1951, "French Grand Prix", "Ascari", 19935,
+     "started car 12 from grid 3 (gearbox, lap 10), then took over González's car 14; the car-14 row copies González's row 20187"),
+    (1954, "Belgian Grand Prix", "González", 19276,
+     "started car 6 from grid 2 (engine, lap 1), then took over Hawthorn's car 10; the car-10 row copies Hawthorn's row 20238"),
+    (1961, "British Grand Prix", "Moss", 17964,
+     "started car 28 from grid 5 (brakes, lap 44), then took over Fairman's car 26; the car-26 row copies Fairman's row 20299"),
+], columns=["year", "race", "driver", "keep resultId", "why"])
+
 n = len(res_c)
+dups = res_c[res_c.duplicated(["raceId", "driverId"], keep=False)]
 dup_pairs = int(res_c.duplicated(["raceId", "driverId"]).sum())
+both_started = dups.groupby(["raceId", "driverId"])["grid"].apply(lambda g: (g > 0).all())
+print(f"Duplicated pairs after removing non-starters: {len(both_started)}; "
+      f"pairs where both rows have grid > 0: {int(both_started.sum())} -> grid can't tell the rows apart")
+
+# Each override must be one of the duplicated rows, for the named driver and race.
+ov = (RULE_B_OVERRIDES.merge(dups[["resultId", "raceId", "driverId"]], left_on="keep resultId", right_on="resultId", how="left")
+      .merge(CLEAN["races"][["raceId", "year", "name"]], on="raceId", how="left", suffixes=("", "_race"))
+      .merge(CLEAN["drivers"][["driverId", "surname"]], on="driverId", how="left"))
+assert ov["resultId"].notna().all() and (ov["year"] == ov["year_race"]).all() and (ov["race"] == ov["name"]).all() \
+    and (ov["driver"] == ov["surname"]).all(), "an override does not match a duplicated pair"
+
+proxy_choice = dups.sort_values("resultId").drop_duplicates(["raceId", "driverId"]).set_index(["raceId", "driverId"])["resultId"]
+RULE_B_OVERRIDES["proxy would keep"] = [proxy_choice.loc[(r, d)] for r, d in zip(ov["raceId"], ov["driverId"])]
+display(RULE_B_OVERRIDES[["year", "race", "driver", "proxy would keep", "keep resultId", "why"]])
+
 podium_any = res_c.groupby(["raceId", "driverId"])["podium"].transform("max")
-res_c = (res_c.assign(_started=res_c["grid"] > 0)
-         .sort_values(["raceId", "driverId", "_started", "resultId"], ascending=[True, True, False, True])
+res_c = (res_c.assign(_not_override=~res_c["resultId"].isin(RULE_B_OVERRIDES["keep resultId"]))
+         .sort_values(["raceId", "driverId", "_not_override", "resultId"])   # override first, then lowest resultId
          .drop_duplicates(["raceId", "driverId"], keep="first")
-         .drop(columns="_started"))
+         .drop(columns="_not_override"))
 lost = res_c[res_c["podium"] < podium_any.loc[res_c.index]].merge(CLEAN["races"][["raceId", "year"]], on="raceId")
-log_step("rule B: keep starting entry", "results", n, len(res_c), f"{dup_pairs} extra rows")
+log_step("rule B: one row per driver per race", "results", n, len(res_c), f"{dup_pairs} extra rows")
 print(f"Duplicate rows removed: {n - len(res_c)}")
 print(f"Drivers whose shared-drive podium is not credited under rule B: {len(lost)} "
       f"(seasons {lost['year'].min()}-{lost['year'].max()}, outside the 2003+ window)")
+
+french51 = CLEAN["races"].query("year == 1951 and name == 'French Grand Prix'")["raceId"]
+print("1951 French GP, podium rows after rule B + override:")
+display(res_c[res_c["raceId"].isin(french51) & (res_c["podium"] == 1)]
+        .merge(CLEAN["drivers"][["driverId", "surname"]], on="driverId")
+        .sort_values("positionOrder")[["surname", "resultId", "number", "grid", "positionOrder", "status"]])
 
 # --- grid = 0 (pit-lane start) -> that race's last slot + 1, with a flag -------------------------
 def recode_pit_lane(df):
@@ -1325,8 +1398,55 @@ md(r"""
 - **Target first:** `podium` is computed from `positionOrder` before anything is dropped, so cleaning can't change who finished on the podium.
 - **Non-starters:** the rule tests **laps = 0**, not `grid = 0`, for the non-start statuses. The 2005 US GP shows why: 14 drivers withdrew before the start *while holding grid slots* (several near the front). With a `grid = 0` test they would stay in the 2003+ data as "started from P3, no podium", which is false. Rows with no grid slot *and* no laps are also removed (crashed in warm-up, injured, excluded before the start).
   Pit-lane starters (`grid = 0` but laps > 0) **raced**, so they stay.
-- **Rule B:** the kept row is chosen only with pre-race information (did the driver start in that car?). The cost is that a few 1950s drivers lose podium credit from a car they took over mid-race. That's documented and outside the modeling window.
+- **Rule B (reworded after review):** keep the row with the **lowest `resultId`**, as a proxy for the car the driver started in. In this dataset the extra (takeover) rows were mostly added later: in 70 of the 85 raw pairs, one row has a `resultId` below 20,000 and the other one above it. `grid` can't decide: in every remaining pair **both** rows have grid > 0, because the second row carries the grid slot of the car's original driver. The rule never looks at the result, so features and target describe the same car. The cost is that a few 1950s drivers lose podium credit from a car they took over mid-race.
+- **Verified overrides:** in 3 pairs the proxy is known to be wrong. Its row is an exact copy of another driver's only row (same car, grid, laps and finish), so that car was the other driver's start. For those pairs we keep the driver's own starting car (table above). The most visible case is **Ascari, 1951 French GP**: the proxy kept González's car (2nd place), which gave that race a 4th podium row. With the override, the race has exactly 3 podium rows: Fagioli 1st, González 2nd, Villoresi 3rd.
+- **Limitation:** the proxy may still be wrong for a few other 1950s pairs that can't be verified from the data. All of them are before 1979, so they affect only the all-years model version and Q2 (which uses all seasons). Even then the effect is negligible: 82 pairs among ~25,000 rows, and most of them aren't podium rows.
 - **Grid:** a pit-lane start becomes "behind the last car" (that race's highest grid + 1), with `pit_lane_start` keeping the information that it happened.
+
+**Limitation: formation-lap failures (documented, no code change).** The data cannot distinguish a car that failed on the formation lap (never started) from one that retired on lap 1; both show 0 laps with a failure status. About 49 rows in 2003+ (0.5%) may be non-starters recorded as starters. We keep them, because removing all 0-lap rows would also remove genuine first-lap retirements and would select rows using race outcomes.
+""")
+
+md(r"""
+### 2.6.1 Indianapolis 500 (1950–1960)
+
+From 1950 to 1960 the Indianapolis 500 counted as a round of the World Championship, but it was a separate American race: its own drivers and cars, a 33-car field on an oval, and the Grand Prix teams almost never took part. The checks below measure how different it is from the other races.
+""")
+
+code(r'''
+indy_races = CLEAN["races"].loc[CLEAN["races"]["name"] == "Indianapolis 500", ["raceId", "year"]]
+assert len(indy_races) == 11 and indy_races["year"].between(1950, 1960).all()
+
+res_c = CLEAN["results"]
+is_indy = res_c["raceId"].isin(indy_races["raceId"])
+indy = res_c[is_indy].merge(CLEAN["drivers"][["driverId", "nationality"]], on="driverId")
+indy_drivers = indy["driverId"].unique()
+other_races = res_c.loc[~is_indy, "driverId"].unique()
+print(f"Indianapolis 500: {len(indy_races)} races ({indy_races['year'].min()}-{indy_races['year'].max()}), "
+      f"{len(indy)} cleaned rows, {len(indy_drivers)} drivers")
+print(f"American drivers: {int((indy['nationality'] == 'American').sum())} of {len(indy)} rows")
+print(f"Drivers who never started any other championship race: {int((~pd.Series(indy_drivers).isin(other_races)).sum())} "
+      f"of {len(indy_drivers)}")
+same_years = CLEAN["races"].loc[CLEAN["races"]["year"] <= 1960, "raceId"]
+other_fields = res_c[~is_indy & res_c["raceId"].isin(same_years)].groupby("raceId").size()
+print(f"Starters per race: Indy {indy.groupby('raceId').size().median():.0f} (median), "
+      f"other 1950-1960 races {other_fields.median():.0f} (median)")
+
+# Set aside (fully cleaned: non-starters, rule B and grid already applied), used only by the Q2 robustness check.
+INDY500_RESULTS = res_c[is_indy].copy()
+n = len(res_c)
+CLEAN["results"] = res_c[~is_indy].copy()
+log_step("remove Indianapolis 500 (1950-1960)", "results", n, len(CLEAN["results"]),
+         "separate US race in the championship: own drivers, 33-car oval field")
+print(f"Rows removed: {n - len(CLEAN['results'])}")
+''')
+
+md(r"""
+**What this did and why.** The Indianapolis 500 rows are removed from the cleaned results:
+- **Not the same competition:** 380 of its 381 starts are American drivers, and 103 of its 107 drivers never started another championship race. It doesn't describe the F1 Grands Prix we want to predict.
+- **It breaks Q2 (home advantage):** every Indy start is a "home" start for an American driver at a US circuit (the only exception is Ascari in 1952). There is no away driver in the same race to compare with, and the 33-car field pushes most of these rows into the back grid bands. Indy alone was 16% of all home starts.
+- **It would distort an all-years model:** 381 rows from another series, with no qualifying data.
+
+The `races` rows stay (the races did happen, and `driver_standings` still refers to them), so no foreign key breaks. The removed rows are kept aside in `INDY500_RESULTS`, only so that Q2 can show the result *with* Indy as a robustness check.
 """)
 
 # ---------------------------------------------------------------- 2.7
@@ -1419,9 +1539,34 @@ display(model_base.head())
 
 md(r"""
 **Two tables, two purposes.**
-- `results_full`: every cleaned driver-race (all years) **with** post-race columns. Q1–Q3 need the finishing order and status.
+- `results_full`: every cleaned driver-race (all years, without the Indianapolis 500) **with** post-race columns. Q1–Q3 need the finishing order and status.
 - `model_base`: the modeling grain (one row per driver per race, 2003+) with **only pre-race columns** plus the target. Feature engineering (section 3) adds qualifying, form and standings features to it.
   The code asserts that no post-race column is in it. The podium rate (~14%) shows the class imbalance the metrics must handle (hence PR-AUC).
+""")
+
+md(r"""
+### 2.9.1 Final status mapping, with row counts
+
+The full status → category table from 2.5, with how many cleaned race starts carry each status: all seasons, and the Q3 window (2014–2024).
+""")
+
+code(r'''
+status_counts = (results_full.assign(q3_window=results_full["year"] >= 2014)
+                 .groupby("statusId").agg(rows_all_years=("resultId", "size"), rows_2014_2024=("q3_window", "sum")))
+status_map = (CLEAN["status"].merge(status_counts, on="statusId", how="left")
+              .fillna({"rows_all_years": 0, "rows_2014_2024": 0})
+              .astype({"rows_all_years": int, "rows_2014_2024": int}))
+status_map["status_category"] = pd.Categorical(status_map["status_category"], STATUS_CATEGORIES, ordered=True)
+status_map = status_map.sort_values(["status_category", "rows_all_years"], ascending=[True, False])
+
+display(status_map.groupby("status_category", observed=True)[["rows_all_years", "rows_2014_2024"]].sum()
+        .assign(n_statuses=status_map.groupby("status_category", observed=True).size()))
+with pd.option_context("display.max_rows", 200):
+    display(status_map[["status_category", "status", "rows_all_years", "rows_2014_2024"]].reset_index(drop=True))
+''')
+
+md(r"""
+**What this shows.** Every status and its category, for review. Six statuses have 0 rows: `107% Rule`, `Did not prequalify`, `Underweight` and `Safety concerns` only occurred on removed non-starter rows, and `+38 Laps` / `+49 Laps` exist in the status table but never in `results`. In the Q3 window, `Retired` is the largest *unclear* status, which is why Q3 also reports the broad version (mechanical + unclear).
 """)
 
 # ---------------------------------------------------------------- 2.10
@@ -1447,17 +1592,31 @@ for name, df, key in [("results_full", results_full, ["raceId", "driverId"]),
     n_dup, n_null = int(df.duplicated(key).sum()), int(df[key].isna().any(axis=1).sum())
     check(f"{name}: {' + '.join(key)} unique and non-null", n_dup == 0 and n_null == 0, f"{n_dup} duplicates, {n_null} null")
 
-for child_name, child, col, parent, pcol in [
-        ("results_full", results_full, "raceId", CLEAN["races"], "raceId"),
-        ("results_full", results_full, "driverId", CLEAN["drivers"], "driverId"),
-        ("results_full", results_full, "constructorId", CLEAN["constructors"], "constructorId"),
-        ("results_full", results_full, "statusId", CLEAN["status"], "statusId"),
-        ("model_base", model_base, "circuitId", CLEAN["circuits"], "circuitId"),
-        ("qualifying", CLEAN["qualifying"], "raceId", CLEAN["races"], "raceId"),
-        ("driver_standings_prerace", CLEAN["driver_standings_prerace"], "driverId", CLEAN["drivers"], "driverId"),
-        ("constructor_standings_prerace", CLEAN["constructor_standings_prerace"], "constructorId", CLEAN["constructors"], "constructorId")]:
-    orphans = int((~child[col].dropna().isin(parent[pcol])).sum())
-    check(f"FK {child_name}.{col} -> {pcol}", orphans == 0, f"{orphans} orphans")
+# Every foreign key between the cleaned tables (child.column -> parent.column).
+FKS_CLEAN = [
+    ("races", "circuitId", "circuits"),
+    ("results", "raceId", "races"), ("results", "driverId", "drivers"),
+    ("results", "constructorId", "constructors"), ("results", "statusId", "status"),
+    ("qualifying", "raceId", "races"), ("qualifying", "driverId", "drivers"),
+    ("sprint_results", "raceId", "races"), ("sprint_results", "driverId", "drivers"),
+    ("sprint_results", "constructorId", "constructors"), ("sprint_results", "statusId", "status"),
+    ("driver_standings", "raceId", "races"), ("driver_standings", "driverId", "drivers"),
+    ("constructor_standings", "raceId", "races"), ("constructor_standings", "constructorId", "constructors"),
+    ("constructor_results", "raceId", "races"), ("constructor_results", "constructorId", "constructors"),
+    ("driver_standings_prerace", "raceId", "races"), ("driver_standings_prerace", "driverId", "drivers"),
+    ("constructor_standings_prerace", "raceId", "races"), ("constructor_standings_prerace", "constructorId", "constructors"),
+]
+fk_report = pd.DataFrame([{
+    "foreign key": f"{child}.{col} -> {parent}.{col}",
+    "child rows": len(CLEAN[child]),
+    "broken references": int((~CLEAN[child][col].dropna().isin(CLEAN[parent][col])).sum()),
+} for child, col, parent in FKS_CLEAN])
+display(fk_report)
+check(f"all {len(FKS_CLEAN)} foreign keys reconcile", fk_report["broken references"].sum() == 0,
+      f"{int(fk_report['broken references'].sum())} broken references")
+for col, parent in [("raceId", "races"), ("driverId", "drivers"), ("constructorId", "constructors"), ("circuitId", "circuits")]:
+    broken = int((~model_base[col].isin(CLEAN[parent][col])).sum())
+    check(f"FK model_base.{col} -> {parent}", broken == 0, f"{broken} broken")
 
 leftover = sum(int(df[c].isin([SENTINEL, ""]).sum()) for df in CLEAN.values() for c in df.select_dtypes("object"))
 check("no '\\N' or empty strings left in any table", leftover == 0, f"{leftover} cells")
@@ -1474,7 +1633,8 @@ assert check_report["passed"].all(), "a post-cleaning check failed"
 ''')
 
 md(r"""
-**What this means.** The grain is fixed (unique `raceId + driverId`), every key still resolves, no placeholder text is left, `grid` has no fake zeros, and every 2003+ race has exactly 3 podium rows (the shared-drive anomaly only existed before 1965).
+**What this means.** The grain is fixed (unique `raceId + driverId`), no placeholder text is left, `grid` has no fake zeros, and every 2003+ race has exactly 3 podium rows (the shared-drive anomaly only existed before 1965).
+**Foreign keys (extended after review):** the check now covers **all 21** foreign keys between the cleaned tables (it covered 8 before), including the deferred `sprint_results` and `constructor_results` and the new `*_prerace` tables. None has a broken reference: every row still points to an existing race, driver, team, circuit or status. (Only `results` lost rows, and no table references a `results` row.)
 """)
 
 md(r"""
@@ -1525,60 +1685,264 @@ md(r"""
 - **No missing values** in `model_base`, and ranges are plausible (grid 1–24, driver ages ~17–44, qualifying laps ~53–154 s).
 - **Small fields are real:** the 2005 US GP had 6 starters (14 withdrew), and the 2015 Australian GP had 15 (several cars did not start). They aren't cleaning errors.
 - **4 pairs of drivers share a grid slot** (e.g. 2015 Italian GP). This comes from the source data around grid penalties, not from cleaning. It's 8 rows out of 8,934. Grid is used as an ordinal feature, so a tie is harmless and the rows are left as they are.
-- **4 races with > 3 podium rows** are all 1951/1955 cross-driver shared drives (1.6). They're expected and outside the modeling window.
+- **1 race with > 3 podium rows** is left: the 1955 Argentine GP, a cross-driver shared drive (1.6) where two different drivers are credited with one car's 3rd place. It's expected and outside the 2003+ window. (There were 4: the Rule B override fixed the 1951 French GP, and the 1951 and 1955 Indianapolis 500 were removed in 2.6.1.)
 - **Gaps in the pre-race standings:** `driver_standings` early in a season only lists drivers who already have an entry (2003 round 1 has 11 standings rows for 20 starters). Missing values after round 1 therefore mean **"no points yet"** (or the driver didn't race the previous round), not a broken join. **Rule for feature engineering (section 3):** fill `pre_points` and `pre_wins` with 0, and give `pre_position` a "behind everyone ranked" value plus a `no_standing_yet` flag. Round 1 always gets this treatment.
+""")
+
+md(r"""
+### 2.10.2 Evidence that standings are post-race
+
+`driver_standings.points` at race R should be the driver's season total **after** race R. To check this, we rebuild each driver's cumulative season points race by race from the cleaned `results` and compare them to the standings in two ways:
+- **current race included:** points from round 1 up to and including R;
+- **current race not included:** points from round 1 up to R − 1.
+
+If standings are post-race, the first version should match almost every row and the second should not.
+""")
+
+code(r'''
+rounds = CLEAN["races"][["raceId", "year", "round"]]
+
+
+def per_race_points(df, name):
+    return df.groupby(["raceId", "driverId"])["points"].sum().rename(name).reset_index()
+
+
+# Points on raw rows that cleaning removed: the Indianapolis 500 (2.6.1), and shared-drive rows dropped by rule B.
+raw_pts = RAW["results"][["resultId", "raceId", "driverId", "points"]].astype(
+    {"resultId": int, "raceId": int, "driverId": int, "points": float})
+removed = raw_pts[~raw_pts["resultId"].isin(CLEAN["results"]["resultId"])]
+indy_pts = per_race_points(removed[removed["raceId"].isin(indy_races["raceId"])], "indy_pts")
+removed_pts = per_race_points(removed[~removed["raceId"].isin(indy_races["raceId"])], "removed_pts")
+
+# One row per driver, per round of every season in which the driver appears (0 points when he didn't score or race).
+driver_seasons = (pd.concat([CLEAN["results"][["raceId", "driverId"]], CLEAN["driver_standings"][["raceId", "driverId"]]])
+                  .merge(rounds, on="raceId")[["driverId", "year"]].drop_duplicates())
+season = driver_seasons.merge(rounds, on="year")
+for extra in [per_race_points(CLEAN["results"], "race_pts"), per_race_points(CLEAN["sprint_results"], "sprint_pts"),
+              indy_pts, removed_pts]:
+    season = season.merge(extra, on=["raceId", "driverId"], how="left")
+season = (season.fillna({"race_pts": 0.0, "sprint_pts": 0.0, "indy_pts": 0.0, "removed_pts": 0.0})
+          .sort_values(["driverId", "year", "round"]))
+by_season = season.groupby(["driverId", "year"])
+season["cum_incl"] = by_season["race_pts"].cumsum()                  # rounds 1..R
+season["cum_excl"] = season["cum_incl"] - season["race_pts"]          # rounds 1..R-1
+season["sprint_cum"] = by_season["sprint_pts"].cumsum()
+season["indy_cum"] = by_season["indy_pts"].cumsum()
+season["removed_cum"] = by_season["removed_pts"].cumsum()
+
+st = CLEAN["driver_standings"][["raceId", "driverId", "points"]].merge(season, on=["raceId", "driverId"], how="left",
+                                                                         validate="one_to_one")
+st["match_incl"] = np.isclose(st["points"], st["cum_incl"])
+st["match_excl"] = np.isclose(st["points"], st["cum_excl"])
+scored = st["race_pts"] > 0
+display(pd.DataFrame({
+    "all standings rows": [st["match_incl"].mean(), st["match_excl"].mean()],
+    "rows where the driver scored in that race": [st.loc[scored, "match_incl"].mean(), st.loc[scored, "match_excl"].mean()],
+}, index=["current race INCLUDED", "current race NOT included"]).mul(100).round(1).astype(str).add(" %"))
+
+# Why do the remaining rows not match (current race included)?
+mis = st[~st["match_incl"]].copy()
+all_removed = mis["cum_incl"] + mis["indy_cum"] + mis["removed_cum"]
+half = (mis["points"] % 1 != 0) | (mis["cum_incl"] % 1 != 0)
+CAUSES = ["sprint points (standings add the sprint, results don't)",
+          "Indianapolis 500 points (rows removed in 2.6.1, still in the standings)",
+          "shared drive (points of a row removed by rule B)",
+          "best-results rule before 1991 (only the best N scores counted)",
+          "half points"]
+mis["cause"] = np.select(
+    [np.isclose(mis["points"], mis["cum_incl"] + mis["sprint_cum"]),
+     np.isclose(mis["points"], all_removed) & (mis["indy_cum"] > 0),
+     np.isclose(mis["points"], all_removed) & (mis["removed_cum"] > 0),
+     (mis["year"] < 1991) & (mis["points"] < all_removed),
+     half],
+    CAUSES, "other")
+causes = (mis.groupby("cause").agg(rows=("points", "size"), seasons=("year", lambda y: f"{y.min()}-{y.max()}"))
+          .reindex(CAUSES + ["other"], fill_value=0))
+display(causes)
+names_ = CLEAN["drivers"].assign(driver=CLEAN["drivers"]["forename"] + " " + CLEAN["drivers"]["surname"])[["driverId", "driver"]]
+display(mis.merge(names_, on="driverId").sort_values(["cause", "year", "round"]).groupby("cause").head(2)
+        [["cause", "year", "round", "driver", "points", "cum_incl", "cum_excl", "sprint_cum", "indy_cum", "removed_cum"]]
+        .rename(columns={"points": "standings points", "cum_incl": "results incl. race", "cum_excl": "results excl. race"}))
+''')
+
+md(r"""
+**What this shows.** Standings are **post-race**.
+- With the current race **included**, the rebuilt totals match `driver_standings.points` in **96.1%** of rows; **not included**, only **74.7%** (those are mostly rows where the driver scored 0 in that race, so both totals are the same).
+- The clearest test is the rows where the driver **scored** in that race: **92.6%** match with the race included vs **0.1%** without. The standings row for race R already contains race R's points, so it must be lagged by one race (2.8).
+- **Every remaining mismatch has a known cause:** 689 rows are **sprint points** (2021–2024: the standings add the sprint, `results` doesn't). 452 are **Indianapolis 500 points** (1950–1960: the championship counted them, but the Indy rows were removed in 2.6.1). 84 are **shared drives** (1950–1957: the standings count the points of a row that rule B removed). 124 are the **best-results rule** before 1991 (only a driver's best N scores counted, so the standings are lower than the plain sum). **Half points** cause no mismatch, because `results.points` already holds the halves.
 """)
 
 # ---------------------------------------------------------------- 2.11
 md(r"""
-## 2.11 EDA before vs. after cleaning
+## 2.11 Before/after cleaning
+
+The brief asks for EDA **before and after** cleaning, to show what the cleaning changed. Each figure puts the raw data on the **left** and the cleaned data on the **right**.
 """)
 
 code(r'''
-display(pd.DataFrame(cleaning_log))
-
-raw_res = RAW["results"].assign(grid=lambda d: d["grid"].astype(int), podium=lambda d: (d["positionOrder"].astype(int) <= 3))
+raw_res = RAW["results"].assign(grid=lambda d: d["grid"].astype(int), positionOrder=lambda d: d["positionOrder"].astype(int))
+raw_res["podium"] = (raw_res["positionOrder"] <= 3).astype(int)
 raw_res = raw_res.merge(RAW["races"][["raceId", "year"]], on="raceId").assign(year=lambda d: d["year"].astype(int))
+BEFORE_COLOR, AFTER_COLOR = "#8C8C8C", "#4C72B0"
 
-fig, axes = plt.subplots(1, 3, figsize=(16, 4))
 
-log_df = pd.DataFrame(cleaning_log)
-axes[0].barh(log_df["step"], log_df["rows removed"], color="#C44E52")
-axes[0].set_title("Rows removed per cleaning step")
-axes[0].set_xlabel("rows")
-for y, v in enumerate(log_df["rows removed"]):
-    axes[0].text(v, y, f" {v:,}", va="center", fontsize=8)
+def before_after(title, figsize=(13, 4), sharey=True):
+    fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=sharey)
+    axes[0].set_title(f"Before: {title}")
+    axes[1].set_title(f"After: {title}")
+    return fig, axes
 
-bins = np.arange(-0.5, 36.5, 1)
-axes[1].hist(raw_res["grid"], bins=bins, alpha=0.5, label="raw", color="#8C8C8C")
-axes[1].hist(results_full["grid"], bins=bins, alpha=0.6, label="clean", color="#4C72B0")
-axes[1].set_title("grid distribution: raw vs clean")
-axes[1].set_xlabel("grid (raw 0 = no slot)")
-axes[1].legend()
 
-rate_raw = 100 * raw_res.groupby("year")["podium"].mean()
-rate_clean = 100 * results_full.groupby("year")["podium"].mean()
-axes[2].plot(rate_raw.index, rate_raw.values, label="raw results", color="#8C8C8C")
-axes[2].plot(rate_clean.index, rate_clean.values, label="clean results", color="#4C72B0")
-axes[2].axvspan(MODEL_START_YEAR, rate_clean.index.max(), color="#55A868", alpha=0.1, label="modeling window")
-axes[2].set_title("Podium rate per season")
-axes[2].set_ylabel("% of rows with podium")
-axes[2].legend(fontsize=8)
+fig, axes = before_after("number of podium rows per race")
+for ax, df, color in [(axes[0], raw_res, BEFORE_COLOR), (axes[1], results_full, AFTER_COLOR)]:
+    counts = df.groupby("raceId")["podium"].sum().value_counts().sort_index()
+    bars = ax.bar(counts.index.astype(str), counts.values, color=color)
+    ax.bar_label(bars, fontsize=9)
+    ax.set_yscale("log")
+    ax.set_xlabel("podium rows in the race")
+    ax.set_ylabel("races (log scale)")
 plt.tight_layout()
 plt.show()
-
-display(pd.DataFrame({
-    "raw rows": {t: len(RAW[t]) for t in CLEAN if t in RAW},
-    "clean rows": {t: len(CLEAN[t]) for t in CLEAN if t in RAW},
-}).assign(removed=lambda d: d["raw rows"] - d["clean rows"]))
 ''')
 
 md(r"""
-**What the comparison shows.**
-- **Rows removed:** most removals are non-starters, concentrated before the 1990s, when many entrants failed to (pre)qualify. Rule B removes 88 rows.
-- **Grid:** the raw spike at 0 is gone. Pit-lane starters now sit behind the last grid slot, so `grid` is a clean ordinal feature.
-- **Podium rate:** in the raw data, seasons with many non-qualifiers have an artificially *low* podium rate (the denominator includes cars that never started). After cleaning, the rate is stable at roughly 3 / starters per race. Inside the 2003+ window the change is small, which is good: the modeling data was mostly clean already.
-- Only `results` lost rows; every other table keeps all its rows (only values and types changed).
+**Podium rows per race:** before cleaning, 18 races had 4, 5 or 7 "podium" rows (shared drives counted the same driver twice); after the non-starter and duplicate rules and removing the Indianapolis 500, 1,113 of the 1,114 races have exactly 3. The one left with 4 is the 1955 Argentine GP, where two *different* drivers share one car's 3rd place.
+""")
+
+code(r'''
+KEY_COLUMNS = [  # (table, raw column, cleaned column; None = dropped in 2.2)
+    ("results", "position", None), ("results", "time", None), ("results", "milliseconds", "milliseconds"),
+    ("results", "fastestLapTime", "fastestLapTime_sec"), ("results", "rank", "rank"), ("results", "number", "number"),
+    ("qualifying", "q1", "q1_sec"), ("qualifying", "q2", "q2_sec"), ("qualifying", "q3", "q3_sec"),
+    ("races", "time", "start_utc"), ("drivers", "number", None), ("drivers", "code", None),
+]
+rows = []
+for t, raw_col, clean_col in KEY_COLUMNS:
+    s = RAW[t][raw_col].str.strip()
+    rows.append({"column": f"{t}.{raw_col}",
+                 "raw '\\N'": int((s == SENTINEL).sum()), "raw empty string": int((s == "").sum()),
+                 "raw rows": len(s),
+                 "clean column": clean_col or "dropped",
+                 "clean NaN": np.nan if clean_col is None else int(CLEAN[t][clean_col].isna().sum()),
+                 "clean rows": len(CLEAN[t])})
+missing_tbl = pd.DataFrame(rows)
+missing_tbl["raw missing %"] = 100 * (missing_tbl["raw '\\N'"] + missing_tbl["raw empty string"]) / missing_tbl["raw rows"]
+missing_tbl["clean NaN %"] = 100 * missing_tbl["clean NaN"] / missing_tbl["clean rows"]
+
+fig, axes = before_after("missing values per key column (% of rows)", figsize=(14, 5))
+y = np.arange(len(missing_tbl))
+sent_pct = 100 * missing_tbl["raw '\\N'"] / missing_tbl["raw rows"]
+empty_pct = 100 * missing_tbl["raw empty string"] / missing_tbl["raw rows"]
+axes[0].barh(y, sent_pct, color=BEFORE_COLOR, label="'\\N' text")
+axes[0].barh(y, empty_pct, left=sent_pct, color="#DD8452", label="empty string")
+axes[0].legend(loc="lower right", fontsize=8)
+axes[1].barh(y, missing_tbl["clean NaN %"].fillna(0), color=AFTER_COLOR, label="NaN")
+for yy, (pct, col) in enumerate(zip(missing_tbl["clean NaN %"], missing_tbl["clean column"])):
+    axes[1].text(1 if np.isnan(pct) else pct + 1, yy, "dropped (2.2)" if col == "dropped" else f"{pct:.0f}%  ({col})",
+                 va="center", fontsize=8)
+axes[0].set_yticks(y, missing_tbl["column"])
+axes[0].invert_yaxis()
+for ax in axes:
+    ax.set_xlim(0, 125)
+    ax.set_xlabel("% of rows")
+plt.tight_layout()
+plt.show()
+display(missing_tbl[["column", "raw '\\N'", "raw empty string", "raw missing %", "clean column", "clean NaN", "clean NaN %"]].round(1))
+''')
+
+md(r"""
+**Missing values:** before cleaning, pandas sees **none** of these gaps because they are the text `\N` (or an empty string in 68 `q2`/`q3` cells); after cleaning they are real `NaN` (for `qualifying` and `races` the counts are identical, plus the 1002.6 s Q1 lap set to NaN), sparse columns like `drivers.number/code` and `results.position/time` are dropped, and the `results` percentages fall slightly because non-starters, who had no times, were removed.
+""")
+
+code(r'''
+fig, axes = before_after("grid position distribution")
+bins = np.arange(-0.5, 36.5, 1)
+axes[0].hist(raw_res["grid"], bins=bins, color=BEFORE_COLOR)
+axes[1].hist(results_full["grid"].astype(int), bins=bins, color=AFTER_COLOR)
+n_zero = int((raw_res["grid"] == 0).sum())
+axes[0].annotate(f"grid = 0: {n_zero:,} rows", xy=(0, n_zero), xytext=(8, n_zero * 0.9), arrowprops={"arrowstyle": "->"})
+for ax in axes:
+    ax.set_xlabel("grid position")
+    ax.set_ylabel("rows")
+plt.tight_layout()
+plt.show()
+print(f"grid = 0 rows: {n_zero:,} before, {int((results_full['grid'] == 0).sum())} after; "
+      f"pit-lane starters recoded and flagged: {int(results_full['pit_lane_start'].sum())}")
+''')
+
+md(r"""
+**Grid:** the spike of 1,638 rows at `grid = 0` is gone: 1,566 of them were non-starters and were removed, and the 72 pit-lane starters now sit behind the last car of their race (with `pit_lane_start = True`), so `grid` is a clean ordinal feature where 1 is always the best.
+""")
+
+code(r'''
+q1_raw = RAW["qualifying"]["q1"].map(duration_to_seconds)   # '\N' and '' parse to NaN
+q1_clean = CLEAN["qualifying"]["q1_sec"]
+outlier = RAW["qualifying"].loc[q1_raw.idxmax()]
+fig, axes = before_after("qualifying Q1 lap time", sharey=False)
+axes[0].hist(q1_raw.dropna(), bins=np.arange(40, 1060, 10), color=BEFORE_COLOR)
+axes[0].set_yscale("log")
+axes[0].annotate(f"'{outlier['q1']}' = {q1_raw.max():.0f} s", xy=(q1_raw.max(), 1), xytext=(q1_raw.max() - 450, 30),
+                 arrowprops={"arrowstyle": "->"})
+axes[1].hist(q1_clean.dropna(), bins=np.arange(40, 165, 2), color=AFTER_COLOR)
+axes[0].set_ylabel("rows (log scale)")
+axes[1].set_ylabel("rows")
+for ax in axes:
+    ax.set_xlabel("Q1 time (seconds)")
+plt.tight_layout()
+plt.show()
+print(f"Q1 range before: {q1_raw.min():.1f}-{q1_raw.max():.1f} s; after: {q1_clean.min():.1f}-{q1_clean.max():.1f} s")
+''')
+
+md(r"""
+**Q1 times:** before cleaning, one Q1 time of `16:42.640` (1002.6 s, Japan 1995) stretches the range to over 16 minutes; after setting it to NaN (2.7) every Q1 time lies between 53.9 and 153.9 s, a plausible range for a flying lap.
+""")
+
+code(r'''
+rows_tbl = pd.DataFrame({"raw rows": {t: len(RAW[t]) for t in TABLES},
+                         "clean rows": {t: len(CLEAN[t]) if t in CLEAN else 0 for t in TABLES}})
+rows_tbl["removed"] = rows_tbl["raw rows"] - rows_tbl["clean rows"]
+rows_tbl["note"] = ["not carried (2.1)" if t in UNUSED_TABLES else ("cleaned, not used (2.1)" if t in DEFERRED_TABLES else "")
+                    for t in rows_tbl.index]
+
+fig, axes = before_after("rows per table (log scale)", figsize=(14, 5))
+y = np.arange(len(rows_tbl))
+axes[0].barh(y, rows_tbl["raw rows"], color=BEFORE_COLOR)
+axes[1].barh(y, rows_tbl["clean rows"].replace(0, np.nan), color=AFTER_COLOR)
+for yy, (t, r) in enumerate(rows_tbl.iterrows()):
+    axes[0].text(r["raw rows"] * 1.1, yy, f"{r['raw rows']:,}", va="center", fontsize=8)
+    label = r["note"] if t in UNUSED_TABLES else f"{r['clean rows']:,}" + (f"  (-{r['removed']:,})" if r["removed"] else "")
+    axes[1].text(max(r["clean rows"], 1) * 1.1, yy, label, va="center", fontsize=8)
+axes[0].set_yticks(y, rows_tbl.index)
+axes[0].invert_yaxis()
+for ax in axes:
+    ax.set_xscale("log")
+    ax.set_xlim(1, 5e6)
+    ax.set_xlabel("rows")
+plt.tight_layout()
+plt.show()
+display(rows_tbl)
+display(pd.DataFrame(cleaning_log))
+''')
+
+md(r"""
+**Rows per table:** only `results` loses rows (26,759 → 24,645: 1,645 non-starters, 88 duplicate rows and 381 Indianapolis 500 rows, see the step table); `seasons`, `lap_times` and `pit_stops` are not carried, and every other table keeps all its rows (only values and types changed).
+""")
+
+code(r'''
+fig, axes = before_after("podium rate per season")
+for ax, df, color in [(axes[0], raw_res, BEFORE_COLOR), (axes[1], results_full, AFTER_COLOR)]:
+    rate = 100 * df.groupby("year")["podium"].mean()
+    ax.plot(rate.index, rate.values, color=color)
+    ax.axvspan(MODEL_START_YEAR, 2024, color="#55A868", alpha=0.1, label="2003+ window")
+    ax.set_xlabel("season")
+    ax.set_ylabel("% of rows with a podium")
+    ax.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**Podium rate per season:** before cleaning, seasons with many non-qualifiers (late 1980s, as low as ~8%) look artificially weak because cars that never started sit in the denominator; after cleaning the rate follows 3 ÷ number of starters (about 11.5–19%), and inside the 2003+ window it barely changes, so the modeling data was mostly clean already.
 """)
 
 # ---------------------------------------------------------------- 2.12
@@ -1591,6 +1955,114 @@ after = {t: hashlib.sha256(read_raw_bytes(t)).hexdigest() for t in TABLES}
 assert all(after[t] == RAW_FINGERPRINT[t] for t in TABLES), "A raw file changed during cleaning!"
 print(f"All {len(TABLES)} raw files are still byte-identical after cleaning (SHA-256).")
 ''')
+
+# ---------------------------------------------------------------- 2.13
+md(r"""
+## 2.13 Export: the cleaned dataset
+
+The cleaned tables are written to `outputs/clean_data/`, so the next steps (and teammates) can start from them without re-running the cleaning. The raw files are not touched: these are new files.
+- **One CSV per table**, missing values written as empty cells.
+- **`schema.json`**: the type of every column. CSV loses types (e.g. nullable integers, dates), so `load_clean()` below uses it to restore them exactly.
+- **`manifest.csv`**: rows, columns and SHA-256 of every file, so anyone can check they have the same data.
+- **`README.md`**: what each file is, its key, and what cleaning did to it.
+
+The code reads every file back and checks it is **identical** to the in-memory table (values and types).
+""")
+
+code(r'''
+import json
+
+CLEAN_DATA_DIR = Path("outputs/clean_data")
+CLEAN_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# file -> (table, key, description)
+EXPORT = {
+    "model_base": (model_base, "raceId + driverId",
+                   "Modeling base, 2003+: one row per driver per race, pre-race columns + target `podium` only."),
+    "results_full": (results_full, "raceId + driverId",
+                     "All cleaned driver-races 1950-2024 (no Indianapolis 500), with race info and post-race columns. "
+                     "Used by the data-engineering questions. Post-race columns are never features."),
+    "results": (CLEAN["results"], "resultId (and raceId + driverId)",
+                "Cleaned results: target, non-starters removed, rule B, pit-lane grid recode, status + category."),
+    "qualifying": (CLEAN["qualifying"], "qualifyId (and raceId + driverId)",
+                   "q1/q2/q3 as seconds (`*_sec`); empty strings and the 1002.6 s outlier are NaN. Missing q2/q3 = knocked out."),
+    "races": (CLEAN["races"], "raceId", "date as a date; start_utc where the start time is recorded (2005+)."),
+    "drivers": (CLEAN["drivers"], "driverId", "dob as a date; nationality fixed; home_country for Q2."),
+    "constructors": (CLEAN["constructors"], "constructorId", "Teams."),
+    "circuits": (CLEAN["circuits"], "circuitId", "'United States' merged into 'USA'."),
+    "status": (CLEAN["status"], "statusId", "status_category: finished / mechanical / accident / regulation / driver / unclear."),
+    "driver_standings": (CLEAN["driver_standings"], "driverStandingsId (and raceId + driverId)",
+                         "Standings AFTER each race (post-race, leakage!). Use driver_standings_prerace for features."),
+    "constructor_standings": (CLEAN["constructor_standings"], "constructorStandingsId (and raceId + constructorId)",
+                              "Standings AFTER each race (post-race, leakage!). Use constructor_standings_prerace for features."),
+    "driver_standings_prerace": (CLEAN["driver_standings_prerace"], "raceId + driverId",
+                                 "Leakage-safe: standings after the previous round, keyed by the race being predicted. Round 1 has no row."),
+    "constructor_standings_prerace": (CLEAN["constructor_standings_prerace"], "raceId + constructorId",
+                                      "Leakage-safe: standings after the previous round, keyed by the race being predicted. Round 1 has no row."),
+    "sprint_results": (CLEAN["sprint_results"], "resultId (and raceId + driverId)",
+                       "Cleaned but not used yet (optional feature later)."),
+    "constructor_results": (CLEAN["constructor_results"], "constructorResultsId", "Cleaned but not used."),
+}
+
+schema, manifest = {}, []
+for name, (df, key, desc) in EXPORT.items():
+    path = CLEAN_DATA_DIR / f"{name}.csv"
+    df.to_csv(path, index=False)   # dates without a time are written as YYYY-MM-DD
+    schema[name] = {c: str(d) for c, d in df.dtypes.items()}
+    manifest.append({"file": path.name, "rows": len(df), "columns": df.shape[1], "key": key, "description": desc,
+                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+(CLEAN_DATA_DIR / "schema.json").write_text(json.dumps(schema, indent=1), encoding="utf-8")
+manifest = pd.DataFrame(manifest)
+manifest.to_csv(CLEAN_DATA_DIR / "manifest.csv", index=False)
+
+
+def load_clean(name, folder=CLEAN_DATA_DIR):
+    """Read one exported table back with its original column types."""
+    types = json.loads((Path(folder) / "schema.json").read_text(encoding="utf-8"))[name]
+    dates = [c for c, t in types.items() if t.startswith("datetime")]
+    df = pd.read_csv(Path(folder) / f"{name}.csv", dtype={c: t for c, t in types.items() if c not in dates},
+                     parse_dates=dates, keep_default_na=False, na_values=[""],
+                     float_precision="round_trip")   # the default fast parser can be off in the last digit
+    for c in dates:
+        df[c] = df[c].astype(types[c])
+    return df
+
+
+# Round trip: every file must read back identical to the in-memory table.
+for name, (df, _, _) in EXPORT.items():
+    pd.testing.assert_frame_equal(load_clean(name), df.reset_index(drop=True), check_exact=True)
+print(f"{len(EXPORT)} tables written to {CLEAN_DATA_DIR}/ and read back identical (values and types).")
+display(manifest[["file", "rows", "columns", "key"]])
+''')
+
+code(r'''
+lines = ["# Cleaned F1 dataset", "",
+         "Written by section 2.13 of `f1_podium_prediction.ipynb` (do not edit by hand; re-run the notebook instead).",
+         "Raw source: Kaggle / Ergast *Formula 1 World Championship (1950-2024)*. The raw CSVs are unchanged.", "",
+         "Load a table with its original types (nullable integers, dates):", "",
+         "```python", "df = load_clean(\"model_base\")   # defined in section 2.13 of the notebook", "```",
+         "or with plain pandas: `pd.read_csv(path, keep_default_na=False, na_values=[\"\"], float_precision=\"round_trip\")`, "
+         "then apply the types in `schema.json`.", "",
+         "## Files", "", "| file | rows | key | what it is |", "|---|---|---|---|"]
+lines += [f"| `{r.file}` | {r.rows:,} | {r.key} | {r.description} |" for r in manifest.itertuples()]
+lines += ["", "## What cleaning did (details in notebook section 2)", "",
+          "- `\\N` and empty strings -> missing values; text stripped; columns typed (IDs/counts integer, points float, dates as dates, lap times as seconds).",
+          "- `results`: target `podium = positionOrder <= 3` created first; 1,645 non-starters removed; one row per (raceId, driverId) by rule B "
+          "(lowest resultId as a proxy for the starting car, 3 verified overrides); `grid = 0` pit-lane starts -> last slot + 1 with `pit_lane_start`; "
+          "the Indianapolis 500 (1950-1960, 381 rows) removed.",
+          "- `qualifying`: times in seconds; the 1002.6 s Q1 lap set to missing.",
+          "- Labels: 'Argentinian ' -> 'Argentine', 'United States' -> 'USA', `drivers.home_country` added; every status has a category.",
+          "- `*_prerace` standings: leakage-safe standings from the previous round.",
+          "- Not exported: `seasons`, `lap_times`, `pit_stops` (not used).", "",
+          "**Leakage reminder:** post-race columns (`positionOrder`, `points`, `laps`, `status*`, `milliseconds`, `fastestLap*`, `rank`) "
+          "and the non-prerace standings must never be used as features."]
+(CLEAN_DATA_DIR / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+print("README.md written:", len(lines), "lines")
+''')
+
+md(r"""
+**What this did.** The cleaned dataset now exists as files in `outputs/clean_data/`: 15 CSVs, plus `schema.json`, `manifest.csv` and a `README.md` describing each file. Reading every file back gives exactly the in-memory tables, so later sections (or a teammate) can start from `load_clean("model_base")` instead of re-running the cleaning. The files are rewritten on every run, so they always match the notebook.
+""")
 
 # ================================================================ 3. DATA-ENGINEERING QUESTIONS
 md(r"""
@@ -1759,7 +2231,7 @@ plt.show()
 
 md(r"""
 **What the robustness check shows.**
-- **The conversion rate depends strongly on the decade:** about **46–52%** from the 1950s to the 1980s, rising to **74–75%** since 2010. Older cars broke down far more often, so even a front-row car often didn't finish.
+- **The conversion rate depends strongly on the decade:** about **46–54%** from the 1950s to the 1980s, rising to **74–75%** since 2010. Older cars broke down far more often, so even a front-row car often didn't finish.
 - Because of this, **"before 2014" = 1950–2013 mostly measures how old a circuit is**:
   - Classic circuits (Monza, Silverstone, Monaco) carry decades of unreliable-era races, which pulls their rate down.
   - Newer circuits (Bahrain, Shanghai) only have modern races, so they look better.
@@ -1834,7 +2306,8 @@ md(r"""
 **In simple words:** a British driver at Silverstone, a Dutch driver at Zandvoort... do they do better than usual? To be fair, we must compare drivers who **started from similar places**. Otherwise "home advantage" could just mean "the home driver qualified well".
 
 - **Tables & joins:** `results_full` ⟶ `drivers` on `driverId` (`home_country`, built in 2.4) ⟶ `circuits` on `circuitId` (`country`). **Home race** = `home_country == circuit country`.
-- **Grain:** one row = one driver starting one race (all seasons; non-starters were removed in 2.6).
+- **Grain:** one row = one driver starting one race (all seasons; non-starters were removed in 2.6, and the Indianapolis 500 in 2.6.1).
+- **Why no Indianapolis 500:** in 1950–1960 it was a separate American race. Almost every starter was an American at a US circuit (a "home" start), with no away drivers in the same race to compare with. It would have made up 16% of all home starts. The result with Indy put back is shown as a robustness column.
 - **Controlling for starting position:** drivers are grouped into **grid bands** (1–3, 4–6, 7–10, 11+). Home and away drivers are compared **inside the same band**. The band differences are then averaged, weighted by how many home starts fall in each band ("grid-adjusted difference").
 - **Uncertainty:** a bootstrap (resampling the rows 500 times) gives a 95% interval for the adjusted difference.
 - **Missingness:** none. Every driver has a `home_country`, and every cleaned row has a valid grid.
@@ -1843,11 +2316,20 @@ md(r"""
 
 code(r'''
 nat = CLEAN["drivers"][["driverId", "home_country"]]
-q2 = (results_full.merge(nat, on="driverId", how="left", validate="many_to_one")
-      .merge(circuits_c, on="circuitId", how="left", validate="many_to_one"))
-q2["home"] = q2["home_country"] == q2["country"]
 GRID_BANDS = ["1-3", "4-6", "7-10", "11+"]
-q2["grid_band"] = pd.cut(q2["grid"].astype(float), [0, 3, 6, 10, 99], labels=GRID_BANDS)
+
+
+def home_table(res):
+    df = (res.merge(nat, on="driverId", how="left", validate="many_to_one")
+          .merge(circuits_c, on="circuitId", how="left", validate="many_to_one"))
+    df["home"] = df["home_country"] == df["country"]
+    df["grid_band"] = pd.cut(df["grid"].astype(float), [0, 3, 6, 10, 99], labels=GRID_BANDS)
+    return df
+
+
+q2 = home_table(results_full)
+# Robustness only: put back the Indianapolis 500 rows removed in 2.6.1.
+q2_with_indy = home_table(pd.concat([results_full, INDY500_RESULTS.merge(race_info, on="raceId", how="left")]))
 
 
 def adjusted_home_diff(df):
@@ -1874,7 +2356,8 @@ def summarize(df):
 
 
 q2_summary = pd.DataFrame({"all seasons (1950-2024)": summarize(q2),
-                           "2003-2024 only": summarize(q2[q2["year"] >= 2003])})
+                           "2003-2024 only": summarize(q2[q2["year"] >= 2003]),
+                           "robustness: + Indianapolis 500": summarize(q2_with_indy)})
 display(q2_summary)
 
 band_table = (q2.groupby(["grid_band", "home"], observed=True)["podium"].agg(["mean", "size"]).unstack("home"))
@@ -1914,9 +2397,9 @@ plt.show()
 
 md(r"""
 **Answer to Q2: No, there is no home advantage once starting position is taken into account.**
-- **Without controlling for grid**, home drivers even look *worse* (≈ 11.2% vs 13.7% podiums). That's misleading, because home drivers start further back on average (grid ≈ 13.4 vs 11.7). In older seasons many local drivers entered only their home race in weaker cars.
-- **Comparing drivers who started from the same grid band**, the home rate is almost identical to the away rate in **every** band, just slightly lower (e.g. grid 1–3: ≈ 54% home vs 56% away).
-- The **grid-adjusted difference is close to zero** (about −0.6 points), and the 95% interval includes 0, so the small gap is consistent with chance. The modern era (2003+) points the same way.
+- **Without controlling for grid**, home drivers even look *worse* (≈ 11.6% vs 13.7% podiums). That's misleading, because home drivers start further back on average (grid ≈ 12.7 vs 11.7). In older seasons many local drivers entered only their home race in weaker cars.
+- **Comparing drivers who started from the same grid band**, the home rate is almost identical to the away rate in **every** band: slightly higher at the front (grid 1–3: ≈ 55.8% home vs 55.4% away; grid 4–6: 26.5% vs 26.0%) and slightly lower further back (grid 7–10: 7.2% vs 9.3%).
+- The **grid-adjusted difference is close to zero** (about −0.6 points), and the 95% interval includes 0, so the small gap is consistent with chance. The modern era (2003+) points the same way, and so does the robustness version with the Indianapolis 500 put back (−0.59 points, interval also includes 0).
 - **Takeaway:** what looks like a "home effect" is really a **starting-position effect**. Where you start matters a lot; whether you're at home doesn't. For the model this suggests a "home race" feature will add little.
 
 *Note:* controlling with grid bands is a simple, transparent method. Within a band, small grid differences remain, but the per-band rates are so close that a finer control wouldn't change the conclusion.
@@ -1930,7 +2413,7 @@ md(r"""
 
 - **Tables & joins:** `results_full` (already joined to `status` and its category in 2.5–2.6) ⟶ `constructors` on `constructorId` (team name), filtered by `year` (from `races`).
 - **Grain:** one row = one car starting one race. **Rate = mechanical retirements ÷ race starts** for that team in that period.
-- **Mechanical retirement:** `status_category == "mechanical"` (engine, gearbox, hydraulics, power unit, ...; 2.5). Crashes, driver problems and regulation decisions are excluded, as the brief defines. Statuses whose cause is unclear (`Retired`, `Puncture`, `Damage`, ...) are excluded from the main rate and shown as a **sensitivity check** ("upper bound").
+- **Mechanical retirement:** `status_category == "mechanical"` (engine, gearbox, hydraulics, power unit, ...; 2.5). Crashes, driver problems and regulation decisions are excluded, as the brief defines. Statuses whose cause is unclear (`Retired`, `Wheel`, `Puncture`, `Damage`, ...) are excluded from the main (**strict**) rate and added in the **broad** rate (mechanical + unclear, an upper bound).
 - **Missingness:** none. Every status has a category, and non-starters were removed, so the denominator counts real starts only.
 - **Small teams:** only teams with **≥ 40 starts** in a period are ranked. Team names follow the dataset: renamed teams (e.g. Toro Rosso → AlphaTauri → RB, Force India → Racing Point → Aston Martin) appear as separate entries.
 - **Cutoff:** not relevant. This is a historical post-race analysis, not a feature.
@@ -1965,8 +2448,8 @@ code(r'''
 fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 for ax, p in zip(axes, PERIODS):
     d = q3_rates[q3_rates["period"] == p].sort_values("mechanical %")
-    ax.barh(d["constructor"], d["mechanical + unclear %"], color="#F2C6A0", label="+ unclear causes (upper bound)")
-    ax.barh(d["constructor"], d["mechanical %"], color="#C44E52", label="mechanical")
+    ax.barh(d["constructor"], d["mechanical + unclear %"], color="#F2C6A0", label="broad: + unclear causes (upper bound)")
+    ax.barh(d["constructor"], d["mechanical %"], color="#C44E52", label="strict: mechanical")
     for yy, (v, ub, n) in enumerate(zip(d["mechanical %"], d["mechanical + unclear %"], d["starts"])):
         ax.text(max(v, ub) + 0.3, yy, f"{v:.1f}%  (n={n})", va="center", fontsize=8)
     field = 100 * q3.loc[q3["period"] == p, "mechanical"].mean()
@@ -1981,10 +2464,10 @@ plt.show()
 
 md(r"""
 **Answer to Q3.**
-- **2014–2021 (first hybrid engines):** the least reliable teams were **Lotus F1 (≈ 19% of starts ended with a car failure), Toro Rosso (≈ 16%) and McLaren (≈ 14%)**, followed by Renault. McLaren's years with the early Honda engine (2015–2017) are a well-known cause.
-- **2022–2024 (new car rules):** the highest rates belong to **Alfa Romeo (≈ 12.5%) and Alpine (≈ 11%)**, then AlphaTauri (≈ 8%).
-- **Big picture:** cars became **much more reliable**. The field-wide mechanical-retirement rate fell from about **9.5% to 6%** of starts, and the top teams in 2022–2024 (Red Bull, McLaren, Mercedes) retired from mechanical failures in only about 4% of starts.
-- **Robustness:** counting the "unclear" statuses as mechanical (light bars) raises some rates by up to ~6 points but doesn't change the top two in either period.
+- **2014–2021 (first hybrid engines):** the least reliable teams were **Lotus F1 (≈ 17% of starts ended with a car failure), Toro Rosso (≈ 16%) and McLaren (≈ 13.5%, tied with Renault)**. McLaren's years with the early Honda engine (2015–2017) are a well-known cause.
+- **2022–2024 (new car rules):** the highest rates belong to **Alfa Romeo (≈ 12.5%) and Alpine (≈ 11%)**, then AlphaTauri (≈ 7%).
+- **Big picture:** cars became **much more reliable**. The field-wide mechanical-retirement rate fell from about **9% to 5.5%** of starts, and the top teams in 2022–2024 (Red Bull, McLaren, Mercedes) retired from mechanical failures in only about 4% of starts.
+- **Strict vs broad (2.5):** the strict ranking counts only *mechanical* statuses (dark bars). The broad ranking also counts *unclear* ones (`Retired`, `Wheel`, `Puncture`, ...; light bars). That raises some rates by up to ~7 points but doesn't change the top two in either period.
 
 *Caution:* in 2022–2024 each team has at most ~136 starts, so one extra failure moves the rate by ~0.7 points. The differences between the middle teams are small.
 """)

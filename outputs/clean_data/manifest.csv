@@ -1,0 +1,16 @@
+file,rows,columns,key,description,sha256
+model_base.csv,8934,10,raceId + driverId,"Modeling base, 2003+: one row per driver per race, pre-race columns + target `podium` only.",2f75cee502ee1792f40a885857611bdc3e09d0fb9846da88c4c1417225a8edc5
+results_full.csv,24645,24,raceId + driverId,"All cleaned driver-races 1950-2024 (no Indianapolis 500), with race info and post-race columns. Used by the data-engineering questions. Post-race columns are never features.",aeb36036eeef682eb094223dc231bb956ec7e6e7a20ed0fea233fc096dda74ad
+results.csv,24645,19,resultId (and raceId + driverId),"Cleaned results: target, non-starters removed, rule B, pit-lane grid recode, status + category.",959a97401549d9ea55f39cbb729869ef5a0e7c06f4e202816b65bf3338083eb0
+qualifying.csv,10494,8,qualifyId (and raceId + driverId),q1/q2/q3 as seconds (`*_sec`); empty strings and the 1002.6 s outlier are NaN. Missing q2/q3 = knocked out.,59259ab1913f0110cc22641d7004d6cc618216366816cca7ee6f1f31c14e9223
+races.csv,1125,7,raceId,date as a date; start_utc where the start time is recorded (2005+).,83d37c388e0c6fd70f2c3d0d331cb8bfda551af41c18ed8f2322522175ae267d
+drivers.csv,861,7,driverId,dob as a date; nationality fixed; home_country for Q2.,bac41c241a37d61a3e37edc6bff7d71fe0a2d8be6a0c1c7ccd7d7c80482ac15c
+constructors.csv,212,4,constructorId,Teams.,cc219ca74e35d4abeda5207000d9e5fd1dd8ae8668daca5042423a7696bd9c41
+circuits.csv,77,4,circuitId,'United States' merged into 'USA'.,54bb0e3a85ebbc8df35a2c7819fb058545073f47413c74d4b09e6707e5f7bf24
+status.csv,139,3,statusId,status_category: finished / mechanical / accident / regulation / driver / unclear.,2c0ca59e08bfa5d226c620e71243715c13ba9d0f84754a3529933b39b414bfe6
+driver_standings.csv,34863,6,driverStandingsId (and raceId + driverId),"Standings AFTER each race (post-race, leakage!). Use driver_standings_prerace for features.",f8f9daf1bffe43d6e8873c4c0854a99017f15f81838a56fc8e9d0282e765637e
+constructor_standings.csv,13391,6,constructorStandingsId (and raceId + constructorId),"Standings AFTER each race (post-race, leakage!). Use constructor_standings_prerace for features.",c38eb054b6be77875ec6263e9f65b2586ba6bc9a992ce43ebe0661bea5df4d2d
+driver_standings_prerace.csv,31671,5,raceId + driverId,"Leakage-safe: standings after the previous round, keyed by the race being predicted. Round 1 has no row.",d69be4ca1c423173f1147c48bdd80b110ad8fec5aed481d3d6ca10e5710395d5
+constructor_standings_prerace.csv,12471,5,raceId + constructorId,"Leakage-safe: standings after the previous round, keyed by the race being predicted. Round 1 has no row.",ac539081242718e066a83246b915b49ccad3960aef2b9f53973ebecb5b3683fe
+sprint_results.csv,360,14,resultId (and raceId + driverId),Cleaned but not used yet (optional feature later).,9e089d75835ba0c47c8585ee48f0f680953737e7ffd41470acd8ab1bc81a124e
+constructor_results.csv,12625,4,constructorResultsId,Cleaned but not used.,3037b0b32c215d698eeb9353ee06324025adcb135a0b0ce3494a806739f4571a

@@ -12,7 +12,7 @@ This README is the project log. It records **what was done, why, and what was tr
 
 | Path | What it is |
 |---|---|
-| `f1_podium_prediction.ipynb` | **The deliverable.** One run-all notebook (the brief requires a single notebook). Currently sections 1–3. Saved with outputs. |
+| `f1_podium_prediction.ipynb` | **The deliverable.** One run-all notebook (the brief requires a single notebook). Sections 1–10. Saved with outputs. |
 | `tools/build_notebook.py` | **Generator** that writes every markdown and code cell of the notebook. The notebook was built from this script. |
 | `tools/run_notebook.py` | Executes the notebook top to bottom with `jupyter_client` and stores the outputs (no `nbconvert` needed). |
 | `outputs/anomalies/` | CSVs written by notebook section 1.12: one per raw table, plus `_summary.csv`. |
@@ -40,7 +40,7 @@ python tools/run_notebook.py  f1_podium_prediction.ipynb    # execute top to bot
 - On Windows, set `PYTHONIOENCODING=utf-8` when printing names with accents from a script (the terminal codepage otherwise fails on e.g. *Räikkönen*).
 
 ### Git
-- Work happens on branch **`youssef`** (pushed to `origin`, repo `Farah-Essam/ACL-2`).
+- Work happens on branch **`amr`** (repo `Farah-Essam/ACL-2`; earlier work on `youssef`, merged into `amr`).
 - Commits so far: audit + cleaning + questions (`d7fda8a`); cleaning review fixes, Indianapolis 500 removal, cleaned-dataset export and the approved section-4 plan (`45d54b0`); section 4 feature selection & engineering (16 Oct 2026). `Project.code-workspace` is a local editor file and is not committed.
 - Commit or push only when the user asks.
 
@@ -74,6 +74,8 @@ python tools/run_notebook.py  f1_podium_prediction.ipynb    # execute top to bot
 | **6. Predictive Modeling** (6.1–6.11) | done (17 Oct 2026); **frozen**, test not evaluated | forward-chaining CV (4 folds), 4 families × models A and B, OOF thresholds, validation once, A vs B + training-window experiments, freeze. Results in README 7.3 |
 | **7. Final optimisation, second freeze, test evaluation** (7.1–7.10) | done (17 Oct 2026) | grid-edge extension (rule-based), re-tuning with the same CV and rule, v2 freeze (`frozen_models_v2.json`, `model_artifacts_v2/`), **one-time test evaluation 2022–2024**, interpretation, 7.10 official race-level output (top 3 per race). Results in README 7.4 |
 | **8. Exploratory (post-test)** | done (17 Oct 2026) | 8 configurations on the historical folds only (grid shape, race-relative features, GB reference); no change to the frozen models. Results in README 7.5 |
+| **9. Feature-group ablation** | done (17 Oct 2026) | leave-one-group-out refits of LR and HGB (frozen v2 settings) on the historical folds. Results in README 7.7 |
+| **10. Explainable AI** | done (17 Oct 2026) | LR weights / odds ratios, global + local SHAP, complete-race top-3 explanations, LIME (supplementary), individual + grouped permutation importance, tree SHAP for HGB, method comparison. Results in README 7.7 |
 | 8+. Ablation, XAI, inference, report | to do | |
 
 Variables available after running sections 1–4:
@@ -167,7 +169,7 @@ Validation (2.10): 15 automated checks all pass (unique keys, **all 21 FKs** wit
 
 ---
 
-## 7. Next steps (agreed but not done)
+## 7. Section-by-section decisions and results (sections 4–10), and next steps
 
 ### 7.1 Section 4: Feature selection & engineering. Plan approved 15 Oct 2026, BUILT 16 Oct 2026
 
@@ -319,7 +321,7 @@ Order: Phase 1 re-tuning → Phase 2 freeze v2 → Phase 3 one-time test → Pha
 - **v2 primary model (same rule):** best mean CV = network A (0.706); logistic regression A is tied (paired rule) and simpler → **primary stays logistic regression, model A**.
 - **v2 thresholds (out-of-fold F1):** LR A 0.3806, RF A 0.3315, HGB A 0.3090, NN A 0.4441, LR B 0.2986, RF B 0.3660, HGB B 0.3686, NN B 0.2922 (full precision in the manifest).
 - **Validation (reported once):** v2 − v1: RF A +0.002, HGB A +0.012, NN A +0.023 [+0.001, +0.038], RF B −0.001, HGB B +0.002, NN B −0.001; LR identical.
-- **Freeze v2:** fingerprint **`2ebc3457f47525afaf17b679d98bffc83bd3481b8261f4c5b3da25e108abafaa`**, recorded 17 Oct 2026 17:46 **before any test cell existed**; the test cell asserts it. Artifacts in `outputs/model_artifacts_v2/` re-load bit for bit (tolerance 1e-9).
+- **Freeze v2:** fingerprint **`2ebc3457f47525afaf17b679d98bffc83bd3481b8261f4c5b3da25e108abafaa`**, recorded 17 Oct 2026 17:46 **before any test cell existed**; checked before the test by `verify_v2_freeze` (7.5, see 7.7 "Freeze verification"). Artifacts in `outputs/model_artifacts_v2/` re-load bit for bit (tolerance 1e-9).
 - **Test 2022–2024 (68 races, 1,354 rows, 204 podiums), frozen v2 models loaded from disk:**
 
   | Model | PR-AUC | ROC-AUC | Brier | precision | recall | F1 | F1 top-3 |
@@ -381,9 +383,107 @@ Order: Phase 1 re-tuning → Phase 2 freeze v2 → Phase 3 one-time test → Pha
 - **Findings:** no configuration meets the rule; podium-pick changes are within about ±4 correct picks out of 474. `log(grid)` is the only consistent change, but in **ranking** (PR-AUC +0.013, all 4 folds), not in the podium pick. Picking all three podium drivers right happens in about 1 race in 4; about 2 of 3 are right per race. Rescaling each race's probabilities (e.g. to sum to 3) keeps their order, so it cannot change the top-3 pick and was not tested as an improvement.
 - **Recommendation:** keep the frozen v2 logistic regression (model A) as the official model. Only `log(grid)` is worth carrying into a future version, to be evaluated on new seasons (2025+), not on 2019–2024.
 
-### 7.6 Later steps
+### 7.6 Further exploratory rounds outside the notebook (17 Oct 2026; details in `TRAINING_RUNS.md`, Runs 8–9)
 
-1. Ablation by feature group (grid, qualifying, standings, form) with every model (on validation; test only for the frozen final report); XAI (permutation importance, SHAP global, LIME/local SHAP; not causal) on the v2 primary model; inference function with two modes: a complete race → its 3 most likely podium finishers (official output), a single driver → podium probability (use `load_model_artifacts('outputs/model_artifacts_v2')`, which already handles partial records); report.
+> **Exploratory, after the test, and not part of the notebook.** Run as development scripts that reuse the notebook's section 4–5 and 8 code. Historical forward-chaining folds only (scoring 2011–2018, model A); validation and test seasons not used; frozen models, fingerprints, primary model, official output and all section-7 results unchanged. Baseline: LR `C` 1, 21 inputs (CV PR-AUC 0.703, top-3 F1 0.666, 2.00 correct picks per race).
+
+- **Run 8: four proposed enhancements.**
+  - **Race-aware rankers:** the pairwise ranker scores top-3 F1 0.655, −0.011 [−0.020, −0.002], **clearly worse**. The listwise ranker scores 0.662, −0.004 [−0.019, +0.011]. Both are worse on PR-AUC (0.683 and 0.686).
+  - **`log(grid)`:** PR-AUC 0.716, better in 4 of 4 folds; top-3 F1 +0.002 [−0.013, +0.015].
+  - **Exponentially weighted form / teammate-relative pace:** top-3 F1 +0.002 / 0.000 (identical picks), PR-AUC unchanged.
+  - **Selecting settings by top-3 F1 instead of PR-AUC** (nested over time, folds 2–4): logistic regression 2.03 vs 2.02 correct picks per race; gradient boosting **2.06 vs 2.10**, worse.
+- **Run 9: new information from our own data.**
+  - **Recent team qualifying form** (previous 5 races) **± this weekend's trend:** PR-AUC 0.705, +0.002 [−0.001, +0.005]; top-3 F1 −0.004, 0 of 4 folds improved.
+  - **Driver history at the circuit:** top-3 F1 −0.006.
+  - **Circuit × grid-band history:** −0.002.
+  - **All new features together:** −0.007.
+  - **Gradient boosting + all new features:** 0.666, only matching the LR baseline.
+- **Conclusion:** none meets the section-8 decision rule; every change moves the podium pick by fewer than about 4 correct picks out of 474. The frozen v2 logistic regression (model A) stays the official model.
+- **Future work** (needs new data and new seasons to test): practice-session long-run pace (e.g. FastF1, about 2018 onwards), a race-aware objective with richer inputs, and `log(grid)` for better probabilities.
+
+### 7.7 Sections 9–10: Feature-group ablation and explainable AI (17 Oct 2026)
+
+**Common rules:**
+- Both sections use only the **saved v2 model files** (`outputs/model_artifacts_v2/`), the model-A training rows (2003–2018) and the validation rows (2019–2021). **No test rows.**
+- On loading, they check that the files' fingerprint equals the v2 record and that the frozen validation predictions are reproduced exactly.
+- The frozen models, fingerprints, settings and all section-7 results are unchanged.
+- The Sections 6–7 searches are not repeated; Sections 9–10 run in about 1 minute.
+
+**Section 9: feature-group ablation** (details: `TRAINING_RUNS.md` Run 10)
+- **Groups**, at the 21-input level, each missing-value flag kept with its features:
+  - grid: `grid`, `pit_lane_start`;
+  - qualifying: `gap_q1_pct`, `grid_minus_quali`, `reached_q3`, `no_q3_format`, `quali_missing`, `q1_time_missing`;
+  - standings: the 4 standings inputs;
+  - form: the 4 form inputs + `drv_form_missing`, `cons_form_missing`;
+  - context: `n_starters`, `drv_experience`, `drv_age`.
+- **Method:** a genuine refit for each "without group" variant in each historical fold, with preprocessing re-fitted inside the fold. The group is removed after preprocessing, through a column-selection step, because the imputer needs all 18 raw columns. LR and HGB keep their frozen v2 settings. 48 fits; the full variants reproduce the section-8 baselines exactly.
+- **Results** (drop = full − without group; 95% intervals over the 158 fold races):
+  - **grid:** LR −0.059 PR-AUC [+0.037, +0.083] and −0.165 correct picks per race [+0.079, +0.260]; HGB −0.077 and −0.190. Clear, 4 of 4 folds.
+  - **form:** LR −0.017 [+0.002, +0.033] and −0.070 picks [+0.006, +0.136]; HGB −0.013 (interval includes 0).
+  - **qualifying, standings, context:** ≤ 0.004 PR-AUC, not clear. Qualifying overlaps with grid; standings with form and grid; context's age and experience cancel.
+
+**Section 10: explainable AI** (frozen primary model: logistic regression A, v2; validation 2019–2021; examples chosen by fixed rules)
+- **Scale:** contributions are in **log-odds** (they add up: base value + contributions = the model's log-odds); probabilities are shown separately.
+- **10.2 weights:**
+  - grid −2.0 per SD (each grid place multiplies the odds by 0.73);
+  - `q1_time_missing` +1.9 (offsets the back-of-grid start and slow-lap fill of penalised fast cars);
+  - `drv_no_standing_yet` +0.7 (offsets the "behind everyone" fill);
+  - `reached_q3` −0.6 and `drv_dnf_rate_5` +0.4 (correlated with grid / average finish);
+  - `drv_experience` +0.4 vs `drv_age` −0.4 (correlation 0.81, they cancel).
+- **10.3 global SHAP** (exact: weight × (value − training mean); the shap library's LinearExplainer gives identical values):
+  - base value −3.64 log-odds (probability 0.026);
+  - mean |SHAP|: grid 1.62, then `drv_avg_finish_5` 0.44, `drv_age` 0.43, `drv_experience` 0.41, `cons_points_share` 0.34.
+  - **Group importance, two definitions:**
+    - (A) = sum over the group's inputs of mean |SHAP|;
+    - (B) = mean over rows of |sum of the group's SHAP values|.
+  - (B): grid 1.62, form 0.51, standings 0.42, qualifying 0.40, context 0.26. (A) is higher where inputs cancel (context 0.87, form 0.95, qualifying 0.62).
+- **10.4 local SHAP (4 rule-chosen drivers):**
+  - Verstappen, pole, Abu Dhabi 2021 (0.909): every input agrees.
+  - Kvyat, grid 14, Germany 2019 (0.007, finished 3rd in the rain): a genuine surprise.
+  - Verstappen, grid 7 after a penalty, Qatar 2021 (0.796): `grid_minus_quali` = 5 adds +1.0.
+  - Verstappen, grid 20 with no Q1 time, Russia 2021 (0.135, finished 2nd): the flag gives back +1.9 of the −2.8 grid cost.
+- **10.5 complete races:**
+  - **Singapore 2019:** the 3rd vs 4th gap is 0.0005 (Verstappen vs Bottas), decided by standings −0.62, context +0.51, grid +0.32, form −0.25. 2 of 3 picks right; winner Vettel was 5th most likely.
+  - **Australia 2019:** the model picks Verstappen (grid 4) over grid-2 Bottas on form +1.00 vs grid −0.64. Model and grid both 2 of 3.
+- **10.6 LIME (supplementary):**
+  - Run on the 21 filled inputs in original units. A wrapper on the 18 raw features is impractical: LIME can't sample missing values, and the missing-value flags could never switch on.
+  - Weak local fits (R² 0.14–0.55); LIME's local predictions are far from the model's (e.g. 0.38 vs 0.91).
+  - Stable across seeds (3–4 of the top 5 shared), but only 1–3 of the top 5 overlap with SHAP.
+  - Impossible synthetic rows: 1.5% "no Q1 time but a real gap", 1.4% "debut with earlier starts", 2.0% "grid beyond the field".
+  - **Not an exact explanation;** SHAP is the reference.
+- **10.7 permutation, 50 repeats on validation:**
+  - **across rows → PR-AUC drop:** grid 0.417, form 0.074, standings 0.051, qualifying 0.047, context 0.005;
+  - **within race → top-3 F1 drop:** grid 0.375, form 0.038, standings 0.031, qualifying 0.024, context 0.001;
+  - **grouped permutation** uses one shared row order per group;
+  - **individual inputs:** `drv_experience` alone 0.057, but the whole context group only 0.005. This is the correlation effect (age and experience offset each other).
+- **10.8 tree SHAP, HGB A** (shap's TreeExplainer; additivity checked): group (B) grid 0.85, form 0.53, standings 0.36, qualifying 0.10, context 0.06.
+- **10.9 agreement:** grid is 1st and form 2nd under every method except the raw weights. Qualifying is 1st by the sum of |weights| only (flags that rarely apply or offset each other). Standings and qualifying swap places between methods.
+- **Not causal:** these explanations describe what the model uses, not what causes podiums.
+
+**Interpretation caveats** (documented in Section 10's introduction):
+- **`pit_lane_start`:** only recorded from 2015 (7 model-A training rows, none on the podium).
+- **`no_q3_format`:** constant 0 in validation.
+- **`*_no_standing_yet`:** means "0 points yet" in 2003–09, but mostly "first race / debut" later.
+- **`grid_minus_quali`:** on 2021–22 sprint weekends it reflects the sprint result as well as penalties.
+- **Correlated groups:** grid, qualifying, standings and form all describe car and driver pace.
+
+**Freeze verification before the test (7.5; replaces the earlier plain fingerprint assertion):**
+- It compares the current v2 freeze with the record frozen on 17 Oct 2026, embedded in the notebook.
+- **Strict, any difference stops the notebook:** the 10 entries; every model's family, settings, training seasons, preprocessing, seed and flags; the 18 input columns and both 21-input lists; every fitted model's preprocessing steps and model type.
+- **Numbers** (thresholds, CV / validation PR-AUC, epochs):
+  - identical fingerprint → exact match;
+  - different numbers under the **same** library versions → stop (unexplained);
+  - under **other** versions (e.g. Kaggle) → warning table, stopping only beyond tolerance (threshold 0.05, CV PR-AUC 0.02, validation PR-AUC 0.03).
+- Tested in all five scenarios: exact; small numeric with other versions; small numeric with the same versions; a structural change; beyond tolerance.
+
+**Kaggle and dependencies:**
+- **SHAP** is pre-installed on Kaggle. If missing, the notebook tries `pip install`; without shap, the linear SHAP values are still computed exactly by formula and plotted with matplotlib, and tree SHAP is reported as missing.
+- **LIME** may need `pip install lime` (internet). If that fails, 10.6 prints a clear limitation message instead of silently skipping.
+- **Runtime:** Sections 9–10 take about 1 minute; on Kaggle (4 CPUs) the whole notebook is estimated at 1.5–2 hours, mostly Sections 6–7.
+
+### 7.8 Later steps
+
+1. ~~Ablation and XAI~~: done (sections 9–10). Inference function with two modes: a complete race → its 3 most likely podium finishers (official output), a single driver → podium probability (use `load_model_artifacts('outputs/model_artifacts_v2')`, which already handles partial records); report.
 
 ---
 

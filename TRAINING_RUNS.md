@@ -250,6 +250,126 @@ On the test, official minus grid is +0.044 correct drivers per race, interval [�
 
 ---
 
+## Run 8: Four proposed enhancements (exploratory, after the test; historical CV folds only)
+
+**Status:** run **outside the notebook** during development (scratch scripts that reuse the notebook's sections 4–5 and 8 code). Validation and test seasons were not used, and no frozen model changed. Same baseline, metrics and race-resampling intervals as Run 7.
+
+| Proposal | Configuration | CV PR-AUC | CV top-3 F1 | Correct / race | Exact-3 rate | Top-3 gain [95% interval] | Folds improved (top-3 / PR-AUC) |
+|---|---|---|---|---|---|---|---|
+| – | C0 baseline (LR `C` 1, 21 inputs) | 0.703 | 0.666 | 2.00 | 0.265 | – | – |
+| P1 race-aware ranking | pairwise ranker (LR on within-race podium vs non-podium pairs) | 0.683 | 0.655 | 1.97 | 0.239 | **−0.011 [−0.020, −0.002], clearly worse** | 0 / 0 |
+| P1 | listwise ranker (softmax over each race, linear score) | 0.686 | 0.662 | 1.98 | 0.240 | −0.004 [−0.019, +0.011] | 0 / 0 |
+| P1 | listwise ranker + `log(grid)` | 0.688 | 0.662 | 1.98 | 0.240 | −0.004 (same picks as above) | 0 / 0 |
+| P2 grid shape | LR + `log(grid)` | **0.716** | 0.668 | 2.00 | 0.252 | +0.002 [−0.013, +0.015] | 2 / **4** |
+| P3 better form | LR + exponentially weighted form (half-life 3: driver podiums, driver finish, team podiums) | 0.703 | 0.668 | 2.00 | 0.252 | +0.002 [−0.011, +0.015] | 1 / 1 |
+| P3 | LR + teammate-relative Q1 pace (previous 5 races) | 0.703 | 0.666 | 2.00 | 0.265 | 0.000 (identical picks) | 0 / 2 |
+| P3 | LR + both | 0.703 | 0.668 | 2.00 | 0.252 | +0.002 [−0.011, +0.015] | 2 / 1 |
+
+**P4: selecting settings by a race-level metric.** This was nested over time: at folds 2–4, the setting was chosen using only earlier folds, by PR-AUC or by top-3 F1, then scored on the next fold.
+
+| Family | Chosen by | Next-fold top-3 F1 | Correct / race | Next-fold PR-AUC |
+|---|---|---|---|---|
+| Logistic regression (8 settings) | PR-AUC | 0.674 | 2.02 | 0.718 |
+| Logistic regression | top-3 F1 | 0.677 | 2.03 | 0.718 |
+| Gradient boosting (16 settings) | PR-AUC | **0.699** | **2.10** | 0.700 |
+| Gradient boosting | top-3 F1 | 0.688 | 2.06 | 0.694 |
+
+**Outcome:**
+- No enhancement improves the podium pick; the pairwise ranker makes it clearly worse.
+- `log(grid)` again improves PR-AUC only.
+- Choosing settings by top-3 F1 gives no consistent benefit and is worse for gradient boosting, because the metric is noisier.
+- The frozen model is kept.
+
+---
+
+## Run 9: New information from our own data (exploratory, after the test; historical CV folds only)
+
+**Status:** run **outside the notebook**, like Run 8. Validation and test seasons were not used, and no frozen model changed.
+
+**New features**, each using only earlier races, or this race's own qualifying (300 rows recomputed by hand):
+- **Recent team qualifying form:** the team's mean Q1 gap and mean qualifying position ÷ field size over its previous 5 races, within team-history segments.
+- **This weekend's trend:** the current Q1 gap minus that recent mean.
+- **Driver's circuit history:** the driver's earlier podium rate at the circuit (smoothed with 2 pseudo-starts at 14%) and number of earlier starts there.
+- **Circuit × grid-band history:** the earlier podium rate from the same grid band (1–3 / 4–6 / 7–10 / 11+) at that circuit, smoothed towards the band's overall earlier rate (10 pseudo-starts).
+
+| Configuration | CV PR-AUC | CV top-3 F1 | Correct / race | Exact-3 rate | Top-3 gain [95% interval] | PR-AUC gain [95% interval] | Folds improved (top-3 / PR-AUC) |
+|---|---|---|---|---|---|---|---|
+| C0 baseline (LR) | 0.703 | 0.666 | 2.00 | 0.265 | – | – | – |
+| LR + recent team qualifying form | 0.705 | 0.662 | 1.98 | 0.252 | −0.004 [−0.013, +0.002] | +0.002 [−0.001, +0.005] | 0 / 4 |
+| LR + team qualifying form + trend | 0.705 | 0.662 | 1.98 | 0.252 | −0.004 [−0.013, +0.002] | +0.002 [−0.002, +0.004] | 0 / 3 |
+| LR + driver history at the circuit | 0.701 | 0.659 | 1.98 | 0.258 | −0.006 [−0.013, +0.000] | −0.003 [−0.008, +0.002] | 0 / 1 |
+| LR + circuit × grid-band history | 0.699 | 0.664 | 1.99 | 0.259 | −0.002 [−0.019, +0.013] | −0.004 [−0.013, +0.003] | 2 / 1 |
+| LR + both circuit histories | 0.697 | 0.666 | 2.00 | 0.265 | −0.000 [−0.017, +0.017] | −0.007 [−0.015, +0.004] | 2 / 1 |
+| LR + all new features | 0.697 | 0.659 | 1.98 | 0.259 | −0.007 [−0.021, +0.008] | −0.006 [−0.012, +0.006] | 1 / 1 |
+| Gradient boosting (frozen v2 setting) | 0.694 | 0.659 | 1.98 | 0.233 | – (reference for the next row) | – | – |
+| Gradient boosting + all new features | 0.694 | 0.666 | 2.00 | 0.246 | +0.006 [−0.004, +0.019] vs gradient boosting | +0.000 [−0.006, +0.006] | 2 / 2 |
+
+**Outcome:**
+- Recent team qualifying form adds nothing beyond this weekend's qualifying.
+- Circuit history is too sparse (a few starts per driver per circuit) and slightly hurts.
+- With every new feature, gradient boosting only matches the logistic-regression baseline.
+- **Not tested:** practice pace, weather forecasts and tyre plans aren't in the dataset. Practice pace (e.g. via the FastF1 library, about 2018 onwards) is the most promising source for a future version.
+
+---
+
+## Run 10: Section 9, feature-group ablation (historical CV folds only)
+
+**Setup:**
+- **Groups removed, one at a time:** the five groups, each with its missing-value flags. Grid (2 inputs), qualifying (6), standings (4), form (6), context (3).
+- **Refits:** each model is genuinely refitted inside each of the four historical folds, with preprocessing re-fitted on the fold's training seasons and the frozen v2 settings (no re-tuning). Groups are removed *after* preprocessing, because the imputer needs all 18 raw columns.
+- **Fits:** 48 in total (2 families × 6 variants × 4 folds), about 4 s.
+- **Data:** validation and test seasons not used; frozen models unchanged.
+- **Check:** the "full" variants reproduce the Run 7 baselines exactly.
+- **"Drop"** = full model − model without the group. Intervals come from resampling the 158 fold races.
+
+| Model | Variant | CV PR-AUC | ROC-AUC | Top-3 F1 | Correct / race | Exact-3 | PR-AUC drop [95%] | Correct-picks drop [95%] | Folds with lower PR-AUC |
+|---|---|---|---|---|---|---|---|---|---|
+| LR | full model | 0.703 | 0.938 | 0.666 | 2.00 | 0.265 | – | – | – |
+| LR | without grid | 0.645 | 0.926 | 0.611 | 1.83 | 0.132 | **+0.059 [+0.037, +0.083]** | **+0.165 [+0.079, +0.260]** | 4 / 4 |
+| LR | without qualifying | 0.699 | 0.936 | 0.676 | 2.03 | 0.253 | +0.004 [+0.001, +0.010] | −0.032 [−0.070, +0.000] | 3 / 4 |
+| LR | without standings | 0.701 | 0.936 | 0.657 | 1.97 | 0.239 | +0.002 [−0.011, +0.010] | +0.025 [−0.013, +0.070] | 2 / 4 |
+| LR | without form | 0.687 | 0.934 | 0.642 | 1.93 | 0.207 | **+0.017 [+0.002, +0.033]** | **+0.070 [+0.006, +0.136]** | 4 / 4 |
+| LR | without context | 0.704 | 0.937 | 0.653 | 1.96 | 0.227 | −0.001 [−0.016, +0.006] | +0.038 [−0.022, +0.101] | 2 / 4 |
+| HGB | full model | 0.694 | 0.940 | 0.659 | 1.98 | 0.233 | – | – | – |
+| HGB | without grid | 0.617 | 0.922 | 0.596 | 1.79 | 0.126 | **+0.077 [+0.046, +0.101]** | **+0.190 [+0.076, +0.307]** | 4 / 4 |
+| HGB | without qualifying | 0.692 | 0.941 | 0.664 | 1.99 | 0.240 | +0.002 [−0.010, +0.012] | −0.013 [−0.044, +0.013] | 2 / 4 |
+| HGB | without standings | 0.696 | 0.939 | 0.663 | 1.99 | 0.240 | −0.002 [−0.012, +0.005] | −0.013 [−0.044, +0.019] | 2 / 4 |
+| HGB | without form | 0.680 | 0.937 | 0.644 | 1.93 | 0.213 | +0.013 [−0.004, +0.024] | +0.044 [−0.010, +0.095] | 4 / 4 |
+| HGB | without context | 0.694 | 0.941 | 0.659 | 1.98 | 0.233 | −0.000 [−0.010, +0.003] | 0.000 [−0.019, +0.013] | 2 / 4 |
+
+**Outcome:**
+- **Grid** is by far the most important group, and its loss is clear for both models.
+- **Form** is the second clear group for logistic regression; for gradient boosting it has the same size, but the interval includes 0.
+- **Qualifying, standings and context** add little on top of the others, because they overlap with grid and form. This measures each group's *unique* contribution.
+
+---
+
+## Section 10: Explainability (no training; frozen primary model, validation 2019–2021)
+
+No model was trained or changed here; the frozen logistic regression A (v2) was explained as saved.
+
+**Group importance under each method** (rank 1 = most important):
+
+| Method | Grid | Form | Standings | Qualifying | Context |
+|---|---|---|---|---|---|
+| Ablation, LR, PR-AUC drop | 1 | 2 | 4 | 3 | 5 |
+| Ablation, LR, correct-picks drop | 1 | 2 | 4 | 5 | 3 |
+| Ablation, gradient boosting, PR-AUC drop | 1 | 2 | 5 | 3 | 4 |
+| Grouped permutation, PR-AUC (shuffled across rows) | 1 (0.417) | 2 (0.074) | 3 (0.051) | 4 (0.047) | 5 (0.005) |
+| Grouped permutation, top-3 F1 (shuffled within race) | 1 (0.375) | 2 (0.038) | 3 (0.031) | 4 (0.024) | 5 (0.001) |
+| SHAP, LR: mean of the group's total contribution (log-odds) | 1 (1.62) | 2 (0.51) | 3 (0.42) | 4 (0.40) | 5 (0.26) |
+| Tree SHAP, gradient boosting: same measure | 1 (0.85) | 2 (0.53) | 3 (0.36) | 4 (0.10) | 5 (0.06) |
+| Sum of the absolute LR weights | 2 | 3 | 4 | 1 | 5 |
+
+**Main points:**
+- Grid is ranked 1st and form 2nd by every method except the raw weights.
+- Qualifying's large weights belong to flags that rarely apply or that offset each other.
+- Age and experience cancel each other, which is why context looks moderate in SHAP measure (A) but negligible elsewhere.
+- LIME's local fits are weak (R² 0.14–0.55) and agree only partly with SHAP (1–3 of the top 5 inputs), so SHAP is the reference.
+- Details are in README 7.7.
+
+---
+
 ## Summary: what changed from run to run, and why
 
 | Step | Change | Why | Effect |
@@ -263,3 +383,7 @@ On the test, official minus grid is +0.044 correct drivers per race, interval [�
 | Run 6 (test) | One-time evaluation of the v2 freeze | Brief requires test results | Primary 0.705 PR-AUC; every family clearly beats the grid baseline |
 | 7.10 | Top-3 per race made the official output | Every race has exactly 3 podiums | Test: 2.00 correct per race, 16 / 68 races fully right |
 | Run 7 (exploratory) | Grid shape + race-relative features | Try to improve the podium pick cheaply | No consistent improvement; frozen model kept |
+| Run 8 (exploratory, outside the notebook) | Race-aware rankers, `log(grid)`, better form features, selecting by top-3 F1 | Proposed enhancements aimed at the podium pick | None improves the podium pick; the pairwise ranker is clearly worse; `log(grid)` helps PR-AUC only |
+| Run 9 (exploratory, outside the notebook) | Recent team qualifying form, circuit history (driver and circuit × grid band) | New information available in our own data | No improvement; circuit history slightly hurts; frozen model kept |
+| Run 10 (Section 9 ablation) | Each feature group removed in turn and the model refitted (LR and HGB, frozen settings) | Brief requires a feature-group ablation | Grid clearly the most important (−0.16 to −0.19 correct picks per race without it); form second; qualifying / standings / context largely overlap with them |
+| Section 10 (explainability) | No training: weights, SHAP, LIME, permutation and race explanations of the frozen primary model | Brief requires XAI | Grid and form dominate every method; SHAP is exact for this model; LIME is unreliable here |

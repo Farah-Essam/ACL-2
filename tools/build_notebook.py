@@ -5588,21 +5588,249 @@ loaded_models_v2 = verify_model_artifacts(ARTIFACT_DIR_V2, VAL_PRED_V2, THRESHOL
 md(r"""
 ## 7.5 Phase 3: the test evaluation (2022–2024)
 
-The test seasons are used here **for the first time**. The models are the v2 models **loaded from `outputs/model_artifacts_v2/`** (not the in-memory objects), with their frozen thresholds. Before anything is scored, the cell checks that the v2 fingerprint equals the value recorded when v2 was frozen in 7.4 (`2ebc3457f47525af...`, recorded on 17 Oct 2026 at 17:46, before this cell was written). Every model is scored in one pass; the results below are reported as they come out and change nothing above.
+The test seasons are used here **for the first time**. The models are the v2 models **loaded from `outputs/model_artifacts_v2/`** (not the in-memory objects), with their frozen thresholds. Before anything is scored, the next cell verifies the v2 freeze against the record frozen in 7.4 (fingerprint `2ebc3457f47525af...`, recorded on 17 Oct 2026 at 17:46, before the test cells were written): strictly for structure, and with a documented tolerance for numbers only under other library versions (e.g. on Kaggle). Every model is scored in one pass; the results below are reported as they come out and change nothing above.
 
 The same metrics as in section 6: PR-AUC (main), ROC-AUC, Brier score, precision / recall / F1 at the frozen threshold, F1 of the top-3-per-race rule, and confusion matrices. Comparisons use the paired race-resampling interval (500 resamples of the test races).
 """)
 
+md(r"""
+### Freeze verification before the test (works across environments)
+
+The test below must use exactly the configuration frozen in 7.4. This cell compares the current v2 freeze with the record as it was frozen on 17 Oct 2026 (embedded below, fingerprint `2ebc3457...`):
+- **Structure, checked strictly; any difference stops the notebook:** the same 10 entries; every model's family, settings, training seasons, pre-processing, seed, primary flag and "changed from v1" flag; the 18 input columns (names, order, count) and both 21-input lists; the pre-processing steps and model types of every fitted model.
+- **Numbers (thresholds, CV and validation PR-AUC, network epochs):** identical fingerprint → exact match. If they differ **under the same library versions** that froze v2, the difference is unexplained and the notebook **stops**. If they differ under **other** library versions (e.g. on Kaggle), small numerical differences are expected: they are listed with a clear **warning**, and the notebook stops only if one exceeds its tolerance (threshold 0.05, CV PR-AUC 0.02, validation PR-AUC 0.03).
+""")
+
 code(r'''
 EXPECTED_V2_FINGERPRINT = "2ebc3457f47525afaf17b679d98bffc83bd3481b8261f4c5b3da25e108abafaa"   # printed by 7.4 when v2 was frozen, before the test cells were written
-assert FROZEN_V2_FINGERPRINT == EXPECTED_V2_FINGERPRINT, "the v2 freeze differs from the one recorded before the test"
-assert json.loads(FROZEN_V2_PATH.read_text(encoding="utf-8"))["fingerprint"] == EXPECTED_V2_FINGERPRINT
+EXPECTED_V2_VERSIONS = {"python": "3.14.0", "numpy": "2.4.1", "pandas": "2.3.3", "scikit-learn": "1.8.0", "torch": "2.10.0+cpu", "cloudpickle": "3.1.2"}
+EXPECTED_INPUT_COLUMNS = ["grid", "pit_lane_start", "gap_q1_pct", "grid_minus_quali", "reached_q3", "no_q3_format", "quali_missing", "drv_champ_pos", "cons_points_share", "drv_no_standing_yet", "cons_no_standing_yet", "drv_podium_rate_5", "drv_avg_finish_5", "drv_dnf_rate_5", "cons_podium_rate_5", "n_starters", "drv_experience", "drv_age"]
+EXPECTED_MODEL_INPUTS = {"scaled": ["grid", "gap_q1_pct", "grid_minus_quali", "drv_champ_pos", "cons_points_share", "drv_podium_rate_5", "drv_avg_finish_5", "drv_dnf_rate_5", "cons_podium_rate_5", "n_starters", "drv_experience", "drv_age", "pit_lane_start", "reached_q3", "no_q3_format", "quali_missing", "drv_no_standing_yet", "cons_no_standing_yet", "q1_time_missing", "drv_form_missing", "cons_form_missing"],
+                         "tree": ["grid", "pit_lane_start", "gap_q1_pct", "grid_minus_quali", "reached_q3", "no_q3_format", "quali_missing", "drv_champ_pos", "cons_points_share", "drv_no_standing_yet", "cons_no_standing_yet", "drv_podium_rate_5", "drv_avg_finish_5", "drv_dnf_rate_5", "cons_podium_rate_5", "n_starters", "drv_experience", "drv_age", "q1_time_missing", "drv_form_missing", "cons_form_missing"]}
+EXPECTED_V2_RECORD = json.loads(r"""{
+ "A | gradient boosting": {
+  "changed from v1": true,
+  "epochs": null,
+  "family": "gradient boosting",
+  "mean CV PR-AUC": 0.693678,
+  "model version": "A",
+  "pre-processing": "PREPROCESSORS[('A', 'tree')]",
+  "primary": false,
+  "seed": 42,
+  "settings": {
+   "learning_rate": 0.1,
+   "max_iter": 50,
+   "max_leaf_nodes": 3,
+   "min_samples_leaf": 80
+  },
+  "threshold": 0.308988,
+  "training seasons": "2003-2018",
+  "validation PR-AUC": 0.732625
+ },
+ "A | grid-only LR (baseline)": {
+  "family": "logistic regression on grid",
+  "model version": "A",
+  "threshold": 0.363429,
+  "training seasons": "2003-2018",
+  "validation PR-AUC": 0.676492
+ },
+ "A | logistic regression": {
+  "changed from v1": false,
+  "epochs": null,
+  "family": "logistic regression",
+  "mean CV PR-AUC": 0.703218,
+  "model version": "A",
+  "pre-processing": "PREPROCESSORS[('A', 'scaled')]",
+  "primary": true,
+  "seed": 42,
+  "settings": {
+   "C": 1,
+   "class_weight": null
+  },
+  "threshold": 0.380597,
+  "training seasons": "2003-2018",
+  "validation PR-AUC": 0.735023
+ },
+ "A | neural network": {
+  "changed from v1": true,
+  "epochs": 158,
+  "family": "neural network",
+  "mean CV PR-AUC": 0.706245,
+  "model version": "A",
+  "pre-processing": "PREPROCESSORS[('A', 'scaled')]",
+  "primary": false,
+  "seed": 42,
+  "settings": {
+   "dropout": 0.0,
+   "hidden": [
+    8
+   ],
+   "weight_decay": 0.001
+  },
+  "threshold": 0.444054,
+  "training seasons": "2003-2018",
+  "validation PR-AUC": 0.738472
+ },
+ "A | random forest": {
+  "changed from v1": true,
+  "epochs": null,
+  "family": "random forest",
+  "mean CV PR-AUC": 0.686698,
+  "model version": "A",
+  "pre-processing": "PREPROCESSORS[('A', 'tree')]",
+  "primary": false,
+  "seed": 42,
+  "settings": {
+   "max_depth": 4,
+   "max_features": 0.5,
+   "min_samples_leaf": 100
+  },
+  "threshold": 0.331495,
+  "training seasons": "2003-2018",
+  "validation PR-AUC": 0.735383
+ },
+ "B | gradient boosting": {
+  "changed from v1": true,
+  "epochs": null,
+  "family": "gradient boosting",
+  "mean CV PR-AUC": 0.689708,
+  "model version": "B",
+  "pre-processing": "PREPROCESSORS[('B', 'tree')]",
+  "primary": false,
+  "seed": 42,
+  "settings": {
+   "learning_rate": 0.1,
+   "max_iter": 100,
+   "max_leaf_nodes": 3,
+   "min_samples_leaf": 160
+  },
+  "threshold": 0.368611,
+  "training seasons": "1950-2018",
+  "validation PR-AUC": 0.728927
+ },
+ "B | logistic regression": {
+  "changed from v1": false,
+  "epochs": null,
+  "family": "logistic regression",
+  "mean CV PR-AUC": 0.689618,
+  "model version": "B",
+  "pre-processing": "PREPROCESSORS[('B', 'scaled')]",
+  "primary": false,
+  "seed": 42,
+  "settings": {
+   "C": 0.1,
+   "class_weight": null
+  },
+  "threshold": 0.298557,
+  "training seasons": "1950-2018",
+  "validation PR-AUC": 0.720972
+ },
+ "B | neural network": {
+  "changed from v1": true,
+  "epochs": 119,
+  "family": "neural network",
+  "mean CV PR-AUC": 0.700853,
+  "model version": "B",
+  "pre-processing": "PREPROCESSORS[('B', 'scaled')]",
+  "primary": false,
+  "seed": 42,
+  "settings": {
+   "dropout": 0.0,
+   "hidden": [
+    8
+   ],
+   "weight_decay": 0.001
+  },
+  "threshold": 0.29219,
+  "training seasons": "1950-2018",
+  "validation PR-AUC": 0.730649
+ },
+ "B | random forest": {
+  "changed from v1": true,
+  "epochs": null,
+  "family": "random forest",
+  "mean CV PR-AUC": 0.688713,
+  "model version": "B",
+  "pre-processing": "PREPROCESSORS[('B', 'tree')]",
+  "primary": false,
+  "seed": 42,
+  "settings": {
+   "max_depth": 4,
+   "max_features": 0.5,
+   "min_samples_leaf": 100
+  },
+  "threshold": 0.365998,
+  "training seasons": "1950-2018",
+  "validation PR-AUC": 0.729946
+ },
+ "rule: grid <= 3 (baseline)": {
+  "rule": "podium if grid <= 3"
+ }
+}""")
+NUMERIC_TOLERANCE = {"threshold": 0.05, "mean CV PR-AUC": 0.02, "validation PR-AUC": 0.03, "epochs": None}   # None = report only
+EXPECTED_CLASSES = {"logistic regression": "LogisticRegression", "random forest": "RandomForestClassifier",
+                    "gradient boosting": "HistGradientBoostingClassifier", "neural network": "ShallowNet"}
 
+
+def verify_v2_freeze():
+    structural, numeric = [], []
+    if set(FROZEN_V2) != set(EXPECTED_V2_RECORD):
+        structural.append(f"entries differ: {sorted(set(FROZEN_V2) ^ set(EXPECTED_V2_RECORD))}")
+    for key, expected in EXPECTED_V2_RECORD.items():
+        current = FROZEN_V2.get(key, {})
+        for field in set(expected) | set(current):
+            e, c = expected.get(field), current.get(field)
+            if field in NUMERIC_TOLERANCE:
+                if e != c:
+                    tol = NUMERIC_TOLERANCE[field]
+                    too_far = tol is not None and (e is None or c is None or abs(c - e) > tol)
+                    numeric.append({"entry": key, "field": field, "frozen": e, "now": c, "beyond tolerance": too_far})
+            elif e != c:
+                structural.append(f"{key}: {field} frozen {e!r}, now {c!r}")
+    if FINAL_FEATURES != EXPECTED_INPUT_COLUMNS or manifest_v2["input columns"] != EXPECTED_INPUT_COLUMNS:
+        structural.append("the 18 input columns (names, order or count) changed")
+    for kind in ["scaled", "tree"]:
+        if MODEL_INPUTS[kind] != EXPECTED_MODEL_INPUTS[kind]:
+            structural.append(f"the 21 model inputs ({kind}) changed")
+    for (m, family), entry in FINAL_V2.items():
+        if family == "grid-only LR":
+            if [s for s, _ in entry["pipe"].steps] != ["pre", "grid", "model"] or type(entry["pipe"][-1]).__name__ != "LogisticRegression":
+                structural.append("grid-only baseline structure changed")
+            continue
+        steps = [(s, type(o).__name__) for s, o in entry["pre"].steps]
+        expected_steps = [("impute", "F1Imputer")] + ([("scale", "ColumnTransformer")] if SCALED[family] else [])
+        if steps != expected_steps:
+            structural.append(f"{m} {family}: pre-processing steps {steps} != {expected_steps}")
+        if type(entry["model"]).__name__ != EXPECTED_CLASSES[family]:
+            structural.append(f"{m} {family}: model type {type(entry['model']).__name__}")
+        if list(entry["pre"].get_feature_names_out()) != EXPECTED_MODEL_INPUTS["scaled" if SCALED[family] else "tree"]:
+            structural.append(f"{m} {family}: fitted input names or order changed")
+    assert not structural, "STRUCTURAL CHANGE in the v2 freeze - not allowed:\n" + "\n".join(structural)
+    assert not any(n["beyond tolerance"] for n in numeric), f"numerical change beyond tolerance: {numeric}"
+    versions_now = manifest_v2["versions"]
+    if FROZEN_V2_FINGERPRINT == EXPECTED_V2_FINGERPRINT:
+        print(f"v2 freeze verified: EXACT match with the recorded fingerprint {EXPECTED_V2_FINGERPRINT[:16]}...; "
+              f"structure, features, pre-processing and model types checked.")
+        return
+    assert versions_now != EXPECTED_V2_VERSIONS, ("numbers changed although the library versions are the ones that froze v2: "
+                                                  f"unexplained change {numeric}")
+    print("WARNING: the v2 fingerprint differs from the recorded one, but ONLY in numbers, under different library versions.")
+    print(f"  recorded {EXPECTED_V2_FINGERPRINT[:16]}... with {EXPECTED_V2_VERSIONS}")
+    print(f"  now      {FROZEN_V2_FINGERPRINT[:16]}... with {versions_now}")
+    print("  Structure, settings, training seasons, features and pre-processing are identical. Numerical differences (within tolerance):")
+    display(pd.DataFrame(numeric))
+
+
+verify_v2_freeze()
+assert json.loads(FROZEN_V2_PATH.read_text(encoding="utf-8"))["fingerprint"] == FROZEN_V2_FINGERPRINT
+''')
+
+code(r'''
 TEST_ROWS = data[data["split"] == "test"].reset_index(drop=True)         # the 2022-2024 seasons: first use
 y_test = TEST_ROWS["podium"].to_numpy()
 test_race = TEST_ROWS["raceId"].to_numpy()
 test_models, test_manifest = load_model_artifacts(ARTIFACT_DIR_V2)       # the frozen v2 models, from disk
-assert test_manifest["frozen fingerprint"] == EXPECTED_V2_FINGERPRINT
+assert test_manifest["frozen fingerprint"] == FROZEN_V2_FINGERPRINT                # the files of this run = the verified freeze
 TEST_PRED = {m["key"]: m["predict"](TEST_ROWS) for m in test_models.values()}
 TEST_THRESHOLDS = {m["key"]: m["threshold"] for m in test_models.values()}
 assert all(TEST_THRESHOLDS[k] == THRESHOLDS_V2[k] for k in TEST_THRESHOLDS)
@@ -6184,6 +6412,815 @@ md(r"""
 - **All three picks right happens in about one race in four** (exact-three rate 0.23–0.26) for every configuration; about 2 of the 3 podium drivers are picked correctly per race.
 
 **Recommendation:** keep the existing frozen model (logistic regression, model A, v2) as the official model; this round does not justify a change. If a future version is built, the only idea worth carrying forward is `log(grid)` (a consistent ranking gain across all four historical folds). It would have to be evaluated on **new** seasons (2025 onwards), not on 2019–2024, which have already been used.
+""")
+
+
+# ================================================================ 9. FEATURE-GROUP ABLATION
+md(r"""
+# 9. Feature-group ablation
+
+**Question:** how much does each group of inputs contribute *on top of all the others*? For each group, the model is **refitted without that group** and scored again; the drop in performance is the group's **unique contribution**.
+
+- **Models:** logistic regression (the primary model) and gradient boosting, model A, each with its **frozen v2 setting** (no re-tuning). These temporary models are only used here; the frozen models are not changed.
+- **Data:** the four historical forward-chaining folds (scoring 2011–12, 13–14, 15–16, 17–18; each trained on the seasons before it, from 2003). Pre-processing is re-fitted inside every fold. The validation and test seasons are **not used**.
+- **Groups** (the 21 model inputs, each missing-value flag kept with its features): **grid**, **qualifying**, **standings**, **form**, **context** (table below). A group is removed *after* pre-processing (the imputer needs all 18 raw columns to build the flags), so the remaining inputs are exactly as in the full model.
+- **Scores:** PR-AUC, ROC-AUC, top-3-per-race F1, correct podium picks per race, exact-three rate, per fold and on average. **Drop = full model − model without the group** (positive = the group helps), with 95% intervals from resampling the 158 fold races (paired).
+- **Correlated groups:** grid and qualifying (and standings and form) carry overlapping information. If one is removed, the other can partly replace it, so a small drop does **not** mean a group is useless on its own.
+""")
+
+code(r'''
+import importlib.util
+
+# The frozen v2 models, loaded from their files (the same files the test evaluation used).
+ART_V2 = CLEAN_DATA_DIR.parent / "model_artifacts_v2"
+_spec = importlib.util.spec_from_file_location("frozen_loader_v2", ART_V2 / "load_artifacts.py")
+frozen_loader_v2 = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(frozen_loader_v2)
+V2_MODELS, V2_MANIFEST = frozen_loader_v2.load_model_artifacts(ART_V2)
+V2_RECORD = json.loads((CLEAN_DATA_DIR.parent / "frozen_models_v2.json").read_text(encoding="utf-8"))
+assert V2_MANIFEST["frozen fingerprint"] == V2_RECORD["fingerprint"], "model files and frozen record disagree"
+V2_REFERENCE = np.load(ART_V2 / "reference_validation_predictions.npz")
+for name in ["A_logistic_regression", "A_gradient_boosting"]:
+    assert np.allclose(V2_MODELS[name]["predict"](VAL_ROWS), V2_REFERENCE[name], rtol=0, atol=1e-12)
+assert "test" not in set(TRAIN_A_ROWS["split"]) | set(VAL_ROWS["split"])
+
+INPUTS_SCALED = V2_MANIFEST["models"]["A_logistic_regression"]["model inputs (after pre-processing)"]
+INPUTS_TREE = V2_MANIFEST["models"]["A_gradient_boosting"]["model inputs (after pre-processing)"]
+INPUT_GROUPS = {
+    "grid": ["grid", "pit_lane_start"],
+    "qualifying": ["gap_q1_pct", "grid_minus_quali", "reached_q3", "no_q3_format", "quali_missing", "q1_time_missing"],
+    "standings": ["drv_champ_pos", "cons_points_share", "drv_no_standing_yet", "cons_no_standing_yet"],
+    "form": ["drv_podium_rate_5", "drv_avg_finish_5", "drv_dnf_rate_5", "cons_podium_rate_5", "drv_form_missing", "cons_form_missing"],
+    "context": ["n_starters", "drv_experience", "drv_age"],
+}
+GROUP_OF = {c: g for g, cols in INPUT_GROUPS.items() for c in cols}
+all_grouped = [c for cols in INPUT_GROUPS.values() for c in cols]
+assert len(all_grouped) == len(set(all_grouped)) == 21 and set(all_grouped) == set(INPUTS_SCALED) == set(INPUTS_TREE)
+print(f"Frozen v2 models loaded and verified (fingerprint {V2_RECORD['fingerprint'][:16]}...); "
+      f"validation predictions reproduced; no test rows involved.")
+display(pd.DataFrame([{"group": g, "inputs": ", ".join(cols), "count": len(cols)} for g, cols in INPUT_GROUPS.items()]))
+''')
+
+code(r'''
+def ablation_model(family, dropped):
+    """Pre-processing (fitted in the fold) -> keep the inputs not in `dropped` -> model with the frozen v2 setting."""
+    scaled = family == "logistic regression"
+    keep = [c for c in (INPUTS_SCALED if scaled else INPUTS_TREE) if c not in dropped]
+    model = (LogisticRegression(max_iter=5000, **LR_V2_SETTING) if scaled else
+             HistGradientBoostingClassifier(l2_regularization=1.0, early_stopping=False, random_state=EXP_SEED, **HGB_V2_SETTING))
+    return Pipeline([("pre", make_preprocessor(scaled=scaled)),
+                     ("keep", ColumnTransformer([("keep", "passthrough", keep)], verbose_feature_names_out=False)),
+                     ("model", model)])
+
+
+ABL_FAMILIES = ["logistic regression", "gradient boosting"]
+ABL_VARIANTS = {"full model": []} | {f"without {g}": cols for g, cols in INPUT_GROUPS.items()}
+ABL_FOLD, ABL_OOF, ABL_FITS = [], {}, []
+t0 = time.time()
+for family in ABL_FAMILIES:
+    for variant, dropped in ABL_VARIANTS.items():
+        preds = []
+        for lo, hi in EXP_FOLDS:
+            tr, sc = EXP_ROWS[EXP_ROWS["year"] < lo], EXP_ROWS[EXP_ROWS["year"].between(lo, hi)]
+            assert tr["year"].max() < lo and set(tr["split"]) == {"train"}       # earlier training seasons only
+            pipe = ablation_model(family, dropped).fit(tr[FINAL_FEATURES], tr["podium"])
+            ABL_FITS.append({"family": family, "variant": variant, "fold": f"{lo}-{hi}", "trained on": f"{tr['year'].min()}-{tr['year'].max()}",
+                             "inputs used": pipe.named_steps["model"].n_features_in_})
+            p = pipe.predict_proba(sc[FINAL_FEATURES])[:, 1]
+            preds.append(p)
+            ABL_FOLD.append({"family": family, "variant": variant, "fold": f"{lo}-{hi}",
+                             "PR-AUC": average_precision_score(sc["podium"], p), "ROC-AUC": roc_auc_score(sc["podium"], p),
+                             **podium_pick(sc["podium"].to_numpy(), p, sc["raceId"].to_numpy())})
+        ABL_OOF[(family, variant)] = np.concatenate(preds)
+ABL_FOLD = pd.DataFrame(ABL_FOLD)
+# The full variants reproduce the section-8 baselines exactly (same folds, same settings, same pre-processing).
+assert np.allclose(ABL_OOF[("logistic regression", "full model")], EXP_OOF["C0 baseline (LR, 21 inputs)"])
+assert np.allclose(ABL_OOF[("gradient boosting", "full model")], EXP_OOF["C7 reference: gradient boosting (frozen v2 setting)"])
+fits = pd.DataFrame(ABL_FITS)
+assert (fits.loc[fits["variant"] == "full model", "inputs used"] == 21).all()
+print(f"{len(fits)} ablation fits in {time.time() - t0:.0f} s; every fit used only seasons before its scoring fold; "
+      f"inputs per variant: {fits.groupby('variant', sort=False)['inputs used'].first().to_dict()}")
+''')
+
+code(r'''
+# Paired race resampling over the 158 fold races (each race drawn keeps its own identity).
+abl_races = np.unique(oof_race)
+abl_rows_of = [np.flatnonzero(oof_race == r) for r in abl_races]
+rng_abl = np.random.default_rng(EXP_SEED)
+ABL_DRAWS = [rng_abl.choice(len(abl_races), len(abl_races)) for _ in range(500)]
+ABL_DRAW_ROWS = [np.concatenate([abl_rows_of[j] for j in d]) for d in ABL_DRAWS]
+
+
+def per_race_correct(p):
+    picks = pd.DataFrame({"race": oof_race, "y": oof_y, "p": p})
+    picks["pick"] = picks.groupby("race")["p"].rank(method="first", ascending=False) <= 3
+    return picks[picks["pick"]].groupby("race")["y"].sum().reindex(abl_races).to_numpy()
+
+
+abl_rows = []
+for family in ABL_FAMILIES:
+    full_p = ABL_OOF[(family, "full model")]
+    full_c = per_race_correct(full_p)
+    means = ABL_FOLD[ABL_FOLD["family"] == family].groupby("variant", sort=False)[["PR-AUC", "ROC-AUC", "top-3 F1", "correct per race", "exact-3 rate"]].mean()
+    per_fold = ABL_FOLD[ABL_FOLD["family"] == family].pivot(index="variant", columns="fold", values="PR-AUC")
+    per_fold_c = ABL_FOLD[ABL_FOLD["family"] == family].pivot(index="variant", columns="fold", values="correct per race")
+    for variant in ABL_VARIANTS:
+        row = {"family": family, "variant": variant, **means.loc[variant].to_dict()}
+        if variant != "full model":
+            p = ABL_OOF[(family, variant)]
+            c = per_race_correct(p)
+            pr_d = [average_precision_score(oof_y[i], full_p[i]) - average_precision_score(oof_y[i], p[i]) for i in ABL_DRAW_ROWS]
+            c_d = [full_c[d].mean() - c[d].mean() for d in ABL_DRAWS]
+            e_d = [(full_c[d] == 3).mean() - (c[d] == 3).mean() for d in ABL_DRAWS]
+            row.update({
+                "PR-AUC drop": means.loc["full model", "PR-AUC"] - means.loc[variant, "PR-AUC"],
+                "PR-AUC drop 95% interval": np.percentile(pr_d, [2.5, 97.5]),
+                "ROC-AUC drop": means.loc["full model", "ROC-AUC"] - means.loc[variant, "ROC-AUC"],
+                "top-3 F1 drop": means.loc["full model", "top-3 F1"] - means.loc[variant, "top-3 F1"],
+                "correct-picks drop": full_c.mean() - c.mean(), "correct-picks drop 95% interval": np.percentile(c_d, [2.5, 97.5]),
+                "exact-3 drop": (full_c == 3).mean() - (c == 3).mean(), "exact-3 drop 95% interval": np.percentile(e_d, [2.5, 97.5]),
+                "folds where removal lowered PR-AUC": int((per_fold.loc["full model"] > per_fold.loc[variant]).sum()),
+                "folds where removal lowered correct picks": int((per_fold_c.loc["full model"] > per_fold_c.loc[variant]).sum())})
+        abl_rows.append(row)
+ABLATION = pd.DataFrame(abl_rows)
+fmt = lambda v: f"[{v[0]:+.4f}, {v[1]:+.4f}]" if isinstance(v, np.ndarray) else "-"
+show_abl = ABLATION.copy()
+for col in ["PR-AUC drop 95% interval", "correct-picks drop 95% interval", "exact-3 drop 95% interval"]:
+    show_abl[col] = show_abl[col].map(fmt)
+print("Ablation on the historical folds (means over 4 folds; drops = full - without; intervals over the 158 fold races):")
+display(show_abl.set_index(["family", "variant"]).round(4))
+print("PR-AUC per fold:")
+display(ABL_FOLD.pivot_table(index=["family", "variant"], columns="fold", values="PR-AUC", sort=False).round(4))
+print("Correct podium picks per race, per fold:")
+display(ABL_FOLD.pivot_table(index=["family", "variant"], columns="fold", values="correct per race", sort=False).round(3))
+''')
+
+code(r'''
+GROUP_COLORS = {"grid": "#4C72B0", "qualifying": "#DD8452", "standings": "#55A868", "form": "#C44E52", "context": "#8172B3"}
+fig, axes = plt.subplots(2, 2, figsize=(14, 7))
+for row, family in enumerate(ABL_FAMILIES):
+    sub = ABLATION[(ABLATION["family"] == family) & (ABLATION["variant"] != "full model")]
+    groups = [v.replace("without ", "") for v in sub["variant"]]
+    for col, (metric, interval, label) in enumerate([("PR-AUC drop", "PR-AUC drop 95% interval", "drop in PR-AUC"),
+                                                     ("correct-picks drop", "correct-picks drop 95% interval", "drop in correct podium picks per race")]):
+        ax = axes[row, col]
+        centre = sub[metric].to_numpy()
+        lo = np.array([iv[0] for iv in sub[interval]])
+        hi = np.array([iv[1] for iv in sub[interval]])
+        ax.barh(groups, centre, color=[GROUP_COLORS[g] for g in groups])
+        ax.errorbar(centre, range(len(groups)), xerr=[centre - lo, hi - centre], fmt="none", ecolor="black", capsize=3)
+        ax.axvline(0, color="black", lw=0.8)
+        ax.invert_yaxis()
+        ax.set_xlabel(f"{label} when the group is removed (95% interval)")
+        ax.set_title(f"{family}: {label}", fontsize=10)
+plt.suptitle("Feature-group ablation (historical folds 2011-2018): bars to the right = the group helps", fontsize=11)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**What the ablation shows** (historical folds, 158 races; drop = full model − model without the group):
+- **Grid is by far the most important group.** Without it, logistic regression loses 0.059 PR-AUC (interval +0.037 to +0.083) and **0.16 correct podium picks per race** (+0.08 to +0.26); the exact-three rate falls from 26% to 13%. Gradient boosting loses even more (0.077 PR-AUC, 0.19 picks per race). It hurts in all 4 folds for both models.
+- **Recent form is the second clear group** for logistic regression: −0.017 PR-AUC (+0.002 to +0.033; lower in all 4 folds) and −0.07 correct picks per race (+0.006 to +0.136; lower in 3 folds, equal in the 4th). For gradient boosting the drop has the same size (−0.013 PR-AUC, all 4 folds) but its interval includes 0.
+- **Qualifying, standings and context add little on top of the others.** Removing qualifying costs logistic regression only 0.004 PR-AUC (an interval just above 0), and its podium picks are slightly *better* without it (interval includes 0). Standings and context change nothing measurable. This is **not** saying these inputs are useless: qualifying pace and standings are strongly correlated with grid and form, so when one group is removed, the others carry most of its information. (In the section-4 forward selection, which added groups one at a time, qualifying was the clearest gain *after grid alone*; here it is measured *after everything else*.)
+""")
+
+# ================================================================ 10. EXPLAINABLE AI
+md(r"""
+# 10. Explainable AI
+
+**This section answers Requirement 6 of the brief (model explainability):**
+
+| Brief requirement | Where it is answered |
+|---|---|
+| Global explanation: **permutation importance** (plotted and interpreted) | **10.7** (individual inputs and feature groups; across rows → PR-AUC, within race → top-3 F1) |
+| Global explanation: **SHAP** (plotted and interpreted) | **10.3** (global SHAP of the primary model), plus **10.8** (tree SHAP of gradient boosting, for comparison) |
+| Local explanation of **a single prediction** (LIME and/or local SHAP), plotted and interpreted | **10.4** (local SHAP waterfalls for four drivers, each with its predicted podium probability), **10.5** (a complete race: why these three), **10.6** (LIME, supplementary) |
+| Explanations **not presented as causal effects** | stated below, in the caveats of 10.2 and 10.7, and in the conclusion of 10.9 |
+
+Extra context, not required by the brief: 10.2 (logistic-regression weights and odds ratios) and 10.9 (agreement between methods, including the Section 9 ablation).
+
+**Target:** the frozen primary model, **logistic regression, model A (v2)**, exactly as saved (its fitted pre-processing and its 21 inputs). Gradient boosting A (v2) is explained in 10.8 for comparison. Explanations use the **validation seasons 2019–2021** and examples chosen by **rules fixed in advance**; the test seasons are not used.
+
+**How to read the numbers.** Logistic regression adds up a contribution for every input on the **log-odds** scale and then turns the total into a probability:
+
+  log-odds = base value + Σ contributions, probability = 1 / (1 + e^(−log-odds)).
+
+So contributions **add up in log-odds, not in probability**. A contribution of +1.0 log-odds multiplies the odds of a podium by e ≈ 2.7. Every plot below states its scale.
+
+**These are explanations of the model, not of Formula 1.** They show which inputs the model relies on, not what *causes* podiums. Correlated inputs (grid, qualifying pace, standings and form all describe how fast the car is) share credit in ways that depend on the method.
+
+**Caveats to keep in mind (from the pre-XAI audit):**
+- **`pit_lane_start`:** pit-lane starts are only recorded as `grid = 0` from 2015, so model A saw just 7 of them in training (none on the podium); its weight is unreliable.
+- **`no_q3_format`:** it is 0 for every validation row (Q3 exists in all of 2019–2021), so it contributes nothing here.
+- **`drv_no_standing_yet` / `cons_no_standing_yet`:** in 2003–2009 the source data leaves 0-point drivers out of the standings, so these flags mean "no points yet"; later they mostly mean "first race of the season or debut".
+- **`grid_minus_quali` on sprint weekends:** in 2021 (and 2022) the race grid came from the sprint, so the value mixes sprint gains/losses with penalties, not only penalties.
+- **Correlated inputs:** grid, `gap_q1_pct`, `reached_q3`, standings and form overlap; individual weights and individual importances can understate or redistribute their joint effect. The group-level views below are the more reliable ones.
+""")
+
+md(r"""
+## 10.1 Loading the frozen model and the validation data
+
+Loads the saved v2 files (checked against the frozen fingerprint), builds the training and validation inputs exactly as the saved pre-processing produces them, and imports SHAP and LIME (with a clear message if either is unavailable).
+""")
+
+code(r'''
+import cloudpickle
+
+try:
+    import shap
+    SHAP_OK, SHAP_NOTE = True, f"shap {shap.__version__}"
+except ImportError:
+    try:
+        import subprocess, sys
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "shap"], check=True, timeout=300)
+        import shap
+        SHAP_OK, SHAP_NOTE = True, f"shap {shap.__version__} (installed now)"
+    except Exception as e:
+        SHAP_OK, SHAP_NOTE = False, f"shap unavailable ({type(e).__name__}); exact SHAP values are still computed by hand (linear model) and plotted with matplotlib"
+
+
+def load_v2(name):
+    m = V2_MANIFEST["models"][name]
+    return cloudpickle.loads((ART_V2 / m["files"]["preprocessor and model"]["file"]).read_bytes())
+
+
+_primary = load_v2("A_logistic_regression")
+XPRE, XLR = _primary["preprocessor"], _primary["model"]
+_tree = load_v2("A_gradient_boosting")
+TPRE, THGB = _tree["preprocessor"], _tree["model"]
+XAI_INPUTS = list(XPRE.get_feature_names_out())
+assert XAI_INPUTS == INPUTS_SCALED == list(XLR.feature_names_in_) and XLR.coef_.shape == (1, 21)
+assert list(TPRE.get_feature_names_out()) == INPUTS_TREE == list(THGB.feature_names_in_)
+
+X_TRAIN = XPRE.transform(TRAIN_A_ROWS[FINAL_FEATURES])
+X_VAL = XPRE.transform(VAL_ROWS[FINAL_FEATURES])
+P_VAL = XLR.predict_proba(X_VAL)[:, 1]
+LOGIT_VAL = XLR.decision_function(X_VAL)
+assert np.array_equal(P_VAL, V2_REFERENCE["A_logistic_regression"]), "re-loaded primary model differs from the frozen predictions"
+FILLED_COLS = list(XPRE.named_steps["impute"].get_feature_names_out())
+FILLED_TRAIN = XPRE.named_steps["impute"].transform(TRAIN_A_ROWS[FINAL_FEATURES])
+FILLED_VAL = XPRE.named_steps["impute"].transform(VAL_ROWS[FINAL_FEATURES])
+
+# Readable context for every validation row (names are for reading only).
+_names = CLEAN["drivers"].assign(driver=CLEAN["drivers"]["forename"] + " " + CLEAN["drivers"]["surname"]).set_index("driverId")["driver"]
+_races = CLEAN["races"].set_index("raceId")
+VAL_INFO = VAL_ROWS[["raceId", "driverId", "year", "grid", "podium"]].copy()
+VAL_INFO["driver"] = VAL_INFO["driverId"].map(_names)
+VAL_INFO["race"] = VAL_INFO["year"].astype(str) + " " + VAL_INFO["raceId"].map(_races["name"])
+VAL_INFO["round"] = VAL_INFO["raceId"].map(_races["round"])
+VAL_INFO["probability"] = P_VAL
+VAL_INFO["rank in race"] = VAL_INFO.groupby("raceId")["probability"].rank(method="first", ascending=False).astype(int)
+VAL_INFO["top-3 pick"] = VAL_INFO["rank in race"] <= 3
+
+# Values in original units for labels: the 18 features as recorded (missing shown as "missing"), flags as 0/1.
+_display = pd.DataFrame(index=VAL_ROWS.index)
+for c in XAI_INPUTS:
+    raw = VAL_ROWS[c] if c in FINAL_FEATURES else FILLED_VAL[c]
+    _display[c] = [("missing" if pd.isna(v) else (int(v) if float(v).is_integer() else round(float(v), 3))) for v in raw]
+DISPLAY_VAL = _display
+print(f"Primary model re-loaded from {ART_V2.name}: 21 inputs, predictions identical to the frozen ones. {SHAP_NOTE}.")
+''')
+
+# ---------------------------------------------------------------- 10.2
+md(r"""
+## 10.2 Logistic-regression weights and odds ratios
+
+Each weight is the change in **log-odds** of a podium when that input goes up by one unit, **with all other inputs held fixed**:
+- **continuous inputs** (standardised): one unit = **one standard deviation** of the training data; the table also converts the weight to **one original unit** (e.g. one grid place, one percentage point of Q1 gap);
+- **flags** (0/1, not scaled): the effect of the flag switching **from 0 to 1**.
+
+**Odds ratio** = e^weight: above 1 = the odds of a podium go up, below 1 = they go down. Because the inputs are correlated, "holding all others fixed" is often unrealistic (a car that qualifies faster also starts further forward), so single weights should not be read on their own; sections 10.3–10.8 look at the inputs together.
+""")
+
+code(r'''
+scaler = XPRE.named_steps["scale"].named_transformers_["continuous"]
+sd_of = dict(zip(CONTINUOUS_FEATURES, scaler.scale_))
+coef = pd.Series(XLR.coef_[0], index=XAI_INPUTS)
+coef_table = pd.DataFrame({
+    "group": [GROUP_OF[c] for c in XAI_INPUTS],
+    "type": ["continuous (per 1 SD)" if c in sd_of else "flag (0 -> 1)" for c in XAI_INPUTS],
+    "weight (log-odds)": coef.values,
+    "odds ratio": np.exp(coef.values),
+    "1 SD in original units": [sd_of.get(c, np.nan) for c in XAI_INPUTS],
+    "weight per original unit": [coef[c] / sd_of[c] if c in sd_of else np.nan for c in XAI_INPUTS],
+    "odds ratio per original unit": [np.exp(coef[c] / sd_of[c]) if c in sd_of else np.nan for c in XAI_INPUTS],
+}, index=XAI_INPUTS)
+print(f"Intercept: {XLR.intercept_[0]:+.3f} log-odds. Weights sorted by size:")
+display(coef_table.reindex(coef.abs().sort_values(ascending=False).index).round(3))
+
+fig, ax = plt.subplots(figsize=(10, 6.5))
+order = coef.sort_values().index
+ax.barh(order, coef[order], color=[GROUP_COLORS[GROUP_OF[c]] for c in order])
+ax.axvline(0, color="black", lw=0.8)
+for g, col in GROUP_COLORS.items():
+    ax.barh([], [], color=col, label=g)
+ax.legend(title="group", fontsize=8)
+ax.set_xlabel("weight in log-odds (continuous: per 1 standard deviation; flags: 0 -> 1); right = more likely podium")
+ax.set_title("Primary model (logistic regression A): what each input does, all others held fixed")
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**Reading the weights:**
+- **Grid** dominates: −2.0 log-odds per standard deviation (6.3 places), i.e. each grid place further back multiplies the odds of a podium by about 0.73.
+- **Some signs look surprising; they come from correlated inputs and from flags that correct a filled value:**
+  - `q1_time_missing` +1.9 (odds × 6.7): a driver with a qualifying record but no Q1 time usually starts at the back after a penalty or a problem, and the slow-lap fill makes them look slow. Many of them are in fast cars, so the flag *offsets* the low grid and the slow fill (example (d) in 10.4).
+  - `drv_no_standing_yet` +0.7: offsets the "behind everyone" position given to drivers without standings (e.g. everyone in round 1).
+  - `reached_q3` −0.6 and `drv_dnf_rate_5` +0.4: these move with grid and with `drv_avg_finish_5`. Once grid and average finish are known, reaching Q3 adds little, and a driver whose average finish is poor *because of retirements* is partly corrected back up.
+  - `drv_experience` +0.4 and `drv_age` −0.4 (correlation 0.81): at the same experience an older driver is less likely, at the same age a more experienced one more likely; they largely cancel (see the group view in 10.3).
+- `no_q3_format` (−0.5) only matters for 2003–2005 rows and is 0 throughout validation; `pit_lane_start` (−0.03) is based on 7 training rows.
+""")
+
+# ---------------------------------------------------------------- 10.3
+md(r"""
+## 10.3 Global SHAP: which inputs drive the predictions?
+
+For a logistic regression, SHAP values are **exact and simple**: the contribution of input *j* for a driver is
+
+  φ_j = weight_j × (value_j − average value_j in the training seasons), in log-odds,
+
+and the **base value** is the log-odds of a driver with average inputs. For every row, base value + Σ φ_j = the model's log-odds (checked below). This uses the standard "interventional" SHAP, which treats inputs as independent; with correlated inputs it explains **the model's formula**, not how the inputs move together in reality.
+
+**Two ways to measure a group's importance** (both reported, because they differ when contributions inside a group cancel out):
+- **(A) sum of individual importances:** for each input, the mean of |φ_j| over the validation rows; then add these up within the group;
+- **(B) importance of the group's total contribution:** for each row, add the group's φ_j (signed) and take the absolute value; then average over the validation rows. (B) ≤ (A); (B) is the better measure of what the group does *as a whole*.
+""")
+
+code(r'''
+TRAIN_MEAN = X_TRAIN.mean()
+PHI = (X_VAL - TRAIN_MEAN) * coef                                  # exact SHAP values (log-odds), rows x 21 inputs
+BASE_VALUE = float(XLR.intercept_[0] + coef @ TRAIN_MEAN)
+assert np.allclose(PHI.sum(axis=1) + BASE_VALUE, LOGIT_VAL), "SHAP values do not add up to the model's log-odds"
+if SHAP_OK:
+    _lin = shap.LinearExplainer(XLR, shap.maskers.Independent(X_TRAIN, max_samples=len(X_TRAIN)))
+    _sv = _lin(X_VAL)
+    assert np.allclose(_sv.values, PHI.to_numpy(), atol=1e-8), "the shap library disagrees with the exact formula"
+    SHAP_CHECK = "the shap library's LinearExplainer gives the same values (checked)"
+else:
+    SHAP_CHECK = "shap library not available: values computed with the exact formula"
+print(f"Base value: {BASE_VALUE:+.3f} log-odds = probability {1 / (1 + np.exp(-BASE_VALUE)):.3f} (a driver with average inputs). "
+      f"Average predicted probability on validation: {P_VAL.mean():.3f} (actual podium rate {VAL_ROWS['podium'].mean():.3f}). {SHAP_CHECK}.")
+
+mean_abs = PHI.abs().mean().sort_values(ascending=False)
+group_A = mean_abs.groupby(lambda c: GROUP_OF[c]).sum()
+group_B = pd.Series({g: PHI[cols].sum(axis=1).abs().mean() for g, cols in INPUT_GROUPS.items()})
+SHAP_GROUPS_LR = pd.DataFrame({"(A) sum of mean |SHAP| of its inputs": group_A, "(B) mean |summed group SHAP|": group_B}).sort_values(
+    "(B) mean |summed group SHAP|", ascending=False)
+display(pd.DataFrame({"group": [GROUP_OF[c] for c in mean_abs.index], "mean |SHAP| (log-odds)": mean_abs.values}, index=mean_abs.index).round(4))
+display(SHAP_GROUPS_LR.round(4))
+
+EXPL_LR = None
+if SHAP_OK:
+    EXPL_LR = shap.Explanation(values=PHI.to_numpy(), base_values=np.full(len(PHI), BASE_VALUE), data=X_VAL.to_numpy(),
+                               display_data=DISPLAY_VAL.to_numpy(), feature_names=XAI_INPUTS)
+    shap.plots.beeswarm(EXPL_LR, max_display=21, show=False)
+    plt.title("Global SHAP, primary model, validation 2019-2021\n(each dot = one driver in one race; x = contribution in log-odds; "
+              "colour = the input's value, red high / blue low)", fontsize=9)
+    plt.gcf().set_size_inches(10, 8)
+    plt.tight_layout()
+    plt.show()
+else:
+    fig, ax = plt.subplots(figsize=(10, 8))
+    for k, c in enumerate(mean_abs.index[::-1]):
+        ax.scatter(PHI[c], np.full(len(PHI), k) + np.random.default_rng(0).uniform(-0.3, 0.3, len(PHI)), s=3, c=X_VAL[c], cmap="coolwarm")
+    ax.set_yticks(range(21), mean_abs.index[::-1])
+    ax.set_xlabel("contribution (log-odds)")
+    ax.set_title("Global SHAP (exact), primary model, validation 2019-2021")
+    plt.tight_layout()
+    plt.show()
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 4.2))
+mean_abs[::-1].plot.barh(ax=axes[0], color=[GROUP_COLORS[GROUP_OF[c]] for c in mean_abs.index[::-1]])
+axes[0].set_xlabel("mean |SHAP| (log-odds)")
+axes[0].set_title("Importance of each input")
+SHAP_GROUPS_LR[::-1].plot.barh(ax=axes[1], color=["#A6BDDB", "#4C72B0"])
+axes[1].set_xlabel("log-odds")
+axes[1].set_title("Importance of each group: (A) sum of input importances, (B) importance of the group's total")
+axes[1].legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**Global SHAP findings** (validation, primary model):
+- **Base value** −3.64 log-odds = probability 0.026: a driver with *average* inputs (mid-field) rarely reaches the podium. The model's average predicted probability on validation is 0.160 (actual podium rate 0.150).
+- **Grid is the main driver of the predictions:** mean |SHAP| 1.62 log-odds, about four times the next input. Then the driver's recent average finish (0.44), age (0.43), experience (0.41), the team's share of the leader's points (0.34) and reaching Q3 (0.31).
+- **By group, measure (B), the importance of the group's total contribution:** grid 1.62, form 0.51, standings 0.42, qualifying 0.40, context 0.26. Measure (A) is higher for groups whose inputs **cancel** each other: context drops from 0.87 (A) to 0.26 (B) because age and experience push in opposite directions; form (0.95 → 0.51) and qualifying (0.62 → 0.40) also partly cancel.
+""")
+
+# ---------------------------------------------------------------- 10.4
+md(r"""
+## 10.4 Local SHAP: four individual predictions
+
+Four validation drivers, chosen by **rules fixed before looking at their explanations**:
+- **(a)** the **most confident correct pick:** the highest-probability driver who was picked in the race's top 3 and did finish on the podium;
+- **(b)** the **biggest miss:** the real podium finisher with the lowest predicted probability;
+- **(c)** a **fast car starting further back:** the highest-probability top-3 pick who started **5th or lower**;
+- **(d)** the highest-probability driver **without a Q1 time** (`q1_time_missing` = 1); if there is none, the highest-probability **debut** driver.
+
+Each waterfall starts at the base value (average driver), adds the inputs' contributions in **log-odds** (red pushes towards a podium, blue away), and ends at the driver's log-odds, whose probability is given in the title. Labels show the inputs' **original values**.
+""")
+
+code(r'''
+def pick(mask, by="probability", largest=True):
+    cand = VAL_INFO[mask]
+    return cand[by].idxmax() if largest else cand[by].idxmin()
+
+
+q1_missing = FILLED_VAL["q1_time_missing"] == 1
+EXAMPLES = {
+    "(a) most confident correct pick": pick(VAL_INFO["top-3 pick"] & (VAL_INFO["podium"] == 1)),
+    "(b) biggest miss": pick(VAL_INFO["podium"] == 1, largest=False),
+    "(c) top-3 pick starting 5th or lower": pick(VAL_INFO["top-3 pick"] & (VAL_INFO["grid"] >= 5)),
+    ("(d) no Q1 time" if q1_missing.any() else "(d) debut driver"):
+        pick(q1_missing if q1_missing.any() else FILLED_VAL["drv_form_missing"] == 1),
+}
+ex_table = VAL_INFO.loc[list(EXAMPLES.values()), ["race", "driver", "grid", "probability", "rank in race", "top-3 pick", "podium"]]
+ex_table.index = list(EXAMPLES)
+display(ex_table.round(3))
+
+
+def waterfall(i, title, max_display=10):
+    if SHAP_OK:
+        shap.plots.waterfall(EXPL_LR[i], max_display=max_display, show=False)
+        plt.gcf().set_size_inches(9, 5)
+        plt.title(title, fontsize=9)
+        plt.tight_layout()
+        plt.show()
+    else:
+        contrib = PHI.iloc[i].sort_values(key=abs, ascending=False).head(max_display)[::-1]
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.barh([f"{c} = {DISPLAY_VAL.iloc[i][c]}" for c in contrib.index], contrib, color=np.where(contrib > 0, "#C44E52", "#4C72B0"))
+        ax.axvline(0, color="black", lw=0.8)
+        ax.set_xlabel("contribution (log-odds)")
+        ax.set_title(title, fontsize=9)
+        plt.tight_layout()
+        plt.show()
+
+
+for label, i in EXAMPLES.items():
+    r = VAL_INFO.loc[i]
+    waterfall(i, f"{label}: {r['driver']}, {r['race']} (grid {int(r['grid'])})\n"
+                 f"log-odds {LOGIT_VAL[i]:+.2f} -> podium probability {r['probability']:.3f}; "
+                 f"{'on the podium' if r['podium'] == 1 else 'not on the podium'}; rank {r['rank in race']} in the race")
+    top = PHI.iloc[i].sort_values(key=abs, ascending=False).head(4)
+    print(f"{label}: largest contributions (log-odds): " + ", ".join(f"{c} = {DISPLAY_VAL.iloc[i][c]} ({v:+.2f})" for c, v in top.items()))
+''')
+
+md(r"""
+**Local SHAP findings** (the four rule-chosen drivers; contributions in log-odds):
+- **(a) Max Verstappen, 2021 Abu Dhabi GP, pole, probability 0.909, podium.** Starting 1st adds +3.3, an average finish of 1.6 over the last 5 races +1.2, the team's points share +0.85 and a podium in each of his last 5 races +0.8. Everything agrees.
+- **(b) Daniil Kvyat, 2019 German GP, grid 14, probability 0.007, finished 3rd** in a chaotic wet race. Grid 14 (−0.9), no recent retirements (−0.4, see the DNF-rate weight) and a weak team (−0.3) all point away from a podium. Nothing known before the start suggested it: a genuine surprise.
+- **(c) Max Verstappen, 2021 Qatar GP, grid 7 after a penalty (qualified 2nd), probability 0.796, podium.** Grid 7 is still better than average (+1.4); recent form (+1.2), the penalty signal `grid_minus_quali` = 5 (+1.0, "fast car starting further back") and the team's points share (+0.9) lift him to the 2nd most likely driver of the race.
+- **(d) Max Verstappen, 2021 Russian GP, grid 20 with no Q1 time (engine penalty), probability 0.135, finished 2nd.** Starting last costs −2.8; the "no Q1 time" flag gives back +1.9 and the team's points share +0.85. The model saw *something* was unusual (6th most likely), but not enough to pick him.
+""")
+
+# ---------------------------------------------------------------- 10.5
+md(r"""
+## 10.5 Explaining a complete race: why these three?
+
+The official output for a race is the **three drivers with the highest podium probability** (7.10). Within one race, the model's ranking is decided by the drivers' log-odds, so the gap between two drivers splits **exactly** into per-input parts: weight × (difference in their input values).
+
+- **Race 1 (rule):** the validation race where the **3rd and 4th** probabilities are **closest**, i.e. the hardest cut. The table lists every driver; the bar chart shows why the 3rd driver is ahead of the 4th.
+- **Race 2 (rule):** the **first validation race, in calendar order,** where the model's top 3 differ from the **top 3 on the starting grid**. The chart compares the driver the model brought in with the grid-top-3 driver it left out (if there are several, the highest-probability one brought in vs the lowest-probability one left out).
+
+The three picks are the most likely podium finishers, **not** a forecast of 1st, 2nd and 3rd.
+""")
+
+code(r'''
+def race_table(race_id):
+    t = VAL_INFO[VAL_INFO["raceId"] == race_id].sort_values("rank in race")
+    t = t.assign(**{"grid top 3": t["grid"].rank(method="first") <= 3})
+    return t[["driver", "grid", "probability", "rank in race", "top-3 pick", "grid top 3", "podium"]]
+
+
+def pair_explanation(i_ahead, i_behind, title):
+    diff = PHI.loc[i_ahead] - PHI.loc[i_behind]                       # = weight x (x_ahead - x_behind), log-odds
+    assert np.isclose(diff.sum(), LOGIT_VAL[i_ahead] - LOGIT_VAL[i_behind])
+    show = diff.sort_values(key=abs, ascending=False).head(10)[::-1]
+    a, b = VAL_INFO.loc[i_ahead, "driver"], VAL_INFO.loc[i_behind, "driver"]
+    labels = [f"{c}: {DISPLAY_VAL.loc[i_ahead, c]} vs {DISPLAY_VAL.loc[i_behind, c]}" for c in show.index]
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    ax.barh(labels, show, color=np.where(show > 0, "#C44E52", "#4C72B0"))
+    ax.axvline(0, color="black", lw=0.8)
+    ax.set_xlabel(f"log-odds in favour of {a} (red) / {b} (blue)")
+    ax.set_title(f"{title}\n{a} vs {b}: total gap {diff.sum():+.2f} log-odds "
+                 f"(probability {VAL_INFO.loc[i_ahead, 'probability']:.3f} vs {VAL_INFO.loc[i_behind, 'probability']:.3f})", fontsize=9)
+    plt.tight_layout()
+    plt.show()
+    by_group = diff.groupby(lambda c: GROUP_OF[c]).sum().sort_values(key=abs, ascending=False)
+    print(f"{a} vs {b}, gap by group (log-odds): " + ", ".join(f"{g} {v:+.2f}" for g, v in by_group.items()))
+    return diff
+
+
+# Race 1: the closest 3rd-vs-4th cut.
+cut = (VAL_INFO.sort_values(["raceId", "rank in race"]).groupby("raceId")["probability"]
+       .apply(lambda p: p.iloc[2] - p.iloc[3]))
+RACE1 = cut.idxmin()
+r1 = race_table(RACE1)
+print(f"Race 1: {VAL_INFO.loc[VAL_INFO['raceId'] == RACE1, 'race'].iloc[0]}; 3rd vs 4th probability gap {cut.min():.4f} "
+      f"(the smallest of the 60 validation races). The model's three picks got {int(r1.loc[r1['top-3 pick'], 'podium'].sum())} podiums right.")
+display(r1.round(3))
+third = r1.index[r1["rank in race"] == 3][0]
+fourth = r1.index[r1["rank in race"] == 4][0]
+pair_explanation(third, fourth, "Race 1: why the 3rd most likely driver is ahead of the 4th")
+
+# Race 2: the first race where the model's top 3 differ from the grid's top 3.
+order = VAL_INFO.drop_duplicates("raceId").sort_values(["year", "round"])["raceId"]
+RACE2 = next(r for r in order if set(race_table(r).query("`top-3 pick`")["driver"]) != set(race_table(r).query("`grid top 3`")["driver"]))
+r2 = race_table(RACE2)
+print(f"Race 2: {VAL_INFO.loc[VAL_INFO['raceId'] == RACE2, 'race'].iloc[0]} (first validation race where the model's top 3 "
+      f"differ from the grid's top 3). Model picks right: {int(r2.loc[r2['top-3 pick'], 'podium'].sum())}; "
+      f"grid top 3 right: {int(r2.loc[r2['grid top 3'], 'podium'].sum())}.")
+display(r2.round(3))
+brought_in = r2[r2["top-3 pick"] & ~r2["grid top 3"]]["probability"].idxmax()
+left_out = r2[r2["grid top 3"] & ~r2["top-3 pick"]]["probability"].idxmin()
+pair_explanation(brought_in, left_out, "Race 2: the driver the model picked instead of a grid-top-3 starter")
+''')
+
+md(r"""
+**Race-level findings:**
+- **Race 1, 2019 Singapore GP:** the 3rd and 4th most likely drivers are Max Verstappen (grid 4, 0.489) and Valtteri Bottas (grid 5, 0.488), a gap of 0.0005. Verstappen is ahead because of grid (+0.32), age/experience (+0.51) and qualifying (+0.04), while Bottas's championship position and team share (standings −0.62) and form (−0.25) pull the other way. The picks (Hamilton, Leclerc, Verstappen) got **2 of 3** right; the winner, Sebastian Vettel, started 3rd but was only the 5th most likely (0.461).
+- **Race 2, 2019 Australian GP:** the model picks Verstappen (grid 4) instead of Bottas (grid 2), mainly on **recent form (+1.00)**, which outweighs the two grid places (−0.64); age/experience add +0.51. Bottas won and Verstappen was 3rd, so the model's picks and the grid's top 3 both got 2 of 3 right.
+- These two races show the model's logic in one sentence: **start near the front, be in form, drive for a strong team.** Close calls are decided by small differences across many inputs.
+""")
+
+# ---------------------------------------------------------------- 10.6
+md(r"""
+## 10.6 LIME (supplementary local explanation)
+
+LIME explains one prediction by generating many **synthetic** variations of the driver's inputs, asking the model for their probabilities, and fitting a small **weighted linear model** around the driver. Its weights describe that **local approximation**, not the model's own weights, so they are not exact explanations.
+
+**Which input space?** LIME needs a complete table of numbers to sample from:
+- **On the 18 original features** (with the pre-processing inside the prediction function): not practical. The training rows contain missing values (e.g. `reached_q3` is missing for 16.6% of model-A training rows), which LIME cannot sample; and LIME would never generate a *missing* value, so the three missing-value flags would always be 0 and the "no Q1 time / no qualifying / debut" situations could not be explained.
+- **On the 21 filled inputs in original units** (after the imputation step, before scaling): practical; the prediction function scales them and calls the frozen model. **This is used here.** The 9 flags are marked categorical.
+
+**Known weakness (measured below):** LIME varies inputs **independently**, so many synthetic rows are impossible in real data, e.g. a missing Q1 time together with no qualifying record, `reached_q3` = 1 without qualifying, or a grid position beyond the field size. The model is then asked about cars that cannot exist, which can distort the local fit.
+
+Settings: 5,000 synthetic samples, the top 8 inputs, the same four drivers as 10.4, three seeds (42, 43, 44) to check stability; local fit quality (R²) and agreement with SHAP are reported.
+""")
+
+code(r'''
+try:
+    import lime.lime_tabular
+    LIME_OK, LIME_NOTE = True, "lime available"
+except ImportError:
+    try:
+        import subprocess, sys
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "lime"], check=True, timeout=300)
+        import lime.lime_tabular
+        LIME_OK, LIME_NOTE = True, "lime installed now"
+    except Exception as e:
+        LIME_OK, LIME_NOTE = False, (f"LIME COULD NOT RUN in this environment ({type(e).__name__}: lime is not installed and could not be "
+                                     f"installed, e.g. no internet). The LIME results are missing from this run; SHAP (10.3-10.5) "
+                                     f"covers the local explanations.")
+print(LIME_NOTE)
+print("Missing values in the 18 original features (model-A training rows), the reason LIME is run on the filled inputs:",
+      TRAIN_A_ROWS[FINAL_FEATURES].isna().mean().mul(100).round(1)[lambda s: s > 0].to_dict())
+
+
+def lime_predict(Z):
+    filled = pd.DataFrame(np.asarray(Z, dtype=float), columns=FILLED_COLS)
+    return XLR.predict_proba(XPRE.named_steps["scale"].transform(filled))
+
+
+assert np.allclose(lime_predict(FILLED_VAL.to_numpy())[:, 1], P_VAL), "LIME wrapper does not reproduce the model"
+CAT_IDX = [FILLED_COLS.index(c) for c in BINARY_FEATURES + INDICATORS]
+
+# How often does independent sampling produce impossible rows? (same independence as LIME's sampling)
+rng_lime = np.random.default_rng(EXP_SEED)
+sim = pd.DataFrame({c: FILLED_TRAIN[c].to_numpy()[rng_lime.integers(0, len(FILLED_TRAIN), 5000)] for c in FILLED_COLS})
+slow = XPRE.named_steps["impute"].gap_slow_
+impossible = {
+    "no Q1 time and no qualifying record at once": ((sim["q1_time_missing"] == 1) & (sim["quali_missing"] == 1)).mean(),
+    "no Q1 time but a real Q1 gap": ((sim["q1_time_missing"] == 1) & ~np.isclose(sim["gap_q1_pct"], slow)).mean(),
+    "reached Q3 without a qualifying record": ((sim["reached_q3"] == 1) & (sim["quali_missing"] == 1)).mean(),
+    "grid position beyond the field (+ pit lane)": (sim["grid"] > sim["n_starters"] + 1).mean(),
+    "'debut' flag with earlier starts": ((sim["drv_form_missing"] == 1) & (sim["drv_experience"] > 0)).mean(),
+}
+real = FILLED_TRAIN
+in_real = {
+    "no Q1 time and no qualifying record at once": ((real["q1_time_missing"] == 1) & (real["quali_missing"] == 1)).mean(),
+    "no Q1 time but a real Q1 gap": ((real["q1_time_missing"] == 1) & ~np.isclose(real["gap_q1_pct"], slow)).mean(),
+    "reached Q3 without a qualifying record": ((real["reached_q3"] == 1) & (real["quali_missing"] == 1)).mean(),
+    "grid position beyond the field (+ pit lane)": (real["grid"] > real["n_starters"] + 1).mean(),
+    "'debut' flag with earlier starts": ((real["drv_form_missing"] == 1) & (real["drv_experience"] > 0)).mean(),
+}
+display(pd.DataFrame({"share of independently sampled rows %": pd.Series(impossible) * 100,
+                      "share of real training rows %": pd.Series(in_real) * 100}).round(2))
+''')
+
+code(r'''
+LIME_ROWS = []
+shap_top5 = {label: set(PHI.loc[i].abs().sort_values(ascending=False).head(5).index) for label, i in EXAMPLES.items()}
+if LIME_OK:
+    for label, i in EXAMPLES.items():
+        per_seed = {}
+        for seed in [42, 43, 44]:
+            explainer = lime.lime_tabular.LimeTabularExplainer(
+                FILLED_TRAIN.to_numpy(), feature_names=FILLED_COLS, class_names=["no podium", "podium"],
+                categorical_features=CAT_IDX, discretize_continuous=True, mode="classification", random_state=seed)
+            exp = explainer.explain_instance(FILLED_VAL.to_numpy()[VAL_ROWS.index.get_loc(i)], lime_predict, num_features=8, num_samples=5000)
+            weights = exp.as_map()[1]
+            per_seed[seed] = {"names": [FILLED_COLS[j] for j, _ in weights], "conditions": exp.as_list(label=1), "score": exp.score,
+                              "local prediction": float(np.ravel(exp.local_pred)[0])}
+        top5 = {s: set(v["names"][:5]) for s, v in per_seed.items()}
+        LIME_ROWS.append({"example": label, "driver": VAL_INFO.loc[i, "driver"], "model probability": P_VAL[VAL_ROWS.index.get_loc(i)],
+                          "LIME local prediction (seed 42)": per_seed[42]["local prediction"],
+                          "local fit R2 (seeds 42/43/44)": " / ".join(f"{per_seed[s]['score']:.2f}" for s in per_seed),
+                          "top-5 overlap between seeds (min of 3 pairs, out of 5)": min(len(top5[a] & top5[b]) for a, b in [(42, 43), (42, 44), (43, 44)]),
+                          "top-5 overlap with SHAP (seed 42, out of 5)": len(top5[42] & shap_top5[label]),
+                          "LIME top 5 (seed 42)": ", ".join(per_seed[42]["names"][:5]),
+                          "SHAP top 5": ", ".join(PHI.loc[i].abs().sort_values(ascending=False).head(5).index)})
+        cond = per_seed[42]["conditions"][::-1]
+        fig, ax = plt.subplots(figsize=(9, 3.8))
+        ax.barh([c for c, _ in cond], [w for _, w in cond], color=["#C44E52" if w > 0 else "#4C72B0" for _, w in cond])
+        ax.axvline(0, color="black", lw=0.8)
+        ax.set_xlabel("LIME weight (change in the local linear model's podium probability)")
+        ax.set_title(f"LIME {label}: {VAL_INFO.loc[i, 'driver']}, {VAL_INFO.loc[i, 'race']} (seed 42, R2 {per_seed[42]['score']:.2f})", fontsize=9)
+        plt.tight_layout()
+        plt.show()
+    LIME_TABLE = pd.DataFrame(LIME_ROWS).set_index("example")
+    display(LIME_TABLE.round(3))
+else:
+    print("LIME results missing (see the message above); this is a limitation of this run, not an omitted step.")
+''')
+
+md(r"""
+**LIME findings, and why it stays secondary:**
+- **The local linear fits are weak:** R² 0.14–0.55. LIME's own prediction for the driver is far from the model's (0.38 vs 0.91 for (a); 0.32 vs 0.80 for (c); 0.27 vs 0.14 for (d)). The model is very steep near 0 and 1 (the sigmoid), which a straight line over LIME's wide synthetic neighbourhood does not capture.
+- **LIME is stable across seeds** (3–4 of the top 5 inputs shared) but **agrees only partly with SHAP** (1–3 of the top 5). It often ranks `q1_time_missing` first even when the driver *has* a Q1 time. Its condition "q1_time_missing = 0" is compared with synthetic rows where the flag is 1, and that flag has the model's second-largest weight.
+- **Impossible synthetic rows are present but not dominant:**
+  - independent sampling produces "no Q1 time but a real Q1 gap" in 1.5% of rows, a "debut" flag with earlier starts in 1.4%, and a grid position beyond the field in 2.0%;
+  - none of these occur in real data (grid beyond the field: 0.06%, pit-lane recodes).
+- **Conclusion:** LIME's weights describe a rough local approximation, not the model. SHAP, which is exact for this model, is the reference for local explanations.
+""")
+
+# ---------------------------------------------------------------- 10.7
+md(r"""
+## 10.7 Permutation importance
+
+How much worse does the frozen model get if an input's values are **shuffled**, breaking its link with the outcome? 50 shuffles per input; the drop is reported as mean ± standard deviation. Two analyses, answering different questions:
+- **Across-row permutation → PR-AUC:** the values are shuffled over all 1,199 validation rows. Measures how much the input helps rank **all** driver-races by podium chance.
+- **Within-race permutation → top-3 F1:** the values are shuffled **only among the drivers of the same race**. Measures how much the input helps decide **who the top three of a race are**. (Race-level metrics move in steps of one pick, so these drops are coarse.)
+- **Grouped:** all inputs of a group are shuffled **with the same row order**, so the group stays internally consistent (e.g. a flag stays with its feature).
+
+**Caveats:** shuffling one input (or one group) while the others stay put creates combinations that do not occur in real races (e.g. a slow qualifier on pole), and correlated inputs can cover for each other, so individual drops understate inputs that share information. As with SHAP, this describes the **model**, not causes.
+""")
+
+code(r'''
+N_REP = 50
+y_v, race_v = VAL_ROWS["podium"].to_numpy(), VAL_ROWS["raceId"].to_numpy()
+BASE_PR = average_precision_score(y_v, P_VAL)
+BASE_TOP3 = podium_pick(y_v, P_VAL, race_v)["top-3 F1"]
+val_race_rows = [np.flatnonzero(race_v == r) for r in np.unique(race_v)]
+rng_perm = np.random.default_rng(EXP_SEED)
+
+
+def permutation_drop(cols, within_race):
+    drops = []
+    for _ in range(N_REP):
+        if within_race:
+            perm = np.arange(len(y_v))
+            for rows in val_race_rows:
+                perm[rows] = rows[rng_perm.permutation(len(rows))]
+        else:
+            perm = rng_perm.permutation(len(y_v))
+        Xp = X_VAL.copy()
+        Xp[cols] = X_VAL[cols].to_numpy()[perm]                       # same row order for every input of the group
+        p = XLR.predict_proba(Xp)[:, 1]
+        drops.append(BASE_TOP3 - podium_pick(y_v, p, race_v)["top-3 F1"] if within_race else BASE_PR - average_precision_score(y_v, p))
+    return np.mean(drops), np.std(drops)
+
+
+t0 = time.time()
+perm_rows = []
+for kind, units in [("input", {c: [c] for c in XAI_INPUTS}), ("group", INPUT_GROUPS)]:
+    for unit, cols in units.items():
+        m_pr, s_pr = permutation_drop(cols, within_race=False)
+        m_t3, s_t3 = permutation_drop(cols, within_race=True)
+        perm_rows.append({"level": kind, "input or group": unit, "group": GROUP_OF[cols[0]] if kind == "input" else unit,
+                          "PR-AUC drop (across rows)": m_pr, "SD (PR-AUC)": s_pr, "top-3 F1 drop (within race)": m_t3, "SD (top-3)": s_t3})
+PERMUTATION = pd.DataFrame(perm_rows)
+print(f"Base validation scores: PR-AUC {BASE_PR:.4f}, top-3 F1 {BASE_TOP3:.4f}; {N_REP} shuffles each; {time.time() - t0:.0f} s")
+display(PERMUTATION[PERMUTATION["level"] == "group"].drop(columns=["level", "group"]).set_index("input or group").round(4))
+display(PERMUTATION[PERMUTATION["level"] == "input"].drop(columns="level").set_index("input or group")
+        .sort_values("PR-AUC drop (across rows)", ascending=False).round(4))
+
+fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+for row, kind in enumerate(["group", "input"]):
+    sub = PERMUTATION[PERMUTATION["level"] == kind]
+    for col, (metric, sd, label) in enumerate([("PR-AUC drop (across rows)", "SD (PR-AUC)", "PR-AUC drop, values shuffled across rows"),
+                                               ("top-3 F1 drop (within race)", "SD (top-3)", "top-3 F1 drop, values shuffled within each race")]):
+        s = sub.sort_values(metric)
+        axes[row, col].barh(s["input or group"], s[metric], xerr=s[sd], color=[GROUP_COLORS[g] for g in s["group"]], capsize=2)
+        axes[row, col].axvline(0, color="black", lw=0.8)
+        axes[row, col].set_xlabel(label)
+        axes[row, col].set_title(f"Permutation importance by {kind} (primary model, validation)", fontsize=10)
+        axes[row, col].tick_params(axis="y", labelsize=8)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**Permutation findings** (validation; drop in score when the values are shuffled):
+- **Grouped:**
+
+  | Group | PR-AUC drop | Top-3 F1 drop |
+  |---|---|---|
+  | grid | 0.417 | 0.375 |
+  | form | 0.074 | 0.038 |
+  | standings | 0.051 | 0.031 |
+  | qualifying | 0.047 | 0.024 |
+  | context | 0.005 | 0.001 |
+
+  Grid dominates both for ranking all drivers and for picking the top 3 within a race.
+- **Individual inputs:** after grid (0.42), the largest PR-AUC drops are `drv_experience` (0.057), `drv_avg_finish_5` (0.055) and `cons_points_share` (0.040).
+  - **Correlation shows up clearly:** shuffling `drv_experience` *alone* costs 0.057, but shuffling the whole context group (experience, age and field size together) costs only 0.005. Breaking the link between experience and age creates unrealistic drivers whose two offsetting weights no longer cancel.
+- **Unused inputs:** `no_q3_format`, `quali_missing`, `pit_lane_start` and the form flags have ≈ 0 importance in validation; they are constant or very rare there.
+""")
+
+# ---------------------------------------------------------------- 10.8
+md(r"""
+## 10.8 Tree SHAP for gradient boosting A (comparison)
+
+The frozen gradient-boosting model A (v2) is explained with SHAP's **tree** explainer (exact for tree models), on its own 21 unscaled inputs and the same validation rows. Its contributions are also in **log-odds**. This shows whether a non-linear model relies on the same groups as the logistic regression.
+""")
+
+code(r'''
+X_VAL_TREE = TPRE.transform(VAL_ROWS[FINAL_FEATURES])
+TREE_SHAP_OK, TREE_NOTE = False, ""
+if SHAP_OK:
+    try:
+        _te = shap.TreeExplainer(THGB)
+        _tsv = _te(X_VAL_TREE)
+        p_tree = THGB.predict_proba(X_VAL_TREE)[:, 1]
+        assert np.allclose(p_tree, V2_REFERENCE["A_gradient_boosting"])
+        additive = np.allclose(_tsv.values.sum(axis=1) + _tsv.base_values, np.log(p_tree / (1 - p_tree)), atol=1e-6)
+        PHI_TREE = pd.DataFrame(_tsv.values, columns=INPUTS_TREE, index=VAL_ROWS.index)
+        TREE_SHAP_OK, TREE_NOTE = True, f"tree SHAP ran; contributions add up to the model's log-odds: {additive}"
+    except Exception as e:
+        TREE_NOTE = f"TREE SHAP COULD NOT RUN with this shap version ({type(e).__name__}: {e}); comparison missing from this run"
+else:
+    TREE_NOTE = "TREE SHAP COULD NOT RUN: shap is not available; comparison missing from this run"
+print(TREE_NOTE)
+if TREE_SHAP_OK:
+    tree_A = PHI_TREE.abs().mean().groupby(lambda c: GROUP_OF[c]).sum()
+    tree_B = pd.Series({g: PHI_TREE[cols].sum(axis=1).abs().mean() for g, cols in INPUT_GROUPS.items()})
+    SHAP_GROUPS_TREE = pd.DataFrame({"(A) sum of mean |SHAP|": tree_A, "(B) mean |summed group SHAP|": tree_B})
+    display(SHAP_GROUPS_TREE.sort_values("(B) mean |summed group SHAP|", ascending=False).round(4))
+    _disp_tree = DISPLAY_VAL[INPUTS_TREE].to_numpy()
+    shap.plots.beeswarm(shap.Explanation(values=_tsv.values, base_values=_tsv.base_values, data=X_VAL_TREE.to_numpy(),
+                                         display_data=_disp_tree, feature_names=INPUTS_TREE), max_display=21, show=False)
+    plt.title("Tree SHAP, gradient boosting A (v2), validation 2019-2021 (log-odds)", fontsize=9)
+    plt.gcf().set_size_inches(10, 8)
+    plt.tight_layout()
+    plt.show()
+''')
+
+md(r"""
+**Tree SHAP comparison:** gradient boosting relies on the same top two groups, **grid (0.85) and form (0.53)**, then standings (0.36). It uses qualifying (0.10) and context (0.06) much less than logistic regression does. A tree can capture "fast car starting further back" through grid × form interactions rather than through the qualifying flags, and it does not need the age/experience pair.
+""")
+
+# ---------------------------------------------------------------- 10.9
+md(r"""
+## 10.9 Do the methods agree? Group ranking across all methods
+
+Rank of each group (1 = most important) under every method. Agreement means a group's role is robust to *how* importance is measured; disagreement is explained mostly by correlated groups (methods that remove or shuffle a group alone measure its *unique* contribution; SHAP measures how much the model's formula *uses* it).
+""")
+
+code(r'''
+abl_lr = ABLATION[(ABLATION["family"] == "logistic regression") & (ABLATION["variant"] != "full model")].set_index("variant")
+abl_gb = ABLATION[(ABLATION["family"] == "gradient boosting") & (ABLATION["variant"] != "full model")].set_index("variant")
+perm_g = PERMUTATION[PERMUTATION["level"] == "group"].set_index("input or group")
+COMPARE = pd.DataFrame({
+    "ablation LR: PR-AUC drop": abl_lr["PR-AUC drop"].rename(lambda v: v.replace("without ", "")),
+    "ablation LR: correct-picks drop": abl_lr["correct-picks drop"].rename(lambda v: v.replace("without ", "")),
+    "ablation GB: PR-AUC drop": abl_gb["PR-AUC drop"].rename(lambda v: v.replace("without ", "")),
+    "permutation: PR-AUC drop": perm_g["PR-AUC drop (across rows)"],
+    "permutation: top-3 F1 drop (within race)": perm_g["top-3 F1 drop (within race)"],
+    "SHAP LR: mean |group total|": SHAP_GROUPS_LR["(B) mean |summed group SHAP|"],
+})
+if TREE_SHAP_OK:
+    COMPARE["SHAP GB: mean |group total|"] = SHAP_GROUPS_TREE["(B) mean |summed group SHAP|"]
+COMPARE["sum of |LR weights|"] = coef.abs().groupby(lambda c: GROUP_OF[c]).sum()
+RANKS = COMPARE.rank(ascending=False).astype(int)
+print("Values:")
+display(COMPARE.round(4))
+print("Ranks (1 = most important):")
+display(RANKS)
+''')
+
+md(r"""
+**Do the methods agree?**
+- **Grid is ranked 1st by every method and form 2nd by almost every method.** This is the robust finding: the model mostly predicts "who starts near the front and has been finishing near the front lately".
+- **Qualifying is the main disagreement:** 1st by the sum of |weights| but 3rd–5th elsewhere. Its large weights belong to flags that rarely apply (`q1_time_missing`, `no_q3_format`) or offset each other (`reached_q3` vs grid), so big weights do not mean big influence on actual predictions.
+- **Standings and qualifying swap places** between methods. Both overlap with grid and form, so how much credit each gets depends on whether a method removes one group at a time (ablation, permutation: *unique* contribution) or splits the model's formula (SHAP).
+- **Context** looks moderate in SHAP measure (A) but negligible in ablation, grouped permutation and SHAP measure (B): age and experience cancel.
+
+**These explanations describe the model, not Formula 1.** They show which pre-race information the model uses to rank drivers, not what *causes* a podium; correlated inputs mean that credit between grid, qualifying, standings and form is partly a matter of method.
 """)
 
 

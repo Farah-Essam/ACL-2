@@ -19,6 +19,8 @@ This README is the project log. It records **what was done, why, and what was tr
 | `outputs/clean_data/` | **The cleaned dataset**, written by notebook section 2.13: 15 CSVs (`model_base`, `results_full`, every cleaned table, the `*_prerace` standings), `schema.json` (column types), `manifest.csv` (rows + SHA-256) and its own `README.md`. Load with `load_clean("<table>")` to get the exact types back. Rewritten on every run; never edit by hand. |
 | `outputs/final_features.csv` | **The final feature table**, written by notebook section 4.7: every row of `feat` (24,645, all seasons 1950–2024) × 23 columns = `raceId`, `driverId`, `year`, `split`, target `podium` + the 18 `FINAL_FEATURES` in order. Missing values are empty cells (no filling or scaling: that is section 5, fitted on training seasons only). Rows sorted by race, grid, `driverId`. Read with `pd.read_csv(path, keep_default_na=False, na_values=[""])`. Rewritten on every run (on Kaggle under `/kaggle/working/outputs/`). |
 | `outputs/frozen_models.json` | **The frozen section-6 models**, written by notebook 6.11: for each of the 8 final models (4 families × model A and B) and the 2 baselines, the chosen settings, pre-processing, threshold, training seasons, seed / epochs, CV and validation PR-AUC, and a SHA-256 fingerprint of the whole record. No data and no test metric. Rewritten on every run (identical as long as nothing changes). |
+| `outputs/model_artifacts/` | **The fitted frozen models as files**, written by notebook 6.12 on every run: one `cloudpickle` file per scikit-learn model (fitted pre-processing + model), `*_preprocessor.pkl` + `*_weights.pt` (PyTorch `state_dict`) per network, the grid-only baseline, `reference_validation_predictions.npz`, `manifest.json` (files + SHA-256, full-precision thresholds incl. exact hex, architecture/epochs, input columns, frozen fingerprint, library versions) and `load_artifacts.py`. ~6 MB (mostly the two random forests). See README 7.3 "Model artifacts". |
+| `outputs/frozen_models_v2.json`, `outputs/model_artifacts_v2/` | **The second freeze (v2, section 7)**: same structure as v1 (record + fingerprint; fitted models, manifest, reference validation predictions, loader). The v2 record also stores the v1 fingerprint and a `changed from v1` flag. **The test evaluation (7.5) uses these files.** The v1 files stay as the record of the first freeze. |
 | `../Dataset.zip` | Raw data (one folder above the repo, **not** in git). Read directly from the zip, never extracted. |
 | `../GUC_..._2026-09-30....pdf` | The milestone brief (one folder above the repo). |
 
@@ -70,7 +72,8 @@ python tools/run_notebook.py  f1_podium_prediction.ipynb    # execute top to bot
 | **4. Feature Selection & Engineering** (4.1–4.7) | done (16 Oct 2026; review fixes the same day) | split, 22 candidate features with leakage asserts, 4.2.1 checks of the two corrected features (`reached_q3`, team form), evidence plots (train only), redundancy, trials on validation, final 18-feature table, 4.7 export to `outputs/final_features.csv`. Results in README 7.1 |
 | **5. Pre-processing** (5.1–5.8) | done (17 Oct 2026) | missing-value audit, `F1Imputer` (indicators + fills + `gap_q1_pct` cap), scaling, order experiments E1/E2 (+ checks), final pipelines for models A and B, leakage checks. Results in README 7.2 |
 | **6. Predictive Modeling** (6.1–6.11) | done (17 Oct 2026); **frozen**, test not evaluated | forward-chaining CV (4 folds), 4 families × models A and B, OOF thresholds, validation once, A vs B + training-window experiments, freeze. Results in README 7.3 |
-| 7. Final test evaluation | **next, after review of the frozen models** | one-time evaluation of the frozen models on 2022–2024 |
+| **7. Final optimisation, second freeze, test evaluation** (7.1–7.10) | done (17 Oct 2026) | grid-edge extension (rule-based), re-tuning with the same CV and rule, v2 freeze (`frozen_models_v2.json`, `model_artifacts_v2/`), **one-time test evaluation 2022–2024**, interpretation, 7.10 official race-level output (top 3 per race). Results in README 7.4 |
+| **8. Exploratory (post-test)** | done (17 Oct 2026) | 8 configurations on the historical folds only (grid shape, race-relative features, GB reference); no change to the frozen models. Results in README 7.5 |
 | 8+. Ablation, XAI, inference, report | to do | |
 
 Variables available after running sections 1–4:
@@ -83,7 +86,8 @@ Variables available after running sections 1–4:
 - Helpers: `is_missing`, `duration_to_seconds`, `log_step`, `STATUS_GROUPS`, `STATUS_CATEGORIES`, `NON_START_STATUSES`, `RULE_B_OVERRIDES`, `UNUSED_TABLES`, `DEFERRED_TABLES`, `NATIONALITY_TO_COUNTRY`, `season_order`, `CLEAN_DATA_DIR`, `load_clean(name)` (reads an exported table back with its exact types).
 - Section 4: `feat` (all 24,645 rows 1950–2024: keys, `year`, `split`, `podium`, every candidate feature), `season_split(year)`, `FEATURE_GROUPS`, `ALL_CANDIDATES`, `FINAL_FEATURES` (the 18 chosen), `TRAIN_A` / `VAL` (model-A training rows, validation rows), `TRIALS` (every trial's scores), `form_features(n)`, `run_trial`, `gain_interval`, `TEAM_RACES` / `TEAM_GAP_DAYS` (constructor history segments for team form), `ELIMINATION_FORMAT` (the two 2016 races with 8 Q3 places), `FINAL_FEATURES_PATH` / `final_features_df` (the 4.7 export).
 - Section 5: `data` (the CSV read back), `TRAIN_A_ROWS` / `TRAIN_B_ROWS` / `VAL_ROWS`, `CONTINUOUS_FEATURES` / `BINARY_FEATURES` / `INDICATORS`, `F1Imputer`, `make_preprocessor(scaled=...)`, `fit_on_training(pipe, rows, label)` (refuses non-training rows), **`PREPROCESSORS`** (4 fitted pipelines), **`MODEL_INPUTS`**, `EXPERIMENTS` / `experiments_df`, `evaluate_preprocessing`, `pr_auc_difference`.
-- Section 6: `FOLDS` / `fold_rows(model, k)`, `fit6` (training-rows guard + log), `GRIDS`, `SEARCH` (every setting's fold scores), `CHOSEN`, `OOF` (out-of-fold predictions), `THRESHOLDS`, `FINAL6` (fitted final models: `{'pre', 'model'}`), `VAL_PRED`, `ShallowNet` (PyTorch), `PRIMARY_MODEL`, **`FROZEN`** / `FROZEN_MODELS` / `FROZEN_FINGERPRINT`, **`predict_frozen(key, rows)`** (probabilities + threshold rule + top-3 rule; for the test evaluation), `FIT6_LOG` / `PREDICT6_LOG`.
+- Section 6: `ARTIFACT_DIR`, `load_model_artifacts(folder)`, `LOADER_SOURCE` (6.12), `FOLDS` / `fold_rows(model, k)`, `fit6` (training-rows guard + log), `GRIDS`, `SEARCH` (every setting's fold scores), `CHOSEN`, `OOF` (out-of-fold predictions), `THRESHOLDS`, `FINAL6` (fitted final models: `{'pre', 'model'}`), `VAL_PRED`, `ShallowNet` (PyTorch), `PRIMARY_MODEL`, **`FROZEN`** / `FROZEN_MODELS` / `FROZEN_FINGERPRINT`, **`predict_frozen(key, rows)`** (probabilities + threshold rule + top-3 rule; for the test evaluation), `FIT6_LOG` / `PREDICT6_LOG`.
+- Section 7: `GRIDS_V2`, `SEARCH_V2`, `CHOSEN_V2`, `FINAL_V2`, `THRESHOLDS_V2`, `VAL_PRED_V2`, `PRIMARY_MODEL_V2`, `FROZEN_V2` / `FROZEN_V2_FINGERPRINT`, `ARTIFACT_DIR_V2`, `save_model_artifacts` / `verify_model_artifacts` (shared with 6.12), `TEST_ROWS`, `TEST_PRED`, `TEST_THRESHOLDS`, `TEST_BOOT`, `test_table`, `four` (train/CV/val/test), `comparisons`, `season_table`.
 
 ---
 
@@ -286,10 +290,100 @@ Notebook layout: 6.1 set-up, guards, metrics · 6.2 forward-chaining CV + select
 - **Freeze:** 8 final models + 2 baselines, fitted objects in `FROZEN_MODELS`, record + fingerprint in `outputs/frozen_models.json`, `predict_frozen()` verified to reproduce the validation predictions exactly. Guards: 697 fits, all on training rows; all 664 CV fits used only seasons before their scoring block (asserted at fit time + from the log); 486 predictions, none on test rows; `final_features.csv` unchanged.
 - **Limitations:** 60 validation races (differences of ~0.02–0.04 are within noise); thresholds from CV folds whose models trained on fewer seasons (they still predicted 209–230 podiums for 180 real ones); 2022 regulation change may lower test scores; `pit_lane_start` / `no_q3_format` carry little usable signal; model B mixes eras with one coefficient per feature; the tie rule was corrected twice after the first runs (trial log).
 
-### 7.4 Later steps
+#### Model artifacts (6.12)
 
-1. **Final test evaluation (separate step, after review):** load the frozen models (`FROZEN_MODELS`, check `FROZEN_FINGERPRINT`), transform 2022–2024 with the fitted pre-processing, report PR-AUC, ROC-AUC, precision/recall/F1 (frozen thresholds), top-3 F1, Brier and confusion matrices for every frozen model, once. No re-tuning.
-2. Ablation by feature group (grid, qualifying, standings, form) with every model; XAI (permutation importance, SHAP global, LIME/local SHAP; not causal); inference function (can reuse `predict_frozen` / `PREPROCESSORS`, which already handle partial records); report.
+- **What is saved:** the 8 frozen final models (4 families × model A and B) and the grid-only baseline, each with its **fitted pre-processing** from 5.7, in `outputs/model_artifacts/`. Nothing is retrained: 6.12 serialises the objects frozen in 6.11.
+- **Formats:** scikit-learn pipelines and models with **`cloudpickle`** (the pre-processing contains `F1Imputer`, a notebook-defined class; plain `pickle`/`joblib` would store only a reference to it and fail outside the notebook). Networks: PyTorch **`state_dict`** (`torch.save`, loaded with `weights_only=True`) + architecture in the manifest; their pre-processing with `cloudpickle`.
+- **Thresholds:** stored at full precision (JSON float, round-trips exactly) and as an exact hexadecimal float (`float.hex`); the loader uses the hex value. (`outputs/frozen_models.json` keeps 6-decimal thresholds for reading only.)
+- **Loading (outside the notebook):**
+  ```python
+  import sys; sys.path.insert(0, "outputs/model_artifacts")
+  from load_artifacts import load_model_artifacts
+  models, manifest = load_model_artifacts("outputs/model_artifacts")
+  m = models["A_logistic_regression"]                 # primary model; others: A_/B_ + random_forest, gradient_boosting, neural_network; A_grid_only_LR
+  p = m["predict"](rows)                              # rows: DataFrame with the 18 FINAL_FEATURES columns (missing values allowed)
+  yes = p >= m["threshold"]                           # frozen threshold rule
+  ```
+  Every file is checked against its SHA-256 in the manifest when loading.
+- **Verification (17 Oct 2026):** in the notebook (6.12) and in a separate Python process with no notebook code, all 9 re-loaded models reproduce the frozen validation predictions **bit for bit** (largest difference 0.0; notebook tolerance 1e-9), with identical thresholds and identical threshold / top-3 decisions. A record with missing qualifying and form values is scored without error.
+- **Versions that wrote them:** Python 3.14.0, numpy 2.4.1, pandas 2.3.3, scikit-learn 1.8.0, torch 2.10.0+cpu, cloudpickle 3.1.2 (also in `manifest.json`).
+- **Portability limits:** load with the **same versions**. `cloudpickle` files contain Python code by value and need the same Python minor version; scikit-learn objects may not load (or may warn) under another scikit-learn version; PyTorch weights are the most portable part. The networks compute in 32-bit floats: with a different number of CPU threads their probabilities can differ by ~1e-8 (checked: up to 3e-8 with 8 threads, identical decisions); call `torch.set_num_threads(1)` first for bit-identical results (the notebook does). On Kaggle (other versions) *Run All* simply re-creates the files; predictions are identical between runs, but the bytes/SHA-256 of the `cloudpickle` files can differ between runs, so the manifest always describes the files of its own run.
+
+### 7.4 Section 7: Final optimisation, second freeze, test evaluation. Authorised 17 Oct 2026, BUILT 17 Oct 2026
+
+Order: Phase 1 re-tuning → Phase 2 freeze v2 → Phase 3 one-time test → Phase 4 interpretation. Section 6 (v1) is untouched.
+
+- **Phase 1 rule (fixed before running):** for each setting dimension where the best or chosen setting of model A or B used the smallest/largest value tried, add one value beyond that edge (fixed list in 7.1); run the new combinations only; choose among old + new with the **same** folds, paired one-SE rule (closed upwards) and simplicity order (random forest order gains depth 4). Validation not used for any choice; training windows, features and pre-processing unchanged.
+- **Extensions added:** LR `C` 100 (2 new settings); RF depth 4, min leaf 100 (14 new); HGB learning rate 0.02, 3 leaves, min leaf 10 and 160, 50 and 600 trees (128 new); network hidden (8,), dropout 0.4, weight decay 1e-5 and 1e-2 (36 new). Same for A and B. Run time of the 7.2 search ≈ 26 min (the full notebook now ≈ 45 min).
+- **v2 settings (CV PR-AUC v1 → v2):** LR A unchanged `C` 1 (0.703); LR B unchanged `C` 0.1 (0.690); RF A and B → depth 4, min leaf 100, `max_features` 0.5 (A 0.684 → 0.687, B 0.684 → 0.689); HGB A → lr 0.1, 3 leaves, min leaf 80, 50 trees (0.693 → 0.694); HGB B → lr 0.1, 3 leaves, min leaf 160, 100 trees (0.692 → 0.690); NN A → (8,), dropout 0, wd 1e-3, 158 epochs (0.702 → 0.706); NN B → (8,), dropout 0, wd 1e-3, 119 epochs (0.704 → 0.701). Changes are to simpler tied settings; the best overall CV scores moved by ≤ +0.006.
+- **v2 primary model (same rule):** best mean CV = network A (0.706); logistic regression A is tied (paired rule) and simpler → **primary stays logistic regression, model A**.
+- **v2 thresholds (out-of-fold F1):** LR A 0.3806, RF A 0.3315, HGB A 0.3090, NN A 0.4441, LR B 0.2986, RF B 0.3660, HGB B 0.3686, NN B 0.2922 (full precision in the manifest).
+- **Validation (reported once):** v2 − v1: RF A +0.002, HGB A +0.012, NN A +0.023 [+0.001, +0.038], RF B −0.001, HGB B +0.002, NN B −0.001; LR identical.
+- **Freeze v2:** fingerprint **`2ebc3457f47525afaf17b679d98bffc83bd3481b8261f4c5b3da25e108abafaa`**, recorded 17 Oct 2026 17:46 **before any test cell existed**; the test cell asserts it. Artifacts in `outputs/model_artifacts_v2/` re-load bit for bit (tolerance 1e-9).
+- **Test 2022–2024 (68 races, 1,354 rows, 204 podiums), frozen v2 models loaded from disk:**
+
+  | Model | PR-AUC | ROC-AUC | Brier | precision | recall | F1 | F1 top-3 |
+  |---|---|---|---|---|---|---|---|
+  | rule grid ≤ 3 | – | – | – | 0.650 | 0.647 | 0.649 | – |
+  | grid-only LR | 0.647 | 0.914 | 0.075 | 0.583 | 0.775 | 0.665 | 0.652 |
+  | **LR A (primary)** | **0.705** | 0.937 | 0.070 | 0.616 | 0.730 | 0.668 | 0.667 |
+  | RF A | 0.719 | 0.939 | 0.069 | 0.614 | 0.755 | 0.677 | 0.642 |
+  | HGB A | 0.718 | 0.938 | 0.068 | 0.597 | 0.799 | 0.683 | 0.642 |
+  | NN A | 0.698 | 0.935 | 0.072 | 0.621 | 0.716 | 0.665 | 0.627 |
+  | LR B | 0.712 | 0.937 | 0.070 | 0.585 | 0.809 | 0.679 | 0.657 |
+  | RF B | 0.725 | 0.941 | 0.070 | 0.641 | 0.735 | 0.685 | 0.667 |
+  | HGB B | 0.718 | 0.939 | 0.069 | 0.625 | 0.735 | 0.676 | 0.652 |
+  | NN B | 0.704 | 0.937 | 0.070 | 0.551 | 0.819 | 0.659 | 0.627 |
+
+- **Paired race-resampling intervals (test PR-AUC):** vs grid-only: LR A +0.057 [+0.009, +0.104], RF A +0.072 [+0.036, +0.108], HGB A +0.071 [+0.042, +0.098], NN A +0.051 [+0.006, +0.095] → **all clear**. vs primary: RF A +0.015, HGB A +0.013, NN A −0.007 → **none clear**. B − A: LR +0.008, RF +0.006, HGB −0.001, NN +0.006 → **none clear**.
+- **Train / CV / validation / test PR-AUC (model A):** LR 0.688 / 0.703 / 0.735 / 0.705; RF 0.699 / 0.687 / 0.735 / 0.719; HGB 0.705 / 0.694 / 0.733 / 0.718; NN 0.703 / 0.706 / 0.738 / 0.698. Model B training PR-AUC 0.56–0.58 (old seasons are harder, not overfitting).
+- **Regulation change:** test − validation for model A −0.015 to −0.040, every interval includes 0 (≈ ±0.10). Primary model per season: 2019 0.737, 2020 0.726, 2021 0.742, 2022 0.696, 2023 0.783, 2024 0.645 (grid-only similar shape: 2023 0.678, 2024 0.657) → season predictability (team dominance) matters more than the rule change; no clear evidence of a 2022 effect.
+- **Calibration (test):** Brier 0.068–0.072 (baseline 0.075); probabilities sum to 3.05–3.31 per race.
+- **Conclusions:** the four families are statistically indistinguishable on the test seasons; the primary logistic regression generalises (test ≈ CV, ROC-AUC stable) and, like every model, clearly beats the grid-only baseline; old data neither helps nor hurts; no clear overfitting; no clear regulation-change effect. On test, every model's F1 (0.659–0.685) is above the "grid ≤ 3" rule (0.649), unlike on validation (descriptive).
+- **Official prediction output (7.10, decided after the test; presentation only, no model change):**
+  - **Complete race → the predicted podium = the 3 drivers with the highest podium probability** from the frozen primary model (logistic regression, model A, v2). They are the most likely podium finishers, **not** a forecast of 1st/2nd/3rd. This rule was part of the frozen plan (6.8) and scored about the same as the threshold rule on the test (F1 0.667 vs 0.668), so it was not chosen for a better score but because every race has exactly 3 podium places.
+  - **Single driver → a podium probability** (no claim about the whole podium; the top-3 rule needs the whole race).
+  - **Threshold rule (≥ frozen threshold) → secondary, academic result** (any number of "yes" per race; precision/recall/F1 kept in 6.9, 7.5, 7.6).
+  - **Race-level results of the frozen predictions:**
+
+    | Period | Pick | top-3 F1 | correct podium drivers per race (of 3) | all 3 right | at least 2 right |
+    |---|---|---|---|---|---|
+    | validation 2019–2021 (60 races) | top 3 on the starting grid | 0.717 | 2.15 | 20 (33.3%) | 85.0% |
+    | validation 2019–2021 | **official (LR A)** | 0.700 | 2.10 | 21 (35.0%) | 80.0% |
+    | **test 2022–2024 (68 races)** | top 3 on the starting grid | 0.652 | 1.96 | 11 (16.2%) | 80.9% |
+    | **test 2022–2024** | **official (LR A)** | **0.667** | **2.00** | **16 (23.5%)** | 77.9% |
+
+    Official minus grid pick on the test seasons: +0.044 correct drivers per race, 95% race-resampling interval −0.088 to +0.176 → **not clear** (validation: −0.050, also not clear). As a podium pick the model is about as good as the front three on the grid; its clear advantage is in ranking/probabilities (test PR-AUC 0.705 vs 0.647). Other model-A families pick 1.88–1.93 correct per race on the test.
+  - **Deterministic:** no exact tie between the 3rd and 4th probability in any validation or test race (ties would be broken by grid, then `driverId`); the official test picks have fingerprint `5de40cb915d35a8d…` (printed in 7.10).
+- **v1 on test (comparison only, no decision):** LR identical; RF A 0.713 → v2 0.719, HGB A 0.710 → 0.718, NN A 0.700 → 0.698, RF B 0.716 → 0.725, HGB B 0.706 → 0.718, NN B 0.692 → 0.704.
+- **Integrity:** test rows first loaded in 7.5; the v2 fingerprint was recorded before; no setting, threshold, model or primary-model choice was changed after the test evaluation. The test cell re-executes deterministically on every *Run All* (same numbers); that is not a re-evaluation for decisions. The 7.9 interpretation cell (markdown only) was added after the run; the notebook's code cells and outputs are from that single run.
+- **Post-test exploratory ideas (not applied):** normalise per-race probabilities to sum to 3; a "dominance of the leading team" feature; evaluate on 2025 as a second genuine test.
+
+### 7.5 Section 8: Exploratory round after the test (17 Oct 2026)
+
+> **Exploratory, separate from the frozen final evaluation (section 7).** Nothing in section 8 changes a frozen model, threshold, fingerprint, the primary model, the official output or any section-7 result; its numbers come from the historical folds only and are not test results.
+
+- **Status:** exploratory, after the test results were seen. Judged on the four historical forward-chaining folds (scoring 2011–2018, model A) only; **validation and test seasons not used**; frozen v1/v2 models, fingerprints, primary model and section-7 results unchanged. Budget 8 configurations × 4 folds = 32 fits (4 s); no further tuning.
+- **Configurations:** C0 baseline LR (`C` 1, 21 inputs); C1 + `log(grid)`; C2 + grid spline (4 knots, cubic); C3 + team rank within the race (`cons_points_share`, `cons_podium_rate_5`); C4 + `gap_q1_pct` z-score within the race; C5 + rank within the race by `drv_avg_finish_5`; C6 = C1 + C3 + C4 + C5; C7 = gradient boosting with the frozen v2 setting. Race-relative features use only that race's pre-race features; new columns imputed/scaled inside each fold.
+- **Decision rule (fixed in advance):** mean top-3 F1 gain > 0, gain in ≥ 3 of 4 folds, mean PR-AUC not lower, and 95% paired race-resampling interval (158 races) of the top-3 F1 gain excluding 0.
+
+  | Configuration | CV PR-AUC | CV top-3 F1 | correct picks / race | exact-3 rate | top-3 F1 gain | folds improved (top-3 / PR-AUC) | interval (top-3 gain) | rule |
+  |---|---|---|---|---|---|---|---|---|
+  | C0 baseline | 0.703 | 0.666 | 2.00 | 0.265 | – | – | – | – |
+  | C1 + log(grid) | 0.716 | 0.668 | 2.00 | 0.252 | +0.002 | 2 / **4** | [−0.013, +0.015] | no |
+  | C2 + grid spline | 0.713 | 0.668 | 2.00 | 0.246 | +0.002 | 2 / 3 | [−0.012, +0.018] | no |
+  | C3 + relative team strength | 0.705 | 0.660 | 1.98 | 0.259 | −0.006 | 0 / 3 | [−0.015, +0.000] | no |
+  | C4 + relative qualifying pace | 0.698 | 0.670 | 2.01 | 0.264 | +0.004 | 2 / 2 | [−0.006, +0.015] | no |
+  | C5 + relative driver form | 0.703 | 0.658 | 1.97 | 0.240 | −0.008 | 0 / 1 | [−0.019, +0.000] | no |
+  | C6 + log(grid) + all relative | 0.714 | 0.674 | 2.02 | 0.252 | +0.008 | 3 / 3 | [−0.006, +0.023] | no |
+  | C7 GB (frozen v2 setting) | 0.694 | 0.659 | 1.98 | 0.233 | −0.007 | 2 / 2 | [−0.027, +0.015] | no |
+
+- **Findings:** no configuration meets the rule; podium-pick changes are within about ±4 correct picks out of 474. `log(grid)` is the only consistent change, but in **ranking** (PR-AUC +0.013, all 4 folds), not in the podium pick. Picking all three podium drivers right happens in about 1 race in 4; about 2 of 3 are right per race. Rescaling each race's probabilities (e.g. to sum to 3) keeps their order, so it cannot change the top-3 pick and was not tested as an improvement.
+- **Recommendation:** keep the frozen v2 logistic regression (model A) as the official model. Only `log(grid)` is worth carrying into a future version, to be evaluated on new seasons (2025+), not on 2019–2024.
+
+### 7.6 Later steps
+
+1. Ablation by feature group (grid, qualifying, standings, form) with every model (on validation; test only for the frozen final report); XAI (permutation importance, SHAP global, LIME/local SHAP; not causal) on the v2 primary model; inference function with two modes: a complete race → its 3 most likely podium finishers (official output), a single driver → podium probability (use `load_model_artifacts('outputs/model_artifacts_v2')`, which already handles partial records); report.
 
 ---
 
@@ -323,6 +417,7 @@ Notebook layout: 6.1 set-up, guards, metrics · 6.2 forward-chaining CV + select
 | Section 6 selection rule, v2: paired rule as above | Second run: not monotone: LR `C` 1 + balanced (0.7015, noisy shortfall) counted as a tie while `C` 1 without weights (0.7032, small but consistent shortfall) did not | Ties closed upwards: any setting with a mean at least as high as a tie's is a tie. Final rule (v3). Effect: LR model A `C` 1 without class weight (probabilities sum to ~3.2 per race instead of ~6.3 with balanced weights) |
 | Section 6: random forest with `n_jobs=-1` | Predictions differed in the last floating-point digits between calls, so the frozen-model reproduction check failed | `n_jobs=1` everywhere: bit-for-bit reproducible (parallelism moved to the CV jobs) |
 | Section 6: CV jobs run one after another | Model-B searches alone took ~25 min (network: ~130 ms per epoch on 20k rows, Python overhead) | (setting, fold) jobs in parallel processes with joblib; each job seeded, so results are identical (best CV scores reproduced exactly); section 6 now ~8–10 min |
+| Section 7 (authorised by the user after v1 was frozen): re-tuning | Several v1 best/chosen settings sat on grid edges | Rule-based one-step grid extension, same CV and selection rule; v2 freeze recorded before the test; v1 kept unchanged for comparison. The full notebook run time grew to ≈ 45 min |
 
 ---
 

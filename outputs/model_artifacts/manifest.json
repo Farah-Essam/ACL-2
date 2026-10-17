@@ -1,0 +1,457 @@
+{
+ "frozen fingerprint": "53625c66acf187ca0a15a8bb9e3e7c9c93e124429a53678b90df22c05104129c",
+ "written by": "f1_podium_prediction.ipynb, section 6.12 (re-written on every run)",
+ "versions": {
+  "python": "3.14.0",
+  "numpy": "2.4.1",
+  "pandas": "2.3.3",
+  "scikit-learn": "1.8.0",
+  "torch": "2.10.0+cpu",
+  "cloudpickle": "3.1.2"
+ },
+ "input columns": [
+  "grid",
+  "pit_lane_start",
+  "gap_q1_pct",
+  "grid_minus_quali",
+  "reached_q3",
+  "no_q3_format",
+  "quali_missing",
+  "drv_champ_pos",
+  "cons_points_share",
+  "drv_no_standing_yet",
+  "cons_no_standing_yet",
+  "drv_podium_rate_5",
+  "drv_avg_finish_5",
+  "drv_dnf_rate_5",
+  "cons_podium_rate_5",
+  "n_starters",
+  "drv_experience",
+  "drv_age"
+ ],
+ "models": {
+  "A_logistic_regression": {
+   "key": [
+    "A",
+    "logistic regression"
+   ],
+   "training seasons": "2003-2018",
+   "threshold": 0.3805969260654032,
+   "threshold (exact hex)": "0x1.85bb3359a2da8p-2",
+   "primary": true,
+   "format": "sklearn",
+   "settings": {
+    "C": 1,
+    "class_weight": null
+   },
+   "files": {
+    "preprocessor and model": {
+     "file": "A_logistic_regression.pkl",
+     "sha256": "5eec1816bf22a14837827bdc25b9a7c9997b8a82a4a30c874eaaeee92134cf4d",
+     "bytes": 11851
+    }
+   },
+   "model inputs (after pre-processing)": [
+    "grid",
+    "gap_q1_pct",
+    "grid_minus_quali",
+    "drv_champ_pos",
+    "cons_points_share",
+    "drv_podium_rate_5",
+    "drv_avg_finish_5",
+    "drv_dnf_rate_5",
+    "cons_podium_rate_5",
+    "n_starters",
+    "drv_experience",
+    "drv_age",
+    "pit_lane_start",
+    "reached_q3",
+    "no_q3_format",
+    "quali_missing",
+    "drv_no_standing_yet",
+    "cons_no_standing_yet",
+    "q1_time_missing",
+    "drv_form_missing",
+    "cons_form_missing"
+   ]
+  },
+  "A_random_forest": {
+   "key": [
+    "A",
+    "random forest"
+   ],
+   "training seasons": "2003-2018",
+   "threshold": 0.2989569487734727,
+   "threshold (exact hex)": "0x1.3221c53793780p-2",
+   "primary": false,
+   "format": "sklearn",
+   "settings": {
+    "max_depth": 6,
+    "min_samples_leaf": 50,
+    "max_features": "sqrt"
+   },
+   "files": {
+    "preprocessor and model": {
+     "file": "A_random_forest.pkl",
+     "sha256": "4881a4b2157e0e2521356f5ec5905f759a563cf873c77e8d2b33b3d1edba9cd5",
+     "bytes": 2273443
+    }
+   },
+   "model inputs (after pre-processing)": [
+    "grid",
+    "pit_lane_start",
+    "gap_q1_pct",
+    "grid_minus_quali",
+    "reached_q3",
+    "no_q3_format",
+    "quali_missing",
+    "drv_champ_pos",
+    "cons_points_share",
+    "drv_no_standing_yet",
+    "cons_no_standing_yet",
+    "drv_podium_rate_5",
+    "drv_avg_finish_5",
+    "drv_dnf_rate_5",
+    "cons_podium_rate_5",
+    "n_starters",
+    "drv_experience",
+    "drv_age",
+    "q1_time_missing",
+    "drv_form_missing",
+    "cons_form_missing"
+   ]
+  },
+  "A_gradient_boosting": {
+   "key": [
+    "A",
+    "gradient boosting"
+   ],
+   "training seasons": "2003-2018",
+   "threshold": 0.38686123321919197,
+   "threshold (exact hex)": "0x1.8c2559e3110eep-2",
+   "primary": false,
+   "format": "sklearn",
+   "settings": {
+    "learning_rate": 0.05,
+    "max_leaf_nodes": 7,
+    "min_samples_leaf": 80,
+    "max_iter": 100
+   },
+   "files": {
+    "preprocessor and model": {
+     "file": "A_gradient_boosting.pkl",
+     "sha256": "8c1c03decca92211bca13f4fb71ca2f455ea8ee22ef31bae66b2db85e8eb5b1e",
+     "bytes": 110069
+    }
+   },
+   "model inputs (after pre-processing)": [
+    "grid",
+    "pit_lane_start",
+    "gap_q1_pct",
+    "grid_minus_quali",
+    "reached_q3",
+    "no_q3_format",
+    "quali_missing",
+    "drv_champ_pos",
+    "cons_points_share",
+    "drv_no_standing_yet",
+    "cons_no_standing_yet",
+    "drv_podium_rate_5",
+    "drv_avg_finish_5",
+    "drv_dnf_rate_5",
+    "cons_podium_rate_5",
+    "n_starters",
+    "drv_experience",
+    "drv_age",
+    "q1_time_missing",
+    "drv_form_missing",
+    "cons_form_missing"
+   ]
+  },
+  "A_neural_network": {
+   "key": [
+    "A",
+    "neural network"
+   ],
+   "training seasons": "2003-2018",
+   "threshold": 0.37666162848472595,
+   "threshold (exact hex)": "0x1.81b3960000000p-2",
+   "primary": false,
+   "format": "pytorch",
+   "settings": {
+    "hidden": [
+     16
+    ],
+    "dropout": 0.0,
+    "weight_decay": 0.001
+   },
+   "files": {
+    "preprocessor": {
+     "file": "A_neural_network_preprocessor.pkl",
+     "sha256": "79effed71d86a277bc4f10c84832cc00f635ff21852598c46a5cc9cfe4e0cd8d",
+     "bytes": 11015
+    },
+    "weights": {
+     "file": "A_neural_network_weights.pt",
+     "sha256": "ef890b78a8574e04140d177f80208b01a5bbcaf20e52be265259dd908217cc8b",
+     "bytes": 3741
+    }
+   },
+   "architecture": {
+    "n_inputs": 21,
+    "hidden": [
+     16
+    ],
+    "dropout": 0.0
+   },
+   "epochs": 144,
+   "seed": 42,
+   "model inputs (after pre-processing)": [
+    "grid",
+    "gap_q1_pct",
+    "grid_minus_quali",
+    "drv_champ_pos",
+    "cons_points_share",
+    "drv_podium_rate_5",
+    "drv_avg_finish_5",
+    "drv_dnf_rate_5",
+    "cons_podium_rate_5",
+    "n_starters",
+    "drv_experience",
+    "drv_age",
+    "pit_lane_start",
+    "reached_q3",
+    "no_q3_format",
+    "quali_missing",
+    "drv_no_standing_yet",
+    "cons_no_standing_yet",
+    "q1_time_missing",
+    "drv_form_missing",
+    "cons_form_missing"
+   ]
+  },
+  "B_logistic_regression": {
+   "key": [
+    "B",
+    "logistic regression"
+   ],
+   "training seasons": "1950-2018",
+   "threshold": 0.2985573545828425,
+   "threshold (exact hex)": "0x1.31b904e7a782ap-2",
+   "primary": false,
+   "format": "sklearn",
+   "settings": {
+    "C": 0.1,
+    "class_weight": null
+   },
+   "files": {
+    "preprocessor and model": {
+     "file": "B_logistic_regression.pkl",
+     "sha256": "95a997aea70a5f944386245f9e1e36a39e95964def1bad0fda54908dc74caf22",
+     "bytes": 11858
+    }
+   },
+   "model inputs (after pre-processing)": [
+    "grid",
+    "gap_q1_pct",
+    "grid_minus_quali",
+    "drv_champ_pos",
+    "cons_points_share",
+    "drv_podium_rate_5",
+    "drv_avg_finish_5",
+    "drv_dnf_rate_5",
+    "cons_podium_rate_5",
+    "n_starters",
+    "drv_experience",
+    "drv_age",
+    "pit_lane_start",
+    "reached_q3",
+    "no_q3_format",
+    "quali_missing",
+    "drv_no_standing_yet",
+    "cons_no_standing_yet",
+    "q1_time_missing",
+    "drv_form_missing",
+    "cons_form_missing"
+   ]
+  },
+  "B_random_forest": {
+   "key": [
+    "B",
+    "random forest"
+   ],
+   "training seasons": "1950-2018",
+   "threshold": 0.2874214291797764,
+   "threshold (exact hex)": "0x1.2651cd99fca42p-2",
+   "primary": false,
+   "format": "sklearn",
+   "settings": {
+    "max_depth": 6,
+    "min_samples_leaf": 50,
+    "max_features": "sqrt"
+   },
+   "files": {
+    "preprocessor and model": {
+     "file": "B_random_forest.pkl",
+     "sha256": "4303c132a9cc3fb82df351dc8cb53980354ab416958a4140e24ec7e440950fb4",
+     "bytes": 3741481
+    }
+   },
+   "model inputs (after pre-processing)": [
+    "grid",
+    "pit_lane_start",
+    "gap_q1_pct",
+    "grid_minus_quali",
+    "reached_q3",
+    "no_q3_format",
+    "quali_missing",
+    "drv_champ_pos",
+    "cons_points_share",
+    "drv_no_standing_yet",
+    "cons_no_standing_yet",
+    "drv_podium_rate_5",
+    "drv_avg_finish_5",
+    "drv_dnf_rate_5",
+    "cons_podium_rate_5",
+    "n_starters",
+    "drv_experience",
+    "drv_age",
+    "q1_time_missing",
+    "drv_form_missing",
+    "cons_form_missing"
+   ]
+  },
+  "B_gradient_boosting": {
+   "key": [
+    "B",
+    "gradient boosting"
+   ],
+   "training seasons": "1950-2018",
+   "threshold": 0.3527623887347993,
+   "threshold (exact hex)": "0x1.693a8b2b7fcc1p-2",
+   "primary": false,
+   "format": "sklearn",
+   "settings": {
+    "learning_rate": 0.05,
+    "max_leaf_nodes": 7,
+    "min_samples_leaf": 80,
+    "max_iter": 100
+   },
+   "files": {
+    "preprocessor and model": {
+     "file": "B_gradient_boosting.pkl",
+     "sha256": "9243518f739cb72750ab47f2f2aacbf41370f7c8ebca32b410ce30c070a76955",
+     "bytes": 112413
+    }
+   },
+   "model inputs (after pre-processing)": [
+    "grid",
+    "pit_lane_start",
+    "gap_q1_pct",
+    "grid_minus_quali",
+    "reached_q3",
+    "no_q3_format",
+    "quali_missing",
+    "drv_champ_pos",
+    "cons_points_share",
+    "drv_no_standing_yet",
+    "cons_no_standing_yet",
+    "drv_podium_rate_5",
+    "drv_avg_finish_5",
+    "drv_dnf_rate_5",
+    "cons_podium_rate_5",
+    "n_starters",
+    "drv_experience",
+    "drv_age",
+    "q1_time_missing",
+    "drv_form_missing",
+    "cons_form_missing"
+   ]
+  },
+  "B_neural_network": {
+   "key": [
+    "B",
+    "neural network"
+   ],
+   "training seasons": "1950-2018",
+   "threshold": 0.3156477212905884,
+   "threshold (exact hex)": "0x1.4339280000000p-2",
+   "primary": false,
+   "format": "pytorch",
+   "settings": {
+    "hidden": [
+     16
+    ],
+    "dropout": 0.0,
+    "weight_decay": 0.0001
+   },
+   "files": {
+    "preprocessor": {
+     "file": "B_neural_network_preprocessor.pkl",
+     "sha256": "6c32dd6d29d35a332efe649cf138c32156e419f30195fcec1493d3dd9c2f1a82",
+     "bytes": 11015
+    },
+    "weights": {
+     "file": "B_neural_network_weights.pt",
+     "sha256": "8e0c48c9a99bd2ad200b9cea4228a076ccd3eede9231aa98365945165866d1d6",
+     "bytes": 3741
+    }
+   },
+   "architecture": {
+    "n_inputs": 21,
+    "hidden": [
+     16
+    ],
+    "dropout": 0.0
+   },
+   "epochs": 112,
+   "seed": 42,
+   "model inputs (after pre-processing)": [
+    "grid",
+    "gap_q1_pct",
+    "grid_minus_quali",
+    "drv_champ_pos",
+    "cons_points_share",
+    "drv_podium_rate_5",
+    "drv_avg_finish_5",
+    "drv_dnf_rate_5",
+    "cons_podium_rate_5",
+    "n_starters",
+    "drv_experience",
+    "drv_age",
+    "pit_lane_start",
+    "reached_q3",
+    "no_q3_format",
+    "quali_missing",
+    "drv_no_standing_yet",
+    "cons_no_standing_yet",
+    "q1_time_missing",
+    "drv_form_missing",
+    "cons_form_missing"
+   ]
+  },
+  "A_grid_only_LR": {
+   "key": [
+    "A",
+    "grid-only LR"
+   ],
+   "training seasons": "2003-2018",
+   "threshold": 0.3634291980727576,
+   "threshold (exact hex)": "0x1.7426c8a089375p-2",
+   "primary": false,
+   "format": "sklearn pipeline",
+   "files": {
+    "pipeline": {
+     "file": "A_grid_only_LR.pkl",
+     "sha256": "0281af63d67baf601c85d0e561a522b7f79ca61a8c1cdcd7666dd2339efe810f",
+     "bytes": 12405
+    }
+   }
+  }
+ },
+ "reference validation predictions": {
+  "file": "reference_validation_predictions.npz",
+  "sha256": "54fe8ef5ca488f9941b240444c71e696fb5abfc23f85d31b46ce07a90f9642b4",
+  "bytes": 88750
+ }
+}

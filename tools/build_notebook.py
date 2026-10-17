@@ -4635,8 +4635,8 @@ FAMILIES = ["logistic regression", "random forest", "gradient boosting", "neural
 FINAL6 = {}
 
 
-def fit_final(model, family, seed=SEED):
-    c = CHOSEN[(model, family)]
+def fit_final(model, family, seed=SEED, chosen=None):
+    c = (CHOSEN if chosen is None else chosen)[(model, family)]
     pre = PREPROCESSORS[(model, "scaled" if SCALED[family] else "tree")]
     rows = TRAIN_ROWS[model]
     X = pre.transform(rows[FINAL_FEATURES])
@@ -5134,6 +5134,1056 @@ md(r"""
 - **Primary model: logistic regression, model A.** Highest mean cross-validation PR-AUC (0.703), the simplest family, and well-calibrated probabilities. Its improvement over the grid-only baseline is clear (+0.059, interval +0.011 to +0.107); its edge over the other families is not.
 - **Model A vs model B:** no meaningful difference. At equal size, modern seasons are more useful than old ones.
 - **Frozen:** 8 models (4 families × A and B) + 2 baselines, with settings, fitted pipelines, thresholds and a fingerprint (`outputs/frozen_models.json`). **The test seasons 2022–2024 have not been used**; they are evaluated once, in a separate step, with exactly these frozen models.
+""")
+
+
+# ---------------------------------------------------------------- 6.12
+md(r"""
+## 6.12 Saving the frozen models as reusable files
+
+The frozen models of 6.11 live in this notebook's memory. They are also written to **`outputs/model_artifacts/`**, so the test evaluation, the experiments, the explanations and the inference function can load exactly these fitted objects. Nothing is retrained here; this only saves and re-loads what 6.11 froze.
+
+| File | What it holds | Format |
+|---|---|---|
+| `<model>.pkl` (logistic regression, random forest, gradient boosting; model A and B) | the fitted pre-processing pipeline (5.7) + the fitted model | `cloudpickle` |
+| `<model>_preprocessor.pkl` + `<model>_weights.pt` (neural network, A and B) | the fitted pre-processing pipeline + the network's trained weights (`state_dict`) | `cloudpickle` + `torch.save` |
+| `A_grid_only_LR.pkl` | the grid-only baseline pipeline | `cloudpickle` |
+| `reference_validation_predictions.npz` | every saved model's validation probabilities (2019–2021), to verify a re-load | NumPy |
+| `manifest.json` | for each model: its files and their SHA-256, the threshold at **full precision** (also as an exact hexadecimal float), architecture and epochs for the networks, the input columns, the frozen fingerprint and the library versions | JSON |
+| `load_artifacts.py` | the loading function used below, so the files can be loaded outside this notebook | Python |
+
+**Why `cloudpickle`:** the pre-processing contains `F1Imputer`, a class defined in this notebook. Plain `pickle`/`joblib` would only store a *reference* to it, so loading would fail anywhere the notebook hasn't been run; `cloudpickle` stores the class itself. The networks use PyTorch's standard format: weights only, and the architecture is rebuilt from the manifest.
+""")
+
+code(r'''
+import io
+import cloudpickle
+
+LOADER_SOURCE = r"""
+import hashlib, json
+from pathlib import Path
+
+import cloudpickle
+import numpy as np
+import torch
+
+
+def _sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _build_network(architecture):
+    layers, size = [], architecture["n_inputs"]
+    for h in architecture["hidden"]:
+        layers += [torch.nn.Linear(size, h), torch.nn.ReLU(), torch.nn.Dropout(architecture["dropout"])]
+        size = h
+    layers.append(torch.nn.Linear(size, 1))
+    return torch.nn.Sequential(*layers)
+
+
+# Load every saved frozen model from `folder` (outputs/model_artifacts).
+# Returns ({name: {"key", "predict", "threshold"}}, manifest). predict(rows) takes a DataFrame with the 18 feature
+# columns (missing values allowed) and returns podium probabilities. Every file is checked against its SHA-256.
+def load_model_artifacts(folder):
+    folder = Path(folder)
+    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    columns = manifest["input columns"]
+    loaded = {}
+    for name, m in manifest["models"].items():
+        for role, f in m["files"].items():
+            assert _sha256(folder / f["file"]) == f["sha256"], f"{name}: {f['file']} does not match the manifest"
+        load = lambda role: cloudpickle.loads((folder / m["files"][role]["file"]).read_bytes())
+        if m["format"] == "pytorch":
+            pre = load("preprocessor")
+            net = _build_network(m["architecture"])
+            net.load_state_dict(torch.load(folder / m["files"]["weights"]["file"], weights_only=True))
+            net.eval()
+
+            def predict(rows, pre=pre, net=net):
+                X = torch.tensor(np.asarray(pre.transform(rows[columns]), dtype=np.float32))
+                with torch.no_grad():
+                    return torch.sigmoid(net(X).squeeze(1)).numpy().astype(float)
+        elif m["format"] == "sklearn pipeline":
+            pipe = load("pipeline")
+
+            def predict(rows, pipe=pipe):
+                return pipe.predict_proba(rows[columns])[:, 1]
+        else:
+            obj = load("preprocessor and model")
+
+            def predict(rows, obj=obj):
+                return obj["model"].predict_proba(obj["preprocessor"].transform(rows[columns]))[:, 1]
+        loaded[name] = {"key": tuple(m["key"]), "predict": predict, "threshold": float.fromhex(m["threshold (exact hex)"])}
+    return loaded, manifest
+"""
+exec(LOADER_SOURCE)
+
+artifact_name = lambda key: f"{key[0]}_{key[1].replace(' ', '_').replace('-', '_')}"
+
+
+def save_model_artifacts(folder, models, thresholds, val_pred, chosen, primary, fingerprint, section):
+    """Write fitted models + pre-processing, reference validation predictions, manifest and loader to `folder`."""
+    folder.mkdir(parents=True, exist_ok=True)
+
+    def save_file(obj_bytes, filename):
+        (folder / filename).write_bytes(obj_bytes)
+        return {"file": filename, "sha256": hashlib.sha256(obj_bytes).hexdigest(), "bytes": len(obj_bytes)}
+
+    manifest = {
+        "frozen fingerprint": fingerprint,
+        "written by": f"f1_podium_prediction.ipynb, section {section} (re-written on every run)",
+        "versions": {"python": platform.python_version(), "numpy": np.__version__, "pandas": pd.__version__,
+                     "scikit-learn": __import__("sklearn").__version__, "torch": torch.__version__, "cloudpickle": cloudpickle.__version__},
+        "input columns": FINAL_FEATURES,
+        "models": {},
+    }
+    reference = {}
+    for key, entry in models.items():
+        name = artifact_name(key)
+        rec = {"key": list(key), "training seasons": f"{TRAIN_ROWS[key[0]]['year'].min()}-{TRAIN_ROWS[key[0]]['year'].max()}",
+               "threshold": thresholds[key], "threshold (exact hex)": float(thresholds[key]).hex(), "primary": key == primary}
+        if key[1] == "neural network":
+            net = entry["model"]
+            buffer = io.BytesIO()
+            torch.save(net.net_.state_dict(), buffer)
+            rec.update({"format": "pytorch", "settings": {k: (list(v) if isinstance(v, tuple) else v) for k, v in chosen[key]["params"].items()},
+                        "files": {"preprocessor": save_file(cloudpickle.dumps(entry["pre"]), f"{name}_preprocessor.pkl"),
+                                  "weights": save_file(buffer.getvalue(), f"{name}_weights.pt")},
+                        "architecture": {"n_inputs": len(MODEL_INPUTS["scaled"]), "hidden": list(net.hidden), "dropout": net.dropout},
+                        "epochs": int(net.epochs), "seed": int(net.seed), "model inputs (after pre-processing)": MODEL_INPUTS["scaled"]})
+        elif key[1] == "grid-only LR":
+            rec.update({"format": "sklearn pipeline", "files": {"pipeline": save_file(cloudpickle.dumps(entry["pipe"]), f"{name}.pkl")}})
+        else:
+            rec.update({"format": "sklearn", "settings": chosen[key]["params"],
+                        "files": {"preprocessor and model": save_file(cloudpickle.dumps({"preprocessor": entry["pre"], "model": entry["model"]}),
+                                                                      f"{name}.pkl")},
+                        "model inputs (after pre-processing)": MODEL_INPUTS["scaled" if SCALED[key[1]] else "tree"]})
+        manifest["models"][name] = rec
+        reference[name] = val_pred[key]
+
+    buffer = io.BytesIO()
+    np.savez(buffer, **reference)
+    manifest["reference validation predictions"] = save_file(buffer.getvalue(), "reference_validation_predictions.npz")
+    (folder / "load_artifacts.py").write_text(
+        f"# Written by f1_podium_prediction.ipynb, section {section}. Usage:\n"
+        "#   from load_artifacts import load_model_artifacts\n"
+        f"#   models, manifest = load_model_artifacts('outputs/{folder.name}')\n"
+        "#   p = models['A_logistic_regression']['predict'](rows)   # rows: DataFrame with the 18 feature columns\n"
+        + LOADER_SOURCE, encoding="utf-8")
+    (folder / "manifest.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+    display(pd.DataFrame([{"model": n, "format": m["format"], "files": ", ".join(f["file"] for f in m["files"].values()),
+                           "size (KB)": round(sum(f["bytes"] for f in m["files"].values()) / 1024, 1),
+                           "threshold (full precision)": repr(m["threshold"])} for n, m in manifest["models"].items()]))
+    print(f"Saved {len(manifest['models'])} models to {folder}/ (+ manifest.json, reference_validation_predictions.npz, load_artifacts.py)")
+    return manifest
+
+
+ARTIFACT_DIR = CLEAN_DATA_DIR.parent / "model_artifacts"
+manifest = save_model_artifacts(ARTIFACT_DIR, FROZEN_MODELS, THRESHOLDS, VAL_PRED, CHOSEN, PRIMARY_MODEL, FROZEN_FINGERPRINT, "6.12")
+''')
+
+md(r"""
+### Re-load check
+
+The files are loaded back with `load_model_artifacts`, which builds **new** objects from disk (it uses nothing from the notebook's memory), and every re-loaded model predicts the validation rows again. Checks:
+- every file matches the SHA-256 in the manifest, and the manifest carries the frozen fingerprint of 6.11;
+- the probabilities match the frozen validation predictions within an absolute tolerance of **1e-9** (scikit-learn computes in 64-bit floats, the network in 32-bit; the actual largest difference is printed);
+- the thresholds are **identical** to the frozen full-precision values, and both decision rules (threshold, top-3 per race) give exactly the same yes/no predictions.
+""")
+
+code(r'''
+TOLERANCE = 1e-9
+
+
+def verify_model_artifacts(folder, val_pred, thresholds, fingerprint):
+    """Re-load every model from disk and check it reproduces the frozen validation predictions and decisions."""
+    loaded, loaded_manifest = load_model_artifacts(folder)
+    assert loaded_manifest["frozen fingerprint"] == fingerprint
+    reference_back = np.load(folder / "reference_validation_predictions.npz")
+    rows = []
+    for name, m in loaded.items():
+        key = m["key"]
+        p = m["predict"](VAL_ROWS)
+        largest = float(np.abs(p - val_pred[key]).max())
+        assert largest <= TOLERANCE, f"{name}: re-loaded predictions differ by {largest}"
+        assert np.array_equal(reference_back[name], val_pred[key])
+        assert m["threshold"] == thresholds[key], f"{name}: threshold changed"
+        assert np.array_equal(p >= m["threshold"], val_pred[key] >= thresholds[key])
+        assert np.array_equal(top3_per_race(p, val_race), top3_per_race(val_pred[key], val_race))
+        rows.append({"model": name, "largest |difference|": largest, "bit-for-bit identical": bool(np.array_equal(p, val_pred[key])),
+                     "threshold identical": True, "same yes/no predictions": True,
+                     "validation PR-AUC (re-loaded)": round(average_precision_score(y_val, p), 6)})
+    display(pd.DataFrame(rows))
+    assert hashlib.sha256(FINAL_FEATURES_PATH.read_bytes()).hexdigest() == FF_SHA_BEFORE
+    print(f"PASS all {len(loaded)} saved models re-load from disk and reproduce the frozen validation predictions "
+          f"(tolerance {TOLERANCE:g}), with identical thresholds and decisions. No test rows were used.")
+    return loaded
+
+
+loaded_models = verify_model_artifacts(ARTIFACT_DIR, VAL_PRED, THRESHOLDS, FROZEN_FINGERPRINT)
+''')
+
+md(r"""
+**Portability.** The files are meant to be loaded **with the same library versions** that wrote them (listed in `manifest.json`):
+- `cloudpickle` files store Python code by value and only load under the **same Python minor version** (e.g. files written with 3.14 can't be loaded on 3.11).
+- scikit-learn models can change or refuse to load across scikit-learn versions.
+- PyTorch weights (`state_dict`) are the most portable part. The networks compute in 32-bit floats, so with a different number of CPU threads their probabilities can differ by about 1e-8 (rounding order); call `torch.set_num_threads(1)` before predicting to get bit-identical results, as this notebook does. (Checked in a separate process: 8 threads gave differences up to 3e-8 with identical yes/no decisions; 1 thread gave identical probabilities.)
+
+On Kaggle (different versions), the notebook simply re-creates all files during *Run All*, deterministically: the predictions are identical across runs, but the bytes (and SHA-256) of `cloudpickle` files can differ from run to run, because they include an internal identifier for notebook-defined classes. The manifest always lists the hashes of the files written by the same run.
+""")
+
+
+# ================================================================ 7. FINAL OPTIMIZATION AND TEST EVALUATION
+md(r"""
+# 7. Final optimisation, second freeze and the test evaluation
+
+This section runs four phases in a fixed order:
+1. **Phase 1, final optimisation (7.1–7.2):** a small, rule-based extension of the section-6 grids, tuned exactly like section 6 (same forward-chaining folds inside the training seasons, pre-processing re-fitted in every fold, same paired one-standard-error rule, same simplicity order). Validation is **not** used to choose anything.
+2. **Phase 2, second freeze (7.3–7.4):** final fits, out-of-fold thresholds, a new frozen record (`outputs/frozen_models_v2.json`) and saved models (`outputs/model_artifacts_v2/`), verified after re-loading. **Section 6 stays untouched** as the first freeze (v1), with its record and files, for comparison.
+3. **Phase 3, test evaluation (7.5–7.8):** the 2022–2024 seasons are used for the first time, with the models loaded from the v2 files. Before that, the test cell checks that the v2 fingerprint equals the value recorded when v2 was frozen, i.e. before any test result existed.
+4. **Phase 4, interpretation (7.9).**
+
+**Rule after Phase 3:** no retraining, re-tuning, feature change, threshold change or change of the primary model because of test results. Ideas raised by the test results are labelled *post-test, exploratory*.
+""")
+
+# ---------------------------------------------------------------- 7.1
+md(r"""
+## 7.1 Phase 1: which settings are worth testing?
+
+In section 6, several best or chosen settings sit on the **edge** of their grid (e.g. the smallest learning rate or the largest leaf size tried). Then the real optimum might lie just outside the grid. **Rule (fixed before running anything new):** for every setting dimension where the best or the chosen setting of model A **or** model B uses the smallest (or largest) value tried, add **one** value beyond that edge from a fixed list. The extended grid is the full combination of the old and new values; only the new combinations are run. Both models get the same extended grid.
+
+The values beyond each edge:
+
+| Family | Setting | Below the smallest | Above the largest |
+|---|---|---|---|
+| logistic regression | `C` | 0.001 | 100 |
+| random forest | `max_depth` | 4 | (none: "unlimited" is already the top) |
+| random forest | `min_samples_leaf` | 2 | 100 |
+| gradient boosting | `learning_rate` | 0.02 | 0.2 |
+| gradient boosting | `max_leaf_nodes` | 3 | 31 |
+| gradient boosting | `min_samples_leaf` | 10 | 160 |
+| gradient boosting | `max_iter` | 50 | 600 |
+| neural network | hidden layers (by size) | (8,) | (64,) |
+| neural network | `dropout` | (none: 0 is the minimum) | 0.4 |
+| neural network | `weight_decay` | 1e-5 | 1e-2 |
+
+Categorical settings (`class_weight`, `max_features`) have no edge and are not extended. Nothing else changes: same features, same pre-processing, same training windows, same folds, same selection rule (applied to the old and new settings together, so a new setting is chosen only if it is not clearly worse than the best **and** simpler, or clearly better).
+""")
+
+code(r'''
+BEYOND = {   # (below the smallest, above the largest); None = no extension in that direction
+    "logistic regression": {"C": (0.001, 100)},
+    "random forest": {"max_depth": (4, None), "min_samples_leaf": (2, 100)},
+    "gradient boosting": {"learning_rate": (0.02, 0.2), "max_leaf_nodes": (3, 31), "min_samples_leaf": (10, 160), "max_iter": (50, 600)},
+    "neural network": {"hidden": ((8,), (64,)), "dropout": (None, 0.4), "weight_decay": (1e-5, 1e-2)},
+}
+ORDER_KEY = {"max_depth": lambda v: np.inf if v is None else v, "hidden": n_weights}   # how values are ordered
+
+
+def grid_values(family):
+    names = list(GRIDS[family][0])
+    return {n: list(dict.fromkeys(p[n] for p in GRIDS[family])) for n in names}
+
+
+edge_rows, GRIDS_V2 = [], {}
+for family in FAMILIES:
+    values = grid_values(family)
+    used = {(m, which): CHOSEN[(m, family)]["params"] if which == "chosen" else
+            GRIDS[family][int(SEARCH[(m, family)]["mean PR-AUC"].idxmax())]
+            for m in ["A", "B"] for which in ["best", "chosen"]}
+    extended = {n: list(v) for n, v in values.items()}
+    for name, (below, above) in BEYOND[family].items():
+        key = ORDER_KEY.get(name, lambda v: v)
+        lo_v, hi_v = min(values[name], key=key), max(values[name], key=key)
+        hit_lo = [f"{m} {w}" for (m, w), p in used.items() if p[name] == lo_v]
+        hit_hi = [f"{m} {w}" for (m, w), p in used.items() if p[name] == hi_v]
+        if hit_lo and below is not None:
+            extended[name] = [below] + extended[name]
+        if hit_hi and above is not None:
+            extended[name] = extended[name] + [above]
+        edge_rows.append({"family": family, "setting": name, "values tried": values[name],
+                          "smallest used by": ", ".join(hit_lo) or "-", "largest used by": ", ".join(hit_hi) or "-",
+                          "added": [v for v in extended[name] if v not in values[name]] or "-"})
+    combos = [dict(zip(extended, vals)) for vals in __import__("itertools").product(*extended.values())]
+    GRIDS_V2[family] = GRIDS[family] + [c for c in combos if c not in GRIDS[family]]   # old settings keep their numbers
+display(pd.DataFrame(edge_rows))
+display(pd.DataFrame({"settings in section 6": {f: len(GRIDS[f]) for f in FAMILIES},
+                      "new settings": {f: len(GRIDS_V2[f]) - len(GRIDS[f]) for f in FAMILIES},
+                      "extended grid": {f: len(GRIDS_V2[f]) for f in FAMILIES}}))
+''')
+
+# ---------------------------------------------------------------- 7.2
+md(r"""
+## 7.2 Phase 1: tuning the extended grids
+
+Only the new settings are run (the section-6 fold scores of the old settings are reused unchanged; they are deterministic). Then the **same rule** chooses among old + new settings: paired one-standard-error ties, closed upwards, simplest first. The random forest's simplicity order gains `max_depth` 4 (the shallowest); all other orders already cover the new values. The jobs run in chunks so progress is reported regularly.
+""")
+
+code(r'''
+SIMPLICITY_V2 = dict(SIMPLICITY)
+SIMPLICITY_V2["random forest"] = lambda p: ({4: 0, 6: 1, 10: 2, None: 3}[p["max_depth"]], -p["min_samples_leaf"],
+                                            0 if p["max_features"] == "sqrt" else 1)
+SEARCH_V2, CHOSEN_V2 = {}, {}
+
+
+def run_jobs_in_chunks(jobs, label, chunk=48):
+    out = []
+    for start in range(0, len(jobs), chunk):
+        out += run_jobs(jobs[start:start + chunk])
+        print(f"  {label}: {min(start + chunk, len(jobs))}/{len(jobs)} jobs done", flush=True)
+    return out
+
+
+def run_search_v2(model, family):
+    n_old = len(GRIDS[family])
+    new_settings = list(enumerate(GRIDS_V2[family]))[n_old:]
+    jobs = [(model, family, params, k, SEED) for _, params in new_settings for k in range(len(FOLDS))]
+    results = iter(run_jobs_in_chunks(jobs, f"{model} {family}"))
+    rows = []
+    for i, params in new_settings:
+        fold_scores, preds, extra = [], [], []
+        for k in range(len(FOLDS)):
+            p, info = next(results)
+            fold_scores.append(average_precision_score(fold_rows(model, k)[1]["podium"], p))
+            preds.append(p)
+            extra.append(info)
+        row = {"setting": i, **{k: str(v) for k, v in params.items()}, **dict(zip(FOLD_COLS, fold_scores)),
+               "mean PR-AUC": np.mean(fold_scores), "fold SD": np.std(fold_scores, ddof=1), "new in 7.2": True}
+        if family == "neural network":
+            row["best epochs (inner)"] = [e["best_epoch"] for e in extra]
+            OOF[(model, family, i, "info")] = extra
+        OOF[(model, family, i)] = np.concatenate(preds)
+        rows.append(row)
+    table = pd.concat([SEARCH[(model, family)].assign(**{"new in 7.2": False}), pd.DataFrame(rows)], ignore_index=True)
+    table = table.set_index("setting", drop=False)
+    best = table["mean PR-AUC"].idxmax()
+    ties = paired_ties(table[FOLD_COLS], best)
+    chosen = min(ties, key=lambda i: SIMPLICITY_V2[family](GRIDS_V2[family][i]))
+    SEARCH_V2[(model, family)] = table
+    CHOSEN_V2[(model, family)] = {"setting": int(chosen), "params": GRIDS_V2[family][chosen],
+                                  "cv mean PR-AUC": table.loc[chosen, "mean PR-AUC"], "cv fold SD": table.loc[chosen, "fold SD"],
+                                  "best mean PR-AUC": table.loc[best, "mean PR-AUC"], "settings within 1 SE": len(ties),
+                                  "best is new": bool(table.loc[best, "new in 7.2"])}
+    c1, c2 = CHOSEN[(model, family)], CHOSEN_V2[(model, family)]
+    print(f"Model {model}, {family}: best mean CV PR-AUC {c2['best mean PR-AUC']:.4f} (v1 best {c1['best mean PR-AUC']:.4f}); "
+          f"{len(ties)} of {len(table)} settings tied; chosen {c2['params']} -> {c2['cv mean PR-AUC']:.4f} "
+          f"({'unchanged' if c2['params'] == c1['params'] else 'CHANGED from ' + str(c1['params'])})")
+
+
+t0 = time.time()
+for model in ["A", "B"]:
+    for family in FAMILIES:
+        run_search_v2(model, family)
+print(f"({time.time() - t0:.0f} s)")
+''')
+
+code(r'''
+compare_v = []
+for model in ["A", "B"]:
+    for family in FAMILIES:
+        c1, c2 = CHOSEN[(model, family)], CHOSEN_V2[(model, family)]
+        compare_v.append({"model": model, "family": family, "v1 setting": str(c1["params"]), "v1 CV PR-AUC": c1["cv mean PR-AUC"],
+                          "v2 setting": str(c2["params"]), "v2 CV PR-AUC": c2["cv mean PR-AUC"],
+                          "changed": c1["params"] != c2["params"], "best overall is a new setting": c2["best is new"],
+                          "settings tied (v2)": c2["settings within 1 SE"]})
+compare_v = pd.DataFrame(compare_v)
+display(compare_v.round(4))
+for model in ["A", "B"]:
+    for family in FAMILIES:
+        t = SEARCH_V2[(model, family)]
+        top = t.sort_values("mean PR-AUC", ascending=False).head(5)
+        print(f"Model {model}, {family}: top 5 of {len(t)} settings")
+        display(top.drop(columns=["setting"]).round(4))
+''')
+
+# ---------------------------------------------------------------- 7.3
+md(r"""
+## 7.3 Phase 2: final fits, thresholds and the primary model (v2)
+
+Exactly as in section 6, for every family and both models:
+- **Final fit:** the chosen setting refitted on **all** training seasons (model A 2003–2018, model B 1950–2018) with the fitted pre-processing of 5.7; the network trains for the median of its folds' best epochs; seed 42.
+- **Threshold:** the value that maximises F1 on the chosen setting's **out-of-fold** predictions (2011–2018).
+- **Primary model:** the same rule as 6.11, applied to the v2 cross-validation scores.
+
+Then each final model is scored **once** on validation (2019–2021), only to report it; the grid-only baseline and the rule "grid ≤ 3" are unchanged from section 6.
+""")
+
+code(r'''
+FINAL_V2, THRESHOLDS_V2, VAL_PRED_V2 = {}, {}, {}
+for model in ["A", "B"]:
+    for family in FAMILIES:
+        key = (model, family)
+        FINAL_V2[key] = fit_final(model, family, chosen=CHOSEN_V2)
+        THRESHOLDS_V2[key], f1_oof = f1_best_threshold(y_oof[model], OOF[(model, family, CHOSEN_V2[key]["setting"])])
+        CHOSEN_V2[key]["oof F1 at threshold"] = f1_oof
+        VAL_PRED_V2[key] = predict_final(FINAL_V2[key], VAL_ROWS, f"{model} {family} v2 validation")
+FINAL_V2[("A", "grid-only LR")] = {"pipe": grid_pipe}            # baseline unchanged
+THRESHOLDS_V2[("A", "grid-only LR")] = THRESHOLDS[("A", "grid-only LR")]
+VAL_PRED_V2[("A", "grid-only LR")] = VAL_PRED[("A", "grid-only LR")]
+
+family_folds_v2 = pd.DataFrame({f: SEARCH_V2[("A", f)].loc[CHOSEN_V2[("A", f)]["setting"], FOLD_COLS] for f in FAMILIES}).T.astype(float)
+best_v2 = family_folds_v2.mean(axis=1).idxmax()
+near_v2 = paired_ties(family_folds_v2, best_v2)
+PRIMARY_MODEL_V2 = ("A", min(near_v2, key=SIMPLER_FAMILY.get))
+print(f"v2 primary-model rule: highest mean CV PR-AUC {best_v2} ({family_folds_v2.loc[best_v2].mean():.4f}); "
+      f"not clearly worse: {near_v2} -> primary model: {PRIMARY_MODEL_V2[1]}, model {PRIMARY_MODEL_V2[0]} "
+      f"(v1: {PRIMARY_MODEL[1]}, model {PRIMARY_MODEL[0]})")
+
+v12 = []
+for model in ["A", "B"]:
+    for family in FAMILIES:
+        key = (model, family)
+        s1 = scores(y_val, VAL_PRED[key], THRESHOLDS[key], val_race)
+        s2 = scores(y_val, VAL_PRED_V2[key], THRESHOLDS_V2[key], val_race)
+        d, lo, hi = paired_difference(VAL_PRED[key], VAL_PRED_V2[key])
+        v12.append({"model": model, "family": family, "changed": CHOSEN[key]["params"] != CHOSEN_V2[key]["params"],
+                    "CV PR-AUC v1": CHOSEN[key]["cv mean PR-AUC"], "CV PR-AUC v2": CHOSEN_V2[key]["cv mean PR-AUC"],
+                    "val PR-AUC v1": s1["PR-AUC"], "val PR-AUC v2": s2["PR-AUC"], "val v2 - v1": d, "95% interval": f"[{lo:+.4f}, {hi:+.4f}]",
+                    "threshold v1": THRESHOLDS[key], "threshold v2": THRESHOLDS_V2[key], "val F1 v1": s1["F1"], "val F1 v2": s2["F1"],
+                    "Brier v2": s2["Brier"]})
+print("Validation, reported once per v2 model (not used for any choice):")
+display(pd.DataFrame(v12).round(4))
+''')
+
+# ---------------------------------------------------------------- 7.4
+md(r"""
+## 7.4 Phase 2: the second freeze (v2)
+
+The v2 record lists, for each of the 8 final models and the 2 baselines: the setting, pre-processing, training seasons, threshold (rounded for reading; the full-precision value is in the artifacts manifest), seed, epochs, cross-validation PR-AUC, validation PR-AUC, whether it changed from v1, and which model is primary. It is written to `outputs/frozen_models_v2.json` with its fingerprint; the fitted models go to `outputs/model_artifacts_v2/` and are re-loaded and checked like in 6.12. The v1 files are not touched.
+""")
+
+code(r'''
+FROZEN_V2 = {}
+for (m, family), entry in FINAL_V2.items():
+    if family == "grid-only LR":
+        continue
+    c = CHOSEN_V2[(m, family)]
+    FROZEN_V2[f"{m} | {family}"] = {
+        "model version": m, "training seasons": f"{TRAIN_ROWS[m]['year'].min()}-{TRAIN_ROWS[m]['year'].max()}",
+        "family": family, "settings": {k: (list(v) if isinstance(v, tuple) else v) for k, v in c["params"].items()},
+        "pre-processing": f"PREPROCESSORS[('{m}', '{'scaled' if SCALED[family] else 'tree'}')]",
+        "threshold": round(THRESHOLDS_V2[(m, family)], 6), "seed": SEED,
+        "epochs": int(entry["model"].epochs) if family == "neural network" else None,
+        "mean CV PR-AUC": round(c["cv mean PR-AUC"], 6),
+        "validation PR-AUC": round(average_precision_score(y_val, VAL_PRED_V2[(m, family)]), 6),
+        "changed from v1": CHOSEN[(m, family)]["params"] != c["params"], "primary": (m, family) == PRIMARY_MODEL_V2}
+FROZEN_V2["A | grid-only LR (baseline)"] = FROZEN["A | grid-only LR (baseline)"]
+FROZEN_V2["rule: grid <= 3 (baseline)"] = FROZEN["rule: grid <= 3 (baseline)"]
+FROZEN_V2_FINGERPRINT = hashlib.sha256(json.dumps(FROZEN_V2, sort_keys=True).encode()).hexdigest()
+FROZEN_V2_PATH = CLEAN_DATA_DIR.parent / "frozen_models_v2.json"
+FROZEN_V2_PATH.write_text(json.dumps({"fingerprint": FROZEN_V2_FINGERPRINT, "previous version": FROZEN_FINGERPRINT,
+                                      "models": FROZEN_V2}, indent=1), encoding="utf-8")
+display(pd.DataFrame(FROZEN_V2).T.drop(columns=["rule"], errors="ignore"))
+print(f"v2 frozen: {len(FROZEN_V2)} entries -> {FROZEN_V2_PATH} | fingerprint {FROZEN_V2_FINGERPRINT}")
+print(f"(v1 record unchanged: {FROZEN_PATH.name}, fingerprint {FROZEN_FINGERPRINT[:16]}...)")
+
+ARTIFACT_DIR_V2 = CLEAN_DATA_DIR.parent / "model_artifacts_v2"
+manifest_v2 = save_model_artifacts(ARTIFACT_DIR_V2, FINAL_V2, THRESHOLDS_V2, VAL_PRED_V2, CHOSEN_V2, PRIMARY_MODEL_V2,
+                                   FROZEN_V2_FINGERPRINT, "7.4")
+loaded_models_v2 = verify_model_artifacts(ARTIFACT_DIR_V2, VAL_PRED_V2, THRESHOLDS_V2, FROZEN_V2_FINGERPRINT)
+''')
+
+
+# ---------------------------------------------------------------- 7.5
+md(r"""
+## 7.5 Phase 3: the test evaluation (2022–2024)
+
+The test seasons are used here **for the first time**. The models are the v2 models **loaded from `outputs/model_artifacts_v2/`** (not the in-memory objects), with their frozen thresholds. Before anything is scored, the cell checks that the v2 fingerprint equals the value recorded when v2 was frozen in 7.4 (`2ebc3457f47525af...`, recorded on 17 Oct 2026 at 17:46, before this cell was written). Every model is scored in one pass; the results below are reported as they come out and change nothing above.
+
+The same metrics as in section 6: PR-AUC (main), ROC-AUC, Brier score, precision / recall / F1 at the frozen threshold, F1 of the top-3-per-race rule, and confusion matrices. Comparisons use the paired race-resampling interval (500 resamples of the test races).
+""")
+
+code(r'''
+EXPECTED_V2_FINGERPRINT = "2ebc3457f47525afaf17b679d98bffc83bd3481b8261f4c5b3da25e108abafaa"   # printed by 7.4 when v2 was frozen, before the test cells were written
+assert FROZEN_V2_FINGERPRINT == EXPECTED_V2_FINGERPRINT, "the v2 freeze differs from the one recorded before the test"
+assert json.loads(FROZEN_V2_PATH.read_text(encoding="utf-8"))["fingerprint"] == EXPECTED_V2_FINGERPRINT
+
+TEST_ROWS = data[data["split"] == "test"].reset_index(drop=True)         # the 2022-2024 seasons: first use
+y_test = TEST_ROWS["podium"].to_numpy()
+test_race = TEST_ROWS["raceId"].to_numpy()
+test_models, test_manifest = load_model_artifacts(ARTIFACT_DIR_V2)       # the frozen v2 models, from disk
+assert test_manifest["frozen fingerprint"] == EXPECTED_V2_FINGERPRINT
+TEST_PRED = {m["key"]: m["predict"](TEST_ROWS) for m in test_models.values()}
+TEST_THRESHOLDS = {m["key"]: m["threshold"] for m in test_models.values()}
+assert all(TEST_THRESHOLDS[k] == THRESHOLDS_V2[k] for k in TEST_THRESHOLDS)
+rule_test = (TEST_ROWS["grid"] <= 3).astype(int).to_numpy()
+
+rng_test = np.random.default_rng(SEED)
+test_races = np.unique(test_race)
+TEST_BOOT = [np.concatenate([np.flatnonzero(test_race == r) for r in rng_test.choice(test_races, len(test_races))]) for _ in range(500)]
+print(f"Test 2022-2024: {len(TEST_ROWS):,} rows, {len(test_races)} races, {int(y_test.sum())} podiums "
+      f"(podium rate {y_test.mean():.3f}); every race has 3 podiums: {bool((pd.Series(y_test).groupby(test_race).sum() == 3).all())}")
+
+KEYS_A = [("A", f) for f in FAMILIES]
+KEYS_B = [("B", f) for f in FAMILIES]
+test_table = [{"model": "rule: grid <= 3", "version": "-", "PR-AUC": np.nan, "ROC-AUC": np.nan, "Brier": np.nan, "threshold": np.nan,
+               "precision": precision_score(y_test, rule_test), "recall": recall_score(y_test, rule_test), "F1": f1_score(y_test, rule_test),
+               "predicted podiums": int(rule_test.sum()), "F1 top-3 per race": np.nan}]
+for key in [("A", "grid-only LR")] + KEYS_A + KEYS_B:
+    s = scores(y_test, TEST_PRED[key], TEST_THRESHOLDS[key], test_race)
+    test_table.append({"model": key[1] + (" (primary)" if key == PRIMARY_MODEL_V2 else ""), "version": key[0],
+                       "threshold": TEST_THRESHOLDS[key], **s})
+test_table = pd.DataFrame(test_table)
+print("TEST RESULTS (2022-2024), frozen v2 models:")
+display(test_table.round(4))
+''')
+
+code(r'''
+fig, axes = plt.subplots(1, 2, figsize=(14, 4.6))
+for key in [("A", "grid-only LR")] + KEYS_A:
+    p = TEST_PRED[key]
+    prec, rec, _ = precision_recall_curve(y_test, p)
+    fpr, tpr, _ = roc_curve(y_test, p)
+    label = f"{key[1]}{' (primary)' if key == PRIMARY_MODEL_V2 else ''}"
+    axes[0].plot(rec, prec, color=COLORS[key[1]], label=f"{label} ({average_precision_score(y_test, p):.3f})")
+    axes[1].plot(fpr, tpr, color=COLORS[key[1]], label=f"{label} ({roc_auc_score(y_test, p):.3f})")
+axes[0].axhline(y_test.mean(), color="black", ls=":", lw=0.8, label=f"random guess ({y_test.mean():.3f})")
+axes[0].set_xlabel("recall")
+axes[0].set_ylabel("precision")
+axes[0].set_title("Precision-recall curves, TEST 2022-2024 (model A, PR-AUC)")
+axes[1].plot([0, 1], [0, 1], color="black", ls=":", lw=0.8)
+axes[1].set_xlabel("false positive rate")
+axes[1].set_ylabel("true positive rate (recall)")
+axes[1].set_title("ROC curves, TEST 2022-2024 (model A, ROC-AUC)")
+for ax in axes:
+    ax.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+
+fig, axes = plt.subplots(2, 4, figsize=(16, 7))
+for row, keys in enumerate([KEYS_A, KEYS_B]):
+    for ax, key in zip(axes[row], keys):
+        cm = confusion_matrix(y_test, (TEST_PRED[key] >= TEST_THRESHOLDS[key]).astype(int))
+        ax.imshow(cm, cmap="Blues")
+        for (i, j), v in np.ndenumerate(cm):
+            ax.text(j, i, v, ha="center", va="center", color="white" if v > cm.max() / 2 else "black", fontsize=11)
+        ax.set_xticks([0, 1], ["no podium", "podium"])
+        ax.set_yticks([0, 1], ["no podium", "podium"])
+        ax.set_xlabel("predicted")
+        ax.set_ylabel("actual")
+        ax.set_title(f"model {key[0]}: {key[1]}\n(threshold {TEST_THRESHOLDS[key]:.2f})", fontsize=9)
+plt.suptitle("Confusion matrices, TEST 2022-2024 (frozen thresholds)", fontsize=10)
+plt.tight_layout()
+plt.show()
+''')
+
+# ---------------------------------------------------------------- 7.6
+md(r"""
+## 7.6 Training vs cross-validation vs validation vs test
+
+The same frozen models scored on four kinds of rows: their own training rows (optimistic), the forward-chaining folds (cross-validation mean; F1 from the out-of-fold predictions), the validation seasons 2019–2021 and the test seasons 2022–2024.
+""")
+
+code(r'''
+four = []
+for key in KEYS_A + KEYS_B:
+    m, family = key
+    p_tr = predict_final(FINAL_V2[key], TRAIN_ROWS[m], f"{m} {family} v2 training rows")
+    p_oof = OOF[(m, family, CHOSEN_V2[key]["setting"])]
+    t = THRESHOLDS_V2[key]
+    four.append({"model": m, "family": family,
+                 "PR-AUC train": average_precision_score(TRAIN_ROWS[m]["podium"], p_tr), "PR-AUC CV": CHOSEN_V2[key]["cv mean PR-AUC"],
+                 "PR-AUC validation": average_precision_score(y_val, VAL_PRED_V2[key]), "PR-AUC test": average_precision_score(y_test, TEST_PRED[key]),
+                 "ROC-AUC train": roc_auc_score(TRAIN_ROWS[m]["podium"], p_tr), "ROC-AUC validation": roc_auc_score(y_val, VAL_PRED_V2[key]),
+                 "ROC-AUC test": roc_auc_score(y_test, TEST_PRED[key]),
+                 "F1 train": f1_score(TRAIN_ROWS[m]["podium"], p_tr >= t), "F1 CV (out-of-fold)": f1_score(y_oof[m], p_oof >= t),
+                 "F1 validation": f1_score(y_val, VAL_PRED_V2[key] >= t), "F1 test": f1_score(y_test, TEST_PRED[key] >= t),
+                 "Brier validation": brier_score_loss(y_val, VAL_PRED_V2[key]), "Brier test": brier_score_loss(y_test, TEST_PRED[key])})
+four = pd.DataFrame(four).set_index(["model", "family"])
+display(four.round(4))
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 3.8), sharey=True)
+for ax, m in zip(axes, ["A", "B"]):
+    sub = four.loc[m]
+    x = np.arange(len(FAMILIES))
+    for i, (col, color) in enumerate([("PR-AUC train", "#8C8C8C"), ("PR-AUC CV", "#4C72B0"), ("PR-AUC validation", "#55A868"),
+                                      ("PR-AUC test", "#C44E52")]):
+        ax.bar(x + (i - 1.5) * 0.2, sub[col], 0.2, color=color, label=col.replace("PR-AUC ", ""))
+        for xi, v in zip(x, sub[col]):
+            ax.text(xi + (i - 1.5) * 0.2, v + 0.01, f"{v:.2f}", ha="center", fontsize=6.5)
+    ax.set_xticks(x, FAMILIES, fontsize=8)
+    ax.set_ylim(0, 1.05)
+    ax.set_title(f"Model {m}: PR-AUC on training, CV, validation and test")
+axes[0].set_ylabel("PR-AUC")
+axes[0].legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+''')
+
+# ---------------------------------------------------------------- 7.7
+md(r"""
+## 7.7 Test comparisons with paired race-resampling intervals
+
+Differences in test PR-AUC, each with a 95% interval from resampling the 68 test races 500 times (the same resamples for both models). A difference only counts if the interval **excludes 0**.
+""")
+
+code(r'''
+cmp_rows = []
+
+
+def add_comparison(question, base_key, new_key):
+    d, lo, hi = paired_difference(TEST_PRED[base_key], TEST_PRED[new_key], y=y_test, boot=TEST_BOOT)
+    cmp_rows.append({"question": question, "model": f"{new_key[0]} {new_key[1]}", "compared with": f"{base_key[0]} {base_key[1]}",
+                     "test PR-AUC difference": d, "low": lo, "high": hi, "95% interval": f"[{lo:+.4f}, {hi:+.4f}]",
+                     "clearly different?": "yes" if lo > 0 or hi < 0 else "no (interval includes 0)"})
+
+
+for key in KEYS_A:
+    add_comparison("better than the grid-only baseline?", ("A", "grid-only LR"), key)
+for key in KEYS_A:
+    if key != PRIMARY_MODEL_V2:
+        add_comparison("different from the primary model?", PRIMARY_MODEL_V2, key)
+for family in FAMILIES:
+    add_comparison("model B (1950-2018) vs model A (2003-2018)", ("A", family), ("B", family))
+comparisons = pd.DataFrame(cmp_rows)
+display(comparisons.drop(columns=["low", "high"]).round(4))
+
+fig, ax = plt.subplots(figsize=(10, 4.2))
+y_pos = np.arange(len(comparisons))[::-1]
+ax.errorbar(comparisons["test PR-AUC difference"], y_pos,
+            xerr=[comparisons["test PR-AUC difference"] - comparisons["low"], comparisons["high"] - comparisons["test PR-AUC difference"]],
+            fmt="o", color="#4C72B0", capsize=3)
+ax.axvline(0, color="black", lw=0.8)
+ax.set_yticks(y_pos, [f"{r['model']}  vs  {r['compared with']}" for _, r in comparisons.iterrows()], fontsize=8)
+ax.set_xlabel("difference in test PR-AUC (95% interval)")
+ax.set_title("Test comparisons (2022-2024): intervals crossing 0 are not clear differences")
+plt.tight_layout()
+plt.show()
+''')
+
+# ---------------------------------------------------------------- 7.8
+md(r"""
+## 7.8 Did the 2022 regulation change hurt the predictions?
+
+2022 brought completely new car rules. If the models had learned patterns that only held under the old cars, their scores should drop from 2022. We look at:
+- **validation (2019–2021) vs test (2022–2024)** for every model, with a 95% interval for the difference (the two periods have different races, so both are resampled independently);
+- **season by season** (2019–2024) for the primary model and the grid-only baseline, each with a 95% race-resampling interval.
+
+A drop could also come from other changes (which teams dominated, the number of races), so this can show an *association*, not a cause.
+""")
+
+code(r'''
+def period_difference(p_val, p_test, n=500):
+    rng = np.random.default_rng(SEED)
+    vr, tr_ = np.unique(val_race), np.unique(test_race)
+    d = []
+    for _ in range(n):
+        iv = np.concatenate([np.flatnonzero(val_race == r) for r in rng.choice(vr, len(vr))])
+        it = np.concatenate([np.flatnonzero(test_race == r) for r in rng.choice(tr_, len(tr_))])
+        d.append(average_precision_score(y_test[it], p_test[it]) - average_precision_score(y_val[iv], p_val[iv]))
+    return average_precision_score(y_test, p_test) - average_precision_score(y_val, p_val), *np.percentile(d, [2.5, 97.5])
+
+
+period = []
+for key in [("A", "grid-only LR")] + KEYS_A + KEYS_B:
+    d, lo, hi = period_difference(VAL_PRED_V2[key], TEST_PRED[key])
+    period.append({"model": f"{key[0]} {key[1]}", "validation PR-AUC": average_precision_score(y_val, VAL_PRED_V2[key]),
+                   "test PR-AUC": average_precision_score(y_test, TEST_PRED[key]), "test - validation": d,
+                   "95% interval": f"[{lo:+.4f}, {hi:+.4f}]", "clear change?": "yes" if lo > 0 or hi < 0 else "no (interval includes 0)"})
+display(pd.DataFrame(period).round(4))
+
+seasons = pd.concat([VAL_ROWS.assign(p_primary=VAL_PRED_V2[PRIMARY_MODEL_V2], p_grid=VAL_PRED_V2[("A", "grid-only LR")]),
+                     TEST_ROWS.assign(p_primary=TEST_PRED[PRIMARY_MODEL_V2], p_grid=TEST_PRED[("A", "grid-only LR")])])
+season_rows = []
+rng_season = np.random.default_rng(SEED)
+for year, g in seasons.groupby("year"):
+    races = g["raceId"].unique()
+    row = {"season": year, "races": len(races), "rows": len(g), "podium rate": g["podium"].mean()}
+    for col, name in [("p_primary", "primary"), ("p_grid", "grid-only")]:
+        boot = []
+        for _ in range(500):
+            idx = np.concatenate([np.flatnonzero(g["raceId"].to_numpy() == r) for r in rng_season.choice(races, len(races))])
+            boot.append(average_precision_score(g["podium"].to_numpy()[idx], g[col].to_numpy()[idx]))
+        row[f"{name} PR-AUC"] = average_precision_score(g["podium"], g[col])
+        row[f"{name} low"], row[f"{name} high"] = np.percentile(boot, [2.5, 97.5])
+    season_rows.append(row)
+season_table = pd.DataFrame(season_rows)
+display(season_table.round(3))
+
+fig, ax = plt.subplots(figsize=(10, 3.8))
+for name, color in [("primary", "#4C72B0"), ("grid-only", "#8C8C8C")]:
+    ax.errorbar(season_table["season"] + (0.08 if name == "grid-only" else 0), season_table[f"{name} PR-AUC"],
+                yerr=[season_table[f"{name} PR-AUC"] - season_table[f"{name} low"], season_table[f"{name} high"] - season_table[f"{name} PR-AUC"]],
+                fmt="o-", color=color, capsize=3,
+                label=f"{'primary: ' + PRIMARY_MODEL_V2[1] + ' (model A)' if name == 'primary' else 'grid-only baseline'}")
+ax.axvline(2021.5, color="#C44E52", ls="--", label="new car rules (2022)")
+ax.set_xlabel("season")
+ax.set_ylabel("PR-AUC (95% interval)")
+ax.set_title("PR-AUC per season: validation 2019-2021, test 2022-2024")
+ax.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+### Probability quality on the test seasons, and the first freeze (v1) for comparison
+
+Brier score and the sum of predicted probabilities per race (3 real podiums per race) on the test seasons. Then the **v1** models of section 6, frozen earlier, are scored on the test seasons too, **for comparison only**: the official results are the v2 ones above, and nothing is chosen from this table.
+""")
+
+code(r'''
+test_sums = pd.DataFrame({f"{k[0]} {k[1]}": pd.Series(TEST_PRED[k]).groupby(test_race).sum().to_numpy() for k in KEYS_A + KEYS_B})
+display(pd.DataFrame({"Brier (test)": {f"{k[0]} {k[1]}": brier_score_loss(y_test, TEST_PRED[k]) for k in KEYS_A + KEYS_B},
+                      "mean probability sum per race": test_sums.mean(), "min": test_sums.min(), "max": test_sums.max()}).round(3))
+
+v1_models, v1_manifest = load_model_artifacts(ARTIFACT_DIR)
+assert v1_manifest["frozen fingerprint"] == FROZEN_FINGERPRINT
+v1_rows = []
+for m in v1_models.values():
+    key = m["key"]
+    if key[1] == "grid-only LR":
+        continue
+    p = m["predict"](TEST_ROWS)
+    v1_rows.append({"model": key[0], "family": key[1], "v1 setting": str(CHOSEN[key]["params"]),
+                    "v1 test PR-AUC": average_precision_score(y_test, p), "v2 test PR-AUC": average_precision_score(y_test, TEST_PRED[key]),
+                    "v1 test F1": f1_score(y_test, p >= m["threshold"]), "v2 test F1": f1_score(y_test, TEST_PRED[key] >= TEST_THRESHOLDS[key]),
+                    "setting changed in v2": CHOSEN[key]["params"] != CHOSEN_V2[key]["params"]})
+print("First freeze (v1, section 6) on the test seasons - for comparison only, not used for any decision:")
+display(pd.DataFrame(v1_rows).round(4))
+TEST_EVALUATED_WITH = FROZEN_V2_FINGERPRINT
+print(f"Test evaluation complete with the v2 freeze {TEST_EVALUATED_WITH[:16]}... ; no model, setting or threshold was changed afterwards.")
+''')
+
+
+# ---------------------------------------------------------------- 7.9
+md(r"""
+## 7.9 Phase 4: what the test seasons show
+
+All numbers are from the one test evaluation above (2022–2024: 68 races, 1,354 rows, 204 podiums). Nothing was changed after it.
+
+**1. Which model performs best on the test seasons?**
+- Highest test PR-AUC: random forest, model B (0.725), followed by random forest A (0.719), gradient boosting A (0.718) and B (0.718), logistic regression B (0.712), the primary logistic regression A (0.705), the network B (0.704) and A (0.698).
+- **None of these differences is clear.** Compared with the primary model, random forest A is +0.015 (interval −0.017 to +0.044), gradient boosting A +0.013 (−0.017 to +0.043) and the network A −0.007 (−0.028 to +0.014). The honest answer is: **the four families perform about equally well on unseen seasons**, with the tree models slightly ahead in this sample.
+
+**2. Does the primary model (logistic regression, model A) generalise?**
+- **Yes, for ranking and probabilities.** Test PR-AUC 0.705 is in line with its cross-validation score (0.703) and below the validation score (0.735); that drop of −0.030 has an interval of −0.135 to +0.083, i.e. it is not distinguishable from noise. ROC-AUC is unchanged (0.937 on both validation and test). Brier 0.070, and probabilities sum to 3.27 per race on average (3 real podiums), so they are slightly too high, as on validation.
+- **Yes/no predictions are weaker than on validation:** F1 0.668 (validation 0.716) at the frozen threshold, top-3-per-race F1 0.667. On the test seasons every model beats the rule "grid ≤ 3" in F1 (rule 0.649; models 0.659–0.685), which was **not** the case on validation; this comparison has no interval and is descriptive.
+
+**3. Does old historical data help?**
+- **No evidence either way.** Model B (1950–2018) minus model A (2003–2018) in test PR-AUC: logistic regression +0.008, random forest +0.006, gradient boosting −0.001, network +0.006; **every interval includes 0**. This agrees with cross-validation, validation and the training-window experiments of 6.10: fifty extra seasons neither help nor hurt measurably.
+
+**4. Is the 2022 regulation change associated with lower performance?**
+- Every model scores a little lower on 2022–2024 than on 2019–2021 (model A: −0.015 to −0.040 in PR-AUC), but **every interval includes 0** (they are wide, about ±0.10, because two different sets of about 60 races are compared).
+- Season by season, the primary model scores 0.74 / 0.73 / 0.74 in 2019–2021 and **0.70 in 2022, 0.78 in 2023, 0.65 in 2024**. The best season of all six is a post-change season (2023, one dominant team), and the weakest is 2024, a season with several competitive teams. The grid-only baseline moves in a similar way (2023 0.68, 2024 0.66). So the scores depend more on **how predictable a season is** (how dominant one team is) than on the rule change itself. There is no clear evidence that the 2022 rules broke the models, but with 3 seasons of 22–24 races this can't be ruled out.
+
+**5. Which models show overfitting?**
+- **No model shows clear overfitting.** For model A the training PR-AUC (0.69–0.71) is close to cross-validation (0.69–0.71) and to the test score (0.70–0.72). The v2 tree settings are shallower than v1 (random forest depth 4 with leaves of at least 100 rows; boosting with 3 leaves per tree), and their training-vs-CV gap shrank (gradient boosting: 0.736 → 0.705 on training rows, vs 0.694 in CV).
+- The network A dropped most from validation to test (0.738 → 0.698), but the drop is within noise and it also had the highest validation score, which is partly luck.
+- Model B's training PR-AUC is **lower** (0.56–0.58) than its other scores: its training rows include the 1950s–1990s, which are harder to predict. That is a property of the old data, not overfitting.
+
+**6. Do the improvements over the grid-only baseline remain?**
+- **Yes, and more clearly than on validation.** On the test seasons all four model-A families beat the grid-only baseline (PR-AUC 0.647) with intervals entirely above 0: logistic regression +0.057 (+0.009 to +0.104), random forest +0.072 (+0.036 to +0.108), gradient boosting +0.071 (+0.042 to +0.098), network +0.051 (+0.006 to +0.095). On validation the network's gain was not clear.
+- So qualifying pace, standings and form **do** add real information beyond the starting position, and this holds on seasons the models never saw, under new car rules.
+
+**Comparison with the first freeze (v1, for information only):** where the setting changed, v2 scores slightly higher on the test seasons for the tree models (e.g. gradient boosting A 0.710 → 0.718) and model B's network (0.692 → 0.704), and slightly lower for model A's network (0.700 → 0.698). These differences are small, have no interval, and did not and do not influence any choice; the logistic regressions are identical in v1 and v2.
+
+**Post-test, exploratory ideas (not applied; they would need new, unseen seasons to test fairly):**
+- normalising each race's probabilities so they sum to 3 (they currently sum to 3.0–3.3);
+- features describing how dominant the leading team is in the current season, since season predictability drives most of the score changes;
+- evaluating on the 2025 season when its data becomes available, as a second genuine test.
+""")
+
+
+
+# ---------------------------------------------------------------- 7.10
+md(r"""
+## 7.10 The official prediction output: the three most likely podium finishers of each race
+
+**Decision (taken after the test, about how results are presented, not about the model):** for a complete race, the official prediction is the **three drivers with the highest podium probabilities** from the frozen primary model (logistic regression, model A, v2). Nothing about the model changes: same pre-processing, settings, thresholds and fingerprints. This rule was already part of the frozen plan (6.8: "top-3 per race") and was evaluated on the test seasons in 7.5; on the test seasons it scores about the same as the threshold rule (F1 0.667 vs 0.668), so it is not chosen because it scored better. It is chosen because it matches the sport: every race has exactly 3 podium places.
+
+What the outputs mean:
+- **Complete race → the predicted podium:** the 3 most likely podium finishers. They are *not* a prediction of 1st, 2nd and 3rd place in that order; the model only estimates "podium or not".
+- **A single driver → a podium probability** (e.g. 0.42), not a claim about the whole podium, because the top-3 rule needs every driver of the race.
+- **Threshold rule (probability ≥ the frozen threshold) → secondary, academic result.** It answers "is this driver likely enough?" for each driver separately and can give any number of "yes" per race (242 for 204 real podiums on the test seasons). Its precision / recall / F1 stay reported in 6.9, 7.5 and 7.6.
+
+Below: the race-level evaluation of the **already-frozen** predictions (`VAL_PRED_V2`, `TEST_PRED`); nothing is re-fitted. The comparison is the simplest possible podium pick: **the three drivers starting at the front of the grid**. Ties in probability within a race are broken by row order (grid position, then `driverId`), so the picks are deterministic.
+""")
+
+code(r'''
+def race_level(y, p, race):
+    """Top-3 pick per race and how many of the 3 picks were real podium finishers."""
+    picks = top3_per_race(p, race)
+    correct = pd.Series(y * picks).groupby(race).sum()
+    return picks, correct
+
+
+def race_level_summary(name, y, p, race):
+    picks, correct = race_level(y, p, race)
+    return {"prediction": name, "races": len(correct), "top-3 F1": f1_score(y, picks),
+            "correct podium picks per race (of 3)": correct.mean(),
+            "races with all 3 right": int((correct == 3).sum()), "all 3 right %": 100 * (correct == 3).mean(),
+            "races with at least 2 right %": 100 * (correct >= 2).mean(), "races with 0 right": int((correct == 0).sum())}
+
+
+def correct_difference_interval(y, p_new, p_base, race, seed=SEED, n=500):
+    """Paired race resampling of the difference in correct picks per race (per-race counts, so no grouping issue)."""
+    diff = race_level(y, p_new, race)[1] - race_level(y, p_base, race)[1]
+    rng = np.random.default_rng(seed)
+    boots = [rng.choice(diff.to_numpy(), len(diff)).mean() for _ in range(n)]
+    return diff.mean(), *np.percentile(boots, [2.5, 97.5])
+
+
+OFFICIAL = PRIMARY_MODEL_V2
+race_rows = []
+for period, rows, preds, y, race in [("validation 2019-2021", VAL_ROWS, VAL_PRED_V2, y_val, val_race),
+                                      ("TEST 2022-2024", TEST_ROWS, TEST_PRED, y_test, test_race)]:
+    grid_score = -rows["grid"].to_numpy()                      # front of the grid first
+    race_rows.append({"period": period, **race_level_summary("top 3 on the starting grid", y, grid_score, race)})
+    for key in [OFFICIAL] + [k for k in KEYS_A if k != OFFICIAL]:
+        label = f"{key[1]} (model {key[0]})" + ("  <- OFFICIAL" if key == OFFICIAL else "")
+        race_rows.append({"period": period, **race_level_summary(label, y, preds[key], race)})
+RACE_LEVEL = pd.DataFrame(race_rows)
+print(f"Official output: the 3 most likely podium finishers per race, from {OFFICIAL[1]} (model {OFFICIAL[0]}, frozen v2 "
+      f"{FROZEN_V2_FINGERPRINT[:16]}...). Race-level evaluation of the frozen predictions:")
+display(RACE_LEVEL.round(3))
+
+for period, rows, preds, y, race in [("validation 2019-2021", VAL_ROWS, VAL_PRED_V2, y_val, val_race),
+                                      ("TEST 2022-2024", TEST_ROWS, TEST_PRED, y_test, test_race)]:
+    d, lo, hi = correct_difference_interval(y, preds[OFFICIAL], -rows["grid"].to_numpy(), race)
+    print(f"{period}: official pick minus grid pick = {d:+.3f} correct podium drivers per race "
+          f"(95% race-resampling interval {lo:+.3f} to {hi:+.3f}) -> "
+          f"{'clear' if lo > 0 or hi < 0 else 'not clear (interval includes 0)'}")
+''')
+
+code(r'''
+# Determinism: ties at the cut (3rd vs 4th most likely) and a fingerprint of the official test picks.
+def tie_at_cut(p, race):
+    s = pd.DataFrame({"p": p, "race": race}).sort_values(["race", "p"], ascending=[True, False])
+    third_fourth = s.groupby("race")["p"].apply(lambda v: len(v) > 3 and v.iloc[2] == v.iloc[3])
+    return int(third_fourth.sum())
+
+
+official_test_picks = TEST_ROWS.loc[top3_per_race(TEST_PRED[OFFICIAL], test_race) == 1, ["raceId", "driverId"]]
+assert len(official_test_picks) == 3 * len(np.unique(test_race))
+PICKS_FINGERPRINT = hashlib.sha256(official_test_picks.sort_values(["raceId", "driverId"]).to_csv(index=False).encode()).hexdigest()
+print(f"Races where the 3rd and 4th probabilities are exactly equal: validation {tie_at_cut(VAL_PRED_V2[OFFICIAL], val_race)}, "
+      f"test {tie_at_cut(TEST_PRED[OFFICIAL], test_race)} (ties would be broken by grid position, then driverId)")
+print(f"Official test picks: {len(official_test_picks)} drivers in {len(np.unique(test_race))} races; picks fingerprint {PICKS_FINGERPRINT[:16]}...")
+
+# Example: the official prediction for the first race of each test season (names for reading only).
+names = CLEAN["drivers"].assign(driver=CLEAN["drivers"]["forename"] + " " + CLEAN["drivers"]["surname"]).set_index("driverId")["driver"]
+race_names = CLEAN["races"].set_index("raceId")
+examples = []
+for year in sorted(TEST_ROWS["year"].unique()):
+    first_race = race_names[race_names["year"] == year].sort_values("round").index
+    rid = next(r for r in first_race if r in set(TEST_ROWS["raceId"]))
+    g = TEST_ROWS[TEST_ROWS["raceId"] == rid].assign(probability=TEST_PRED[OFFICIAL][TEST_ROWS["raceId"].to_numpy() == rid])
+    g = g.sort_values("probability", ascending=False).head(3)
+    for _, r in g.iterrows():
+        examples.append({"race": f"{year} {race_names.loc[rid, 'name']}", "predicted podium driver": names[r["driverId"]],
+                         "grid": int(r["grid"]), "podium probability": round(r["probability"], 3), "actually on the podium": bool(r["podium"])})
+display(pd.DataFrame(examples))
+
+fig, ax = plt.subplots(figsize=(9, 3.6))
+test_part = RACE_LEVEL[RACE_LEVEL["period"] == "TEST 2022-2024"].set_index("prediction")
+order = ["top 3 on the starting grid"] + [p for p in test_part.index if p != "top 3 on the starting grid"]
+ax.barh(order, test_part.loc[order, "correct podium picks per race (of 3)"],
+        color=["#8C8C8C"] + ["#4C72B0" if "OFFICIAL" in p else "#A6BDDB" for p in order[1:]])
+for i, v in enumerate(test_part.loc[order, "correct podium picks per race (of 3)"]):
+    ax.text(v + 0.01, i, f"{v:.2f}", va="center", fontsize=8)
+ax.invert_yaxis()
+ax.set_xlim(0, 3)
+ax.set_xlabel("correct podium drivers per race (out of 3), TEST 2022-2024")
+ax.set_title("Picking the podium: frozen models vs the top 3 of the starting grid")
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**What the race-level evaluation shows** (frozen predictions; nothing re-fitted or chosen here):
+- **Test 2022–2024, official pick:** top-3 F1 **0.667**, i.e. **2.00 of the 3 podium drivers** correctly picked per race on average; **all three right in 16 of 68 races (23.5%)**, at least two right in 78%, none right in 1 race.
+- **Top 3 on the starting grid:** 1.96 correct per race, all three right in 11 races (16.2%).
+- **The difference is not clear:** +0.044 correct picks per race for the official model, 95% interval −0.088 to +0.176. On the validation seasons it went the other way (grid 2.15 vs model 2.10, also not clear). So, **as a podium pick, the model is about as good as the front three on the grid.** Its advantage, shown in 7.7, is in **ranking and probabilities** across the whole field (PR-AUC 0.705 vs 0.647 for the grid-only baseline, a clear difference): it knows *how likely* each driver is, including fast cars starting further back, even when that rarely changes the top three.
+- **Deterministic:** no race has equal 3rd and 4th probabilities in validation or test, and the picks have a fixed fingerprint (printed above).
+- **Exact order is not predicted:** the three picks are the most likely podium finishers, not a forecast of 1st, 2nd and 3rd.
+""")
+
+# ================================================================ 8. EXPLORATORY (POST-TEST)
+md(r"""
+# 8. Exploratory, after the test: can podium selection be improved cheaply?
+
+> **This section is exploratory and comes after the test evaluation.** The 2022–2024 results of section 7 have already been seen, so nothing here can claim an unbiased test improvement, and the test seasons are **not used** in this section. The validation seasons 2019–2021 have been explored before and are **not used** either. Everything is judged on the four historical forward-chaining folds (scoring 2011–2018, model A training seasons). The frozen v1/v2 models, their fingerprints, the primary model and the section-7 results are **unchanged**.
+
+**Question:** do a nicer shape for the grid or a few *race-relative* features improve the actual podium pick (the 3 most likely drivers of each race)?
+
+**Budget (fixed in advance): 8 configurations × 4 folds = 32 fits**, no neural network, no further tuning afterwards.
+
+| # | Configuration | What changes vs the baseline |
+|---|---|---|
+| C0 | **baseline**: logistic regression, `C` = 1 (the frozen v2 primary setting), 21 inputs | nothing |
+| C1 | + `log(grid)` | lets the linear model follow the steep drop from pole |
+| C2 | + a compact spline of `grid` (4 knots, cubic) | a flexible grid curve |
+| C3 | + relative team strength | each driver's team's rank **within the race** by `cons_points_share` and by `cons_podium_rate_5` |
+| C4 | + relative qualifying pace | `gap_q1_pct` as a z-score **within the race** (how far from the field's typical pace) |
+| C5 | + relative driver form | rank **within the race** by `drv_avg_finish_5` |
+| C6 | + `log(grid)` and all race-relative features | C1 + C3 + C4 + C5 |
+| C7 | reference: gradient boosting with the frozen v2 setting, 21 inputs | another existing model, unchanged |
+
+**Why these are allowed:** every race-relative feature is computed **inside one race** from that race's **pre-race** features (standings after the previous race, form from earlier races, qualifying). No result of the race enters. The new columns are filled and scaled inside each fold, on that fold's training seasons only.
+
+**Metrics** on each fold's scoring seasons: PR-AUC, ROC-AUC and three podium-pick measures for the top-3-per-race rule: **top-3 F1**, the **average number of correctly picked podium drivers per race** (0–3), and the **exact-three rate** (share of races where all three picks are right). Every race in these folds has exactly 3 podiums, so top-3 F1 = correct picks per race ÷ 3; both are shown because they read differently.
+
+**Decision rule (fixed before the results):** a configuration is a candidate for a *future, independently evaluated* version only if (a) its mean top-3 F1 is higher than the baseline's, (b) it improves top-3 F1 in **at least 3 of the 4 folds**, (c) its mean PR-AUC is not lower, and (d) the 95% interval of its top-3 F1 gain, from resampling the 158 fold races (paired), excludes 0. Otherwise the existing model stays.
+
+*Note:* rescaling each race's probabilities (e.g. so they add up to 3) keeps their order within the race, so it cannot change which three drivers are picked; it is not tested here as a way to improve the podium pick.
+""")
+
+code(r'''
+import json, time
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.preprocessing import SplineTransformer
+
+EXP_SEED = 42
+EXP_FOLDS = [(2011, 2012), (2013, 2014), (2015, 2016), (2017, 2018)]     # the same scoring blocks as sections 6-7
+frozen_v2_record = json.loads((CLEAN_DATA_DIR.parent / "frozen_models_v2.json").read_text(encoding="utf-8"))
+LR_V2_SETTING = frozen_v2_record["models"]["A | logistic regression"]["settings"]
+HGB_V2_SETTING = frozen_v2_record["models"]["A | gradient boosting"]["settings"]
+print("frozen v2 record", frozen_v2_record["fingerprint"][:16], "| baseline LR setting", LR_V2_SETTING, "| HGB setting", HGB_V2_SETTING)
+
+
+def add_race_relative(rows):
+    """Race-relative features, each computed within one race from that race's pre-race features only."""
+    r = rows.copy()
+    by_race = r.groupby("raceId")
+    r["log_grid"] = np.log(r["grid"])
+    r["team_strength_rank"] = by_race["cons_points_share"].rank(ascending=False, pct=True)     # small = strongest team
+    r["team_form_rank"] = by_race[CONS_FORM].rank(ascending=False, pct=True)
+    gap = r["gap_q1_pct"]
+    r["quali_pace_z"] = (gap - by_race["gap_q1_pct"].transform("mean")) / by_race["gap_q1_pct"].transform("std")
+    r["driver_form_rank"] = by_race[DRV_FORM[1]].rank(ascending=True, pct=True)                # drv_avg_finish_5
+    return r
+
+
+EXP_ROWS = add_race_relative(TRAIN_A_ROWS)            # model-A training seasons 2003-2018 only
+RELATIVE = ["team_strength_rank", "team_form_rank", "quali_pace_z", "driver_form_rank"]
+CONFIGS = {
+    "C0 baseline (LR, 21 inputs)": {"extra": [], "spline": False, "model": "lr"},
+    "C1 + log(grid)": {"extra": ["log_grid"], "spline": False, "model": "lr"},
+    "C2 + grid spline": {"extra": [], "spline": True, "model": "lr"},
+    "C3 + relative team strength": {"extra": ["team_strength_rank", "team_form_rank"], "spline": False, "model": "lr"},
+    "C4 + relative qualifying pace": {"extra": ["quali_pace_z"], "spline": False, "model": "lr"},
+    "C5 + relative driver form": {"extra": ["driver_form_rank"], "spline": False, "model": "lr"},
+    "C6 + log(grid) + all relative": {"extra": ["log_grid"] + RELATIVE, "spline": False, "model": "lr"},
+    "C7 reference: gradient boosting (frozen v2 setting)": {"extra": [], "spline": False, "model": "hgb"},
+}
+assert len(CONFIGS) <= 8
+
+
+def exp_pipeline(cfg):
+    parts = [("base", make_preprocessor(scaled=cfg["model"] == "lr"), FINAL_FEATURES)]
+    if cfg["extra"]:
+        parts.append(("extra", make_pipeline(SimpleImputer(strategy="median"), StandardScaler()), cfg["extra"]))
+    if cfg["spline"]:
+        parts.append(("grid_spline", SplineTransformer(n_knots=4, degree=3), ["grid"]))
+    model = (LogisticRegression(max_iter=5000, **LR_V2_SETTING) if cfg["model"] == "lr" else
+             HistGradientBoostingClassifier(l2_regularization=1.0, early_stopping=False, random_state=EXP_SEED, **HGB_V2_SETTING))
+    return Pipeline([("pre", ColumnTransformer(parts)), ("model", model)])
+
+
+def podium_pick(y, p, race):
+    picks = pd.DataFrame({"race": race, "y": y, "p": p})
+    picks["pick"] = picks.groupby("race")["p"].rank(method="first", ascending=False) <= 3
+    correct = picks[picks["pick"]].groupby("race")["y"].sum()
+    return {"top-3 F1": f1_score(picks["y"], picks["pick"]), "correct per race": correct.mean(), "exact-3 rate": (correct == 3).mean()}
+
+
+EXP_FOLD_SCORES, EXP_OOF = [], {}
+t0 = time.time()
+for name, cfg in CONFIGS.items():
+    preds = []
+    for k, (lo, hi) in enumerate(EXP_FOLDS):
+        tr, sc = EXP_ROWS[EXP_ROWS["year"] < lo], EXP_ROWS[EXP_ROWS["year"].between(lo, hi)]
+        assert tr["year"].max() < lo and set(tr["split"]) == {"train"}
+        cols = FINAL_FEATURES + [c for c in cfg["extra"] if c not in FINAL_FEATURES]
+        pipe = exp_pipeline(cfg).fit(tr[cols], tr["podium"])
+        p = pipe.predict_proba(sc[cols])[:, 1]
+        preds.append(p)
+        EXP_FOLD_SCORES.append({"configuration": name, "fold": f"{lo}-{hi}", "PR-AUC": average_precision_score(sc["podium"], p),
+                                "ROC-AUC": roc_auc_score(sc["podium"], p), **podium_pick(sc["podium"].to_numpy(), p, sc["raceId"].to_numpy())})
+    EXP_OOF[name] = np.concatenate(preds)
+EXP_FOLD_SCORES = pd.DataFrame(EXP_FOLD_SCORES)
+print(f"{len(CONFIGS)} configurations x {len(EXP_FOLDS)} folds = {len(EXP_FOLD_SCORES)} fits in {time.time() - t0:.0f} s; "
+      f"test and validation seasons not used.")
+''')
+
+code(r'''
+oof_rows = pd.concat([EXP_ROWS[EXP_ROWS["year"].between(lo, hi)] for lo, hi in EXP_FOLDS])
+oof_y, oof_race = oof_rows["podium"].to_numpy(), oof_rows["raceId"].to_numpy()
+rng_exp = np.random.default_rng(EXP_SEED)
+oof_races = np.unique(oof_race)
+EXP_BOOT = []                                         # resampled races; each copy gets its own id, so a race drawn twice stays two races
+for _ in range(500):
+    draw = rng_exp.choice(oof_races, len(oof_races))
+    idx = [np.flatnonzero(oof_race == r) for r in draw]
+    EXP_BOOT.append((np.concatenate(idx), np.concatenate([np.full(len(i), j) for j, i in enumerate(idx)])))
+base = "C0 baseline (LR, 21 inputs)"
+
+
+def top3_f1_gain_interval(name):
+    gains = []
+    for idx, race_copy in EXP_BOOT:
+        a = podium_pick(oof_y[idx], EXP_OOF[base][idx], race_copy)
+        b = podium_pick(oof_y[idx], EXP_OOF[name][idx], race_copy)
+        gains.append(b["top-3 F1"] - a["top-3 F1"])
+    return np.percentile(gains, [2.5, 97.5])
+
+
+mean = EXP_FOLD_SCORES.groupby("configuration", sort=False)[["PR-AUC", "ROC-AUC", "top-3 F1", "correct per race", "exact-3 rate"]].mean()
+wide = EXP_FOLD_SCORES.pivot(index="configuration", columns="fold", values="top-3 F1").loc[mean.index]
+wide_pr = EXP_FOLD_SCORES.pivot(index="configuration", columns="fold", values="PR-AUC").loc[mean.index]
+summary_rows = []
+for name in mean.index:
+    gain_folds = wide.loc[name] - wide.loc[base]
+    row = {"configuration": name, "CV PR-AUC": mean.loc[name, "PR-AUC"], "CV ROC-AUC": mean.loc[name, "ROC-AUC"],
+           "CV top-3 F1": mean.loc[name, "top-3 F1"], "correct podium picks per race": mean.loc[name, "correct per race"],
+           "exact-3 rate": mean.loc[name, "exact-3 rate"],
+           "top-3 F1 gain vs C0": mean.loc[name, "top-3 F1"] - mean.loc[base, "top-3 F1"],
+           "PR-AUC gain vs C0": mean.loc[name, "PR-AUC"] - mean.loc[base, "PR-AUC"],
+           "folds improved (top-3 F1)": f"{int((gain_folds > 0).sum())} of 4" if name != base else "-",
+           "folds improved (PR-AUC)": f"{int((wide_pr.loc[name] > wide_pr.loc[base]).sum())} of 4" if name != base else "-"}
+    if name != base:
+        lo, hi = top3_f1_gain_interval(name)
+        row["top-3 F1 gain, 95% interval (158 races)"] = f"[{lo:+.4f}, {hi:+.4f}]"
+        row["meets the decision rule?"] = ("yes" if row["top-3 F1 gain vs C0"] > 0 and (gain_folds > 0).sum() >= 3
+                                           and row["PR-AUC gain vs C0"] >= 0 and lo > 0 else "no")
+    summary_rows.append(row)
+EXP_SUMMARY = pd.DataFrame(summary_rows).set_index("configuration")
+print("Historical forward-chaining CV, model A (scoring 2011-2018; 158 races, 474 podiums). Means over the 4 folds:")
+display(EXP_SUMMARY.round(4))
+print("Top-3 F1 per fold:")
+display(wide.round(4))
+print("PR-AUC per fold:")
+display(wide_pr.round(4))
+''')
+
+code(r'''
+fig, axes = plt.subplots(1, 2, figsize=(15, 4.2))
+folds = list(wide.columns)
+for name in wide.index:
+    style = dict(lw=2.5, color="black") if name == base else dict(lw=1, alpha=0.8)
+    axes[0].plot(folds, wide.loc[name], marker="o", label=name.split(" (")[0] if name == base else name, **style)
+    axes[1].plot(folds, wide_pr.loc[name], marker="o", **style)
+axes[0].set_title("Top-3-per-race F1 by fold (black = baseline)")
+axes[0].set_ylabel("top-3 F1")
+axes[1].set_title("PR-AUC by fold (black = baseline)")
+axes[1].set_ylabel("PR-AUC")
+for ax in axes:
+    ax.set_xlabel("scored seasons")
+axes[0].legend(fontsize=7)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**What the exploratory round shows** (historical folds only; validation and test seasons not used):
+- **No configuration meets the decision rule.** Every 95% interval for the top-3 F1 gain includes 0. Picking the podium is hard to improve with these additions: the changes range from −0.008 to +0.008 in top-3 F1, i.e. at most about 4 more (or fewer) correct picks out of 474 podium places in 158 races.
+- **The best podium pick, C6** (`log(grid)` + all race-relative features): top-3 F1 0.674 vs 0.666 (2.02 vs 2.00 correct picks per race), better in 3 of 4 folds, but the interval (−0.006 to +0.023) includes 0.
+- **The only consistent change is `log(grid)` (C1):** PR-AUC +0.013, higher in **all 4 folds**; the spline (C2) is similar (+0.010, 3 of 4 folds). A better grid curve ranks the *whole field* more accurately, but it hardly changes **who** the top three are (top-3 F1 +0.002, 2 of 4 folds; exact-three rate 0.252 vs 0.265).
+- **Relative team strength and relative driver form slightly hurt** the podium pick (0 of 4 folds improved); relative qualifying pace is neutral.
+- **The gradient-boosting reference** (frozen v2 setting) scores below the logistic-regression baseline on these folds (PR-AUC 0.694 vs 0.703, top-3 F1 0.659 vs 0.666).
+- **All three picks right happens in about one race in four** (exact-three rate 0.23–0.26) for every configuration; about 2 of the 3 podium drivers are picked correctly per race.
+
+**Recommendation:** keep the existing frozen model (logistic regression, model A, v2) as the official model; this round does not justify a change. If a future version is built, the only idea worth carrying forward is `log(grid)` (a consistent ranking gain across all four historical folds). It would have to be evaluated on **new** seasons (2025 onwards), not on 2019–2024, which have already been used.
 """)
 
 

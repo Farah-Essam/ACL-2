@@ -18,6 +18,7 @@ This README is the project log. It records **what was done, why, and what was tr
 | `outputs/anomalies/` | CSVs written by notebook section 1.12: one per raw table, plus `_summary.csv`. |
 | `outputs/clean_data/` | **The cleaned dataset**, written by notebook section 2.13: 15 CSVs (`model_base`, `results_full`, every cleaned table, the `*_prerace` standings), `schema.json` (column types), `manifest.csv` (rows + SHA-256) and its own `README.md`. Load with `load_clean("<table>")` to get the exact types back. Rewritten on every run; never edit by hand. |
 | `outputs/final_features.csv` | **The final feature table**, written by notebook section 4.7: every row of `feat` (24,645, all seasons 1950–2024) × 23 columns = `raceId`, `driverId`, `year`, `split`, target `podium` + the 18 `FINAL_FEATURES` in order. Missing values are empty cells (no filling or scaling: that is section 5, fitted on training seasons only). Rows sorted by race, grid, `driverId`. Read with `pd.read_csv(path, keep_default_na=False, na_values=[""])`. Rewritten on every run (on Kaggle under `/kaggle/working/outputs/`). |
+| `outputs/frozen_models.json` | **The frozen section-6 models**, written by notebook 6.11: for each of the 8 final models (4 families × model A and B) and the 2 baselines, the chosen settings, pre-processing, threshold, training seasons, seed / epochs, CV and validation PR-AUC, and a SHA-256 fingerprint of the whole record. No data and no test metric. Rewritten on every run (identical as long as nothing changes). |
 | `../Dataset.zip` | Raw data (one folder above the repo, **not** in git). Read directly from the zip, never extracted. |
 | `../GUC_..._2026-09-30....pdf` | The milestone brief (one folder above the repo). |
 
@@ -33,7 +34,7 @@ python tools/run_notebook.py  f1_podium_prediction.ipynb    # execute top to bot
   - keep editing `tools/build_notebook.py` and regenerate (that's how sections 1–3 were made), **or**
   - edit the notebook directly from now on and stop using the generator.
 - The data path is auto-detected: env var `F1_DATA` → Kaggle mount `/kaggle/input/formula-1-world-championship-1950-2020` → `../Dataset.zip` → `Dataset.zip` → `../Dataset` / `Dataset` / `data/raw`. It works on Kaggle (submission requirement) and locally.
-- Environment used: Python 3.10, pandas 2.3, matplotlib 3.10, numpy 2.2, ipykernel. No scipy or statsmodels needed so far.
+- Environment: the notebook prints its versions in 6.1. Last full run: Python 3.14, numpy 2.4, pandas 2.3, scikit-learn 1.8, PyTorch 2.10 (CPU), joblib (parallel CV jobs). Earlier sections were first built with Python 3.10 / numpy 2.2. SHAP and LIME are installed for the XAI section; XGBoost/LightGBM/Keras are not used.
 - On Windows, set `PYTHONIOENCODING=utf-8` when printing names with accents from a script (the terminal codepage otherwise fails on e.g. *Räikkönen*).
 
 ### Git
@@ -67,8 +68,10 @@ python tools/run_notebook.py  f1_podium_prediction.ipynb    # execute top to bot
 | **2. Data Cleaning** (2.1–2.13) | **closed** (review fixes applied 15 Oct 2026; 2.13 exports the cleaned dataset to `outputs/clean_data/`) | All cleaning applied in memory on copies. 2.9.1 status mapping with row counts; 2.10 re-validation (all 21 FKs); 2.10.2 proof that standings are post-race; 2.11 six before/after plot pairs |
 | **3. Data-Engineering Questions** (3.1–3.3) | done | Q1 (+ two robustness sections), Q2, Q3, each with plots and plain-language answers |
 | **4. Feature Selection & Engineering** (4.1–4.7) | done (16 Oct 2026; review fixes the same day) | split, 22 candidate features with leakage asserts, 4.2.1 checks of the two corrected features (`reached_q3`, team form), evidence plots (train only), redundancy, trials on validation, final 18-feature table, 4.7 export to `outputs/final_features.csv`. Results in README 7.1 |
-| 5. Pre-processing | **next** | decisions pending (README 7.2) |
-| 6+. Models, experiments, XAI, inference | to do | |
+| **5. Pre-processing** (5.1–5.8) | done (17 Oct 2026) | missing-value audit, `F1Imputer` (indicators + fills + `gap_q1_pct` cap), scaling, order experiments E1/E2 (+ checks), final pipelines for models A and B, leakage checks. Results in README 7.2 |
+| **6. Predictive Modeling** (6.1–6.11) | done (17 Oct 2026); **frozen**, test not evaluated | forward-chaining CV (4 folds), 4 families × models A and B, OOF thresholds, validation once, A vs B + training-window experiments, freeze. Results in README 7.3 |
+| 7. Final test evaluation | **next, after review of the frozen models** | one-time evaluation of the frozen models on 2022–2024 |
+| 8+. Ablation, XAI, inference, report | to do | |
 
 Variables available after running sections 1–4:
 - `RAW`: dict of raw tables, **all strings** (`dtype=str`, `keep_default_na=False`).
@@ -79,6 +82,8 @@ Variables available after running sections 1–4:
 - `model_base`: 2003+, pre-race columns + target only; the start of the modeling table.
 - Helpers: `is_missing`, `duration_to_seconds`, `log_step`, `STATUS_GROUPS`, `STATUS_CATEGORIES`, `NON_START_STATUSES`, `RULE_B_OVERRIDES`, `UNUSED_TABLES`, `DEFERRED_TABLES`, `NATIONALITY_TO_COUNTRY`, `season_order`, `CLEAN_DATA_DIR`, `load_clean(name)` (reads an exported table back with its exact types).
 - Section 4: `feat` (all 24,645 rows 1950–2024: keys, `year`, `split`, `podium`, every candidate feature), `season_split(year)`, `FEATURE_GROUPS`, `ALL_CANDIDATES`, `FINAL_FEATURES` (the 18 chosen), `TRAIN_A` / `VAL` (model-A training rows, validation rows), `TRIALS` (every trial's scores), `form_features(n)`, `run_trial`, `gain_interval`, `TEAM_RACES` / `TEAM_GAP_DAYS` (constructor history segments for team form), `ELIMINATION_FORMAT` (the two 2016 races with 8 Q3 places), `FINAL_FEATURES_PATH` / `final_features_df` (the 4.7 export).
+- Section 5: `data` (the CSV read back), `TRAIN_A_ROWS` / `TRAIN_B_ROWS` / `VAL_ROWS`, `CONTINUOUS_FEATURES` / `BINARY_FEATURES` / `INDICATORS`, `F1Imputer`, `make_preprocessor(scaled=...)`, `fit_on_training(pipe, rows, label)` (refuses non-training rows), **`PREPROCESSORS`** (4 fitted pipelines), **`MODEL_INPUTS`**, `EXPERIMENTS` / `experiments_df`, `evaluate_preprocessing`, `pr_auc_difference`.
+- Section 6: `FOLDS` / `fold_rows(model, k)`, `fit6` (training-rows guard + log), `GRIDS`, `SEARCH` (every setting's fold scores), `CHOSEN`, `OOF` (out-of-fold predictions), `THRESHOLDS`, `FINAL6` (fitted final models: `{'pre', 'model'}`), `VAL_PRED`, `ShallowNet` (PyTorch), `PRIMARY_MODEL`, **`FROZEN`** / `FROZEN_MODELS` / `FROZEN_FINGERPRINT`, **`predict_frozen(key, rows)`** (probabilities + threshold rule + top-3 rule; for the test evaluation), `FIT6_LOG` / `PREDICT6_LOG`.
 
 ---
 
@@ -211,19 +216,80 @@ Notebook layout:
 - Fix found while plotting: in round 1 nobody has standings, so "behind everyone ranked" had become position 1 for everyone. Now round-1 rows are set to the back (number of starters), with the `no_standing_yet` flag.
 - **Final 18 features (`FINAL_FEATURES`):** grid `grid`, `pit_lane_start` · qualifying `gap_q1_pct`, `grid_minus_quali`, `reached_q3`, `no_q3_format`, `quali_missing` · standings `drv_champ_pos`, `cons_points_share`, `drv_no_standing_yet`, `cons_no_standing_yet` · form `drv_podium_rate_5`, `drv_avg_finish_5`, `drv_dnf_rate_5`, `cons_podium_rate_5` · context `n_starters`, `drv_experience`, `drv_age`. Model B uses the same 18.
 
-### 7.2 Section 5: Pre-processing. DECISIONS NEEDED
+### 7.2 Section 5: Pre-processing. Plan approved 16 Oct 2026 (with adjustments), BUILT 17 Oct 2026
 
-- Input: `outputs/final_features.csv` (or `feat[FINAL_FEATURES]` in memory), missing values untouched.
-- How to fill missing values: form for a debut (1.1% of train rows), team form for a new team or the first race after a long absence (0.6% of model-A train), `reached_q3` before 2006 (16.6% of model-A train), `gap_q1_pct` (1.8%), all qualifying features for model B before 2003. (Section 4 used a provisional median + "was missing" indicator.)
-- Scaling for logistic regression and the NN (standardise? robust scaler?), fitted on training seasons only.
-- Grid shape: the podium rate falls steeply from pole (79%, 62%, 50%, ...). A transform (e.g. log or 1/grid) may help the linear model.
-- The two (or more) pre-processing-order experiments to report.
+Notebook layout: 5.1 load + feature types · 5.2 missing-value audit · 5.3 imputation step (`F1Imputer`) · 5.4 `gap_q1_pct` cap · 5.5 scaling · 5.6 order experiments (+ consistency check, era diagnostic, invalid leakage demo, transformation check) · 5.7 final pipelines · 5.8 leakage and behaviour checks.
 
-### 7.3 Later steps
+- **Input:** `outputs/final_features.csv` (read, never changed; its SHA-256 is asserted unchanged). 12 continuous + 6 binary features. `raceId`, `driverId`, `year`, `split`, `podium` are never inputs (asserted).
+- **Missing values (train A / train B / validation):** `gap_q1_pct` 1.8% / 64.8% / 1.7%, `grid_minus_quali` 0.3 / 64.2 / 0.3, `reached_q3` 16.6 / 75.9 / 0.3, driver form (3 features) 1.1 / 3.0 / 0.8, team form 0.6 / 1.4 / 0.8; nothing else. Causes asserted exactly: `grid_minus_quali` missing ⇔ `quali_missing`; `reached_q3` missing ⇔ `no_q3_format` or `quali_missing`; driver form missing together ⇔ debut (`drv_experience = 0`).
+- **Indicators (built from the raw values, before filling):** `q1_time_missing` (qualifying record but no Q1 time; never overlaps `quali_missing`), `drv_form_missing`, `cons_form_missing` → **21 model inputs**. The CSV keeps the 18 features.
+- **Fills (all fitted on training rows of the model concerned):**
 
-1. **Models:** baseline (e.g. logistic regression on grid) + ≥ 2 statistical models + shallow NN; ROC-AUC, PR-AUC, F1 on val/test; threshold chosen on validation. Podium rate ~14%, so PR-AUC matters.
-2. **Two model versions on the same validation/test seasons:** **A** = 2003+ (full qualifying); **B** = all years 1950–2018 for training, missing qualifying left as NaN + flag. (Replaces the earlier "grid only, all seasons" idea.)
-3. Ablation by feature group (grid, qualifying, standings, form); ≥ 2 preprocessing-order experiments; XAI; inference function; report.
+  | Gap | Fill | Model A value | Model B value |
+  |---|---|---|---|
+  | `gap_q1_pct`, qualifying record but no Q1 time (A 94 rows, podium 4.3%; B 125, 5.6%) | training 95th percentile (slow lap) | 5.185 | 5.697 |
+  | `gap_q1_pct`, no qualifying record (A 19 rows; B 14,189) | training median (neutral), `quali_missing` kept | 1.359 | 1.533 |
+  | `grid_minus_quali` | 0 (no known penalty) | 0 | 0 |
+  | `reached_q3` | 0 (column stays 0/1; flags explain the gap) | 0 | 0 |
+  | driver form / team form | training medians (+ indicators) | 0 / 11.4 / 0.2 / 0 | 0 / 12.0 / 0.4 / 0 |
+  | anything else (partial new record only) | training median (continuous), 0 (flags); missing `quali_missing` derived from the qualifying features | | |
+
+- **Outliers:** only `gap_q1_pct` is capped, at the training 99th percentile **of observed laps** (A 7.856%, 63 rows; B 9.015%, 78 rows; the largest value was 33.3%). All rows kept. A few capped drivers did reach the podium (4 in A, 3 in B); they stay "among the slowest" after the cap. Not capped: `grid_minus_quali` (real penalty starts), model B field-size values (`drv_champ_pos` up to 104, `n_starters` up to 34).
+- **Scaling:** `StandardScaler` on the 12 continuous features for logistic regression / NN; the 6 flags + 3 indicators stay 0/1; tree pipeline without scaling. Pandas output keeps column names (for SHAP).
+- **Final pipelines:** `PREPROCESSORS[("A" | "B", "scaled" | "tree")]`, each fitted only on its own training rows (A 2003–2018, B 1950–2018); `MODEL_INPUTS["scaled" | "tree"]` (21 names; same set, different order). Use `PREPROCESSORS[...].transform(rows[FINAL_FEATURES])`.
+- **Order experiments (model A rows unless stated; logistic regression; validation PR-AUC with 95% race-resampling interval of the difference):**
+  - Consistency check, not an experiment: median impute → scale vs scale → median impute: 0.7331 vs 0.7330, largest probability difference 0.0026 (only the scaler statistics move).
+  - **E1, KNN impute → scale vs scale → KNN impute:** filled values genuinely differ (e.g. `gap_q1_pct` mean fill 3.24 vs 3.45, all 113 cells differ; `drv_avg_finish_5` mean |difference| 2.1 places), but PR-AUC 0.7368 vs 0.7370, difference +0.0002 [−0.0016, +0.0021]. Order matters for the data, not measurably for this model.
+  - **E2, cap fitted on observed laps → impute vs impute → cap fitted on filled column:** checked first, as asked. Model A: nearly equivalent (cap 7.856 vs 7.764, 64 rows change by ≤ 0.09; PR-AUC 0.7350 vs 0.7348). **Model B: genuinely different** (cap 9.015 vs 6.542, because 64% of the column is median-filled; 221 training laps change by up to 2.47 points), PR-AUC 0.7236 vs 0.7245, difference +0.0009 [−0.0017, +0.0052]. Reported on model B. Kept: cap fitted on observed laps (principle: the cap describes real laps and must not depend on how much data is missing; the score doesn't decide).
+  - Supporting: era filter (model A pre-processing fitted on 1950–2018 vs 2003–2018): scaler means move (DNF rate 0.42 vs 0.23, experience 61 vs 92), PR-AUC identical to 4 decimals (0.7350).
+  - **INVALID demonstration** (fitted on training + validation): PR-AUC unchanged to 4 decimals, largest probability change 0.0043. Shown only to explain the `fit_on_training` guard.
+  - Transformation check (not an order experiment): `log(grid)` 0.7350 (tie), `1/grid` 0.7139, `log(1+experience)` 0.7286, `log(1+gap)` 0.7336, RobustScaler 0.7345, vs final 0.7350; every interval includes 0 → no extra transformation.
+- **Conclusion:** no pre-processing alternative changes validation PR-AUC beyond noise; choices rest on correctness (no leakage, meaningful fills, undistorted cap). Note: Section 4's temporary pipeline (median + 7 duplicate indicators + scaling of flags) scored 0.7384; the final 21-input pipeline gives 0.7350 with the same logistic regression, a difference well inside the noise (bootstrap SD of one score ≈ 0.045).
+- **Checks (5.8), all pass:** no missing values in any output; inputs exactly the 18 features; every learned value equals a hand recomputation from training rows; all fits in section 5 logged as training rows only; 5 partial-record cases filled as designed; A and B give the same 21 names; `final_features.csv` unchanged.
+- **Limitations:** `pit_lane_start` has 7 model-A training rows (pit-lane starts are only recorded as `grid = 0` from 2015); `no_q3_format` is always 0 in validation/test; model B's `quali_missing` mostly marks old eras, and one coefficient per feature can't adapt to different eras; validation reuse (60 races) makes every small difference here noise.
+
+### 7.3 Section 6: Predictive modeling. Plan approved 17 Oct 2026 (with adjustments), BUILT and FROZEN 17 Oct 2026
+
+Notebook layout: 6.1 set-up, guards, metrics · 6.2 forward-chaining CV + selection rules + grids · 6.3 baselines · 6.4 logistic regression · 6.5 random forest · 6.6 gradient boosting · 6.7 PyTorch network (+ final fits, 3-seed check, LR weights) · 6.8 thresholds · 6.9 validation, overfitting, calibration · 6.10 model A vs B + training-window experiments · 6.11 primary model + freeze + guards.
+
+- **Cross-validation (tuning):** 4 forward-chaining folds scoring 2011–12, 13–14, 15–16, 17–18 (158 races); fold training = all earlier training seasons (A from 2003, B from 1950; identical scoring rows asserted). Pre-processing re-fitted inside every fold. **Validation (2019–2021) used once per final model, never for a choice.**
+- **Selection rule:** best mean fold PR-AUC; ties = settings not clearly worse by a **paired** one-standard-error rule (mean per-fold shortfall vs the best ≤ standard error of those shortfalls), closed upwards (any setting scoring at least as high as a tie is a tie); among ties the simplest/most regularised by a fixed per-family order. (See the trial log for the two corrections to this rule.)
+- **Network:** PyTorch, Adam lr 0.001, batch 256, BCE loss; early stopping on an inner subset = the last 2 seasons of each fold's training period (pre-processing fitted on the inner training seasons), patience 15, max 200 epochs; then retrained on the whole fold training period for that epoch count and scored on the fold; final fit trains for the median of the 4 folds' best epochs. Deterministic mode, 1 thread per job; (setting, fold) jobs run in parallel processes (joblib), results identical to sequential.
+- **Chosen settings:**
+
+  | Family | Model A (2003–2018) | Model B (1950–2018) |
+  |---|---|---|
+  | logistic regression | `C` 1, no class weight (4 of 8 tied) | `C` 0.1, no class weight |
+  | random forest (500 trees) | depth 6, min leaf 50, `sqrt` (14 of 18 tied) | depth 6, min leaf 50, `sqrt` |
+  | gradient boosting | lr 0.05, 7 leaves, min leaf 80, 100 trees (3 of 16 tied) | same |
+  | network | 1 layer × 16, dropout 0, weight decay 1e-3, 144 epochs (8 of 12 tied) | 1 × 16, dropout 0, wd 1e-4, 112 epochs |
+
+- **Results, model A** (mean CV PR-AUC → validation PR-AUC / ROC-AUC / Brier; threshold from out-of-fold predictions → validation precision / recall / F1; F1 top-3 per race):
+
+  | Model | CV PR-AUC | val PR-AUC | val ROC-AUC | Brier | threshold | precision | recall | F1 | F1 top-3 |
+  |---|---|---|---|---|---|---|---|---|---|
+  | rule grid ≤ 3 | (CV F1 0.651) | – | – | – | – | 0.717 | 0.717 | 0.717 | – |
+  | grid-only LR (baseline) | 0.646 | 0.676 | 0.917 | 0.071 | 0.363 | 0.617 | 0.822 | 0.705 | 0.717 |
+  | **logistic regression (primary)** | **0.703** | **0.735** | 0.937 | 0.065 | 0.381 | 0.664 | 0.778 | 0.716 | 0.700 |
+  | random forest | 0.684 | 0.733 | 0.936 | 0.065 | 0.299 | 0.635 | 0.811 | 0.712 | 0.700 |
+  | gradient boosting | 0.693 | 0.721 | 0.938 | 0.064 | 0.387 | 0.675 | 0.783 | 0.725 | 0.717 |
+  | neural network | 0.702 | 0.716 | 0.936 | 0.065 | 0.377 | 0.656 | 0.794 | 0.719 | 0.700 |
+
+- **Paired race-resampling comparisons (validation PR-AUC):** vs grid-only LR: LR +0.059 [+0.011, +0.107], RF +0.057 [+0.012, +0.104], HGB +0.044 [+0.011, +0.085] (all clear); NN +0.039 [−0.002, +0.092] (not clear). vs LR: RF −0.002, HGB −0.014, NN −0.020, **all intervals include 0**. → Features beyond grid help; **no family is clearly best**.
+- **F1 caveat:** the yes/no F1 of every model (0.71–0.72) is about the same as the plain "grid ≤ 3" rule (0.717). The models' gain is in ranking and probabilities (PR-AUC, Brier), not in many more correct yes/no calls.
+- **Overfitting:** PR-AUC train / CV / validation: LR 0.688 / 0.703 / 0.735, RF 0.705 / 0.684 / 0.733, HGB 0.736 / 0.693 / 0.721, NN 0.706 / 0.702 / 0.716. Small gaps (trees regularised). Validation > CV for all: 2019–2021 easier (dominant teams); fold scores range 0.64–0.79 by season.
+- **Network seeds (chosen setting):** CV 0.700 ± 0.003, validation 0.721 ± 0.010 over seeds 42/43/44 (frozen: seed 42).
+- **Calibration:** Brier 0.064–0.065 (baseline 0.071); predicted probabilities sum to 3.0–3.3 per race (3 real podiums). No re-calibration (by decision).
+- **Model A vs B (validation, B − A):** LR −0.014 [−0.038, +0.013], RF −0.002, HGB +0.006, NN +0.016 [−0.006, +0.030]: all intervals include 0. CV within 0.014. **More (older) data does not help.**
+- **Training window (descriptive, validation):** LR: every start before 2003 ≈ −0.011 vs 2003–2018; start 2010 −0.003. HGB: older starts +0.001 to +0.006. **Same size (6,381 rows) from all eras** (5 race samples): LR 0.716 ± 0.009 and HGB 0.712 ± 0.010, below model A's 0.735 / 0.721 → at equal size, modern seasons are more useful; old data only partly makes up through quantity.
+- **Primary model (rule fixed in advance: highest mean CV PR-AUC among model-A families, simpler family if tied by the paired rule):** **logistic regression, model A** (CV 0.703; the network 0.702 tied; LR is simpler).
+- **Freeze:** 8 final models + 2 baselines, fitted objects in `FROZEN_MODELS`, record + fingerprint in `outputs/frozen_models.json`, `predict_frozen()` verified to reproduce the validation predictions exactly. Guards: 697 fits, all on training rows; all 664 CV fits used only seasons before their scoring block (asserted at fit time + from the log); 486 predictions, none on test rows; `final_features.csv` unchanged.
+- **Limitations:** 60 validation races (differences of ~0.02–0.04 are within noise); thresholds from CV folds whose models trained on fewer seasons (they still predicted 209–230 podiums for 180 real ones); 2022 regulation change may lower test scores; `pit_lane_start` / `no_q3_format` carry little usable signal; model B mixes eras with one coefficient per feature; the tie rule was corrected twice after the first runs (trial log).
+
+### 7.4 Later steps
+
+1. **Final test evaluation (separate step, after review):** load the frozen models (`FROZEN_MODELS`, check `FROZEN_FINGERPRINT`), transform 2022–2024 with the fitted pre-processing, report PR-AUC, ROC-AUC, precision/recall/F1 (frozen thresholds), top-3 F1, Brier and confusion matrices for every frozen model, once. No re-tuning.
+2. Ablation by feature group (grid, qualifying, standings, form) with every model; XAI (permutation importance, SHAP global, LIME/local SHAP; not causal); inference function (can reuse `predict_frozen` / `PREPROCESSORS`, which already handle partial records); report.
 
 ---
 
@@ -251,6 +317,12 @@ Notebook layout:
 | Section 4 review: team form grouped by `constructorId` only | Returning IDs reused results from 1955 (Mercedes), 1968 (Honda), 1985 (Alfa Romeo), 1960 (Aston Martin) | History segments split at gaps > 550 days; first race of a segment has no form (4.2.1). 141 rows changed |
 | Section 4 review: notebook and generator differed in 10 section-3 cells (the notebook read `outputs/clean_data/`, the generator didn't) | Regenerating would have silently undone the section-3 change | The notebook's cells were copied into `tools/build_notebook.py`; regenerating now reproduces the notebook exactly |
 | Section 4 text: "5-race form is best", "everyone runs Q1 in the same conditions", "ablation in section 5" | Form-window differences are within noise; 2003–2005 `q1` was a race-fuel lap; section 5 is pre-processing | Text corrected (README 7.1, notebook 4.5/4.6) |
+| Section 5 plan: E2 = capping before vs after imputation | Checked first: for model A the two orders are nearly the same (cap 7.856 vs 7.764), for model B genuinely different (9.015 vs 6.542: the median-filled 64% of the column pulls the percentile down) | E2 reported on model B, model A shown as the near-equivalent case. Median-impute/scale order kept only as a consistency check (scaler ignores NaN when fitted, so it is nearly equivalent) |
+| Section 5 text: "no podium finisher among the capped gap rows" (first draft) | 4 capped model-A rows (3 in B) are podium finishes | Text corrected before running; they stay "among the slowest" after the cap |
+| Section 6 selection rule, v1: one-standard-error rule with the best setting's fold SD ÷ √4 (unpaired) | First development run: every setting tied in every family (8/8, 18/18, 12/12) because the fold SD (~0.06) mostly measures how hard each season is, which is shared by all settings; the rule always picked the simplest setting even when clearly worse (LR `C` 0.01: 0.674 vs best 0.704) | **Paired** rule: per-fold shortfall vs the best setting, tie if its mean ≤ its standard error (all settings are scored on the same folds). A statistical correction, documented here because it was made after seeing the first selections |
+| Section 6 selection rule, v2: paired rule as above | Second run: not monotone: LR `C` 1 + balanced (0.7015, noisy shortfall) counted as a tie while `C` 1 without weights (0.7032, small but consistent shortfall) did not | Ties closed upwards: any setting with a mean at least as high as a tie's is a tie. Final rule (v3). Effect: LR model A `C` 1 without class weight (probabilities sum to ~3.2 per race instead of ~6.3 with balanced weights) |
+| Section 6: random forest with `n_jobs=-1` | Predictions differed in the last floating-point digits between calls, so the frozen-model reproduction check failed | `n_jobs=1` everywhere: bit-for-bit reproducible (parallelism moved to the CV jobs) |
+| Section 6: CV jobs run one after another | Model-B searches alone took ~25 min (network: ~130 ms per epoch on 20k rows, Python overhead) | (setting, fold) jobs in parallel processes with joblib; each job seeded, so results are identical (best CV scores reproduced exactly); section 6 now ~8–10 min |
 
 ---
 

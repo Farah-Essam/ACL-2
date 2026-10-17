@@ -3388,6 +3388,1755 @@ display(back["split"].value_counts().rename("rows").to_frame().T)
 ''')
 
 
+# ================================================================ 5. PRE-PROCESSING
+md(r"""
+# 5. Pre-processing
+
+**Goal:** turn the 18 final features into model inputs with **no missing values** and comparable scales, without leaking anything from the validation or test seasons.
+
+Rules for this section:
+- **Every learned value** (percentiles, medians, scaler means and spreads) is **fitted on training rows only**, then applied unchanged to validation (and, in the final evaluation, test). Model A fits on 2003–2018, model B on 1950–2018, **separately**.
+- `outputs/final_features.csv` is **read, never changed**; it keeps the 18 features with their missing values. Pre-processing happens inside a scikit-learn `Pipeline`, so the same steps can be applied to a single new record later.
+- The **test seasons are not used** in this section.
+- The only model here is a temporary **logistic regression**, used to compare pre-processing alternatives. Model training and tuning come in the next section.
+
+Plan: 5.1 load and feature types · 5.2 missing-value audit · 5.3 the imputation step · 5.4 outliers (`gap_q1_pct` cap) · 5.5 scaling · 5.6 order experiments · 5.7 final pipelines · 5.8 leakage and behaviour checks.
+""")
+
+# ---------------------------------------------------------------- 5.1
+md(r"""
+## 5.1 Load the feature table and classify the features
+
+Section 5 starts from the exported file (4.7), to show that it is enough on its own. The 18 features are either **continuous** (positions, rates, gaps, counts, age) or **binary flags** (0/1). The identifier columns (`raceId`, `driverId`, `year`, `split`) and the target `podium` are **never inputs**.
+""")
+
+code(r'''
+import hashlib
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import KNNImputer
+from sklearn.metrics import f1_score, precision_recall_curve
+from sklearn.pipeline import Pipeline
+
+FF_SHA_BEFORE = hashlib.sha256(FINAL_FEATURES_PATH.read_bytes()).hexdigest()   # checked again in 5.8
+data = pd.read_csv(FINAL_FEATURES_PATH, keep_default_na=False, na_values=[""], float_precision="round_trip")
+pd.testing.assert_frame_equal(data, final_features_df, check_dtype=False, check_exact=True)
+
+NOT_INPUTS = ["raceId", "driverId", "year", "split", "podium"]
+BINARY_FEATURES = ["pit_lane_start", "reached_q3", "no_q3_format", "quali_missing", "drv_no_standing_yet", "cons_no_standing_yet"]
+CONTINUOUS_FEATURES = [c for c in FINAL_FEATURES if c not in BINARY_FEATURES]
+DRV_FORM = [f"drv_podium_rate_{FORM_WINDOW}", f"drv_avg_finish_{FORM_WINDOW}", f"drv_dnf_rate_{FORM_WINDOW}"]
+CONS_FORM = f"cons_podium_rate_{FORM_WINDOW}"
+assert set(CONTINUOUS_FEATURES) | set(BINARY_FEATURES) == set(FINAL_FEATURES) and not set(NOT_INPUTS) & set(FINAL_FEATURES)
+assert all(set(data[c].dropna().unique()) <= {0, 1} for c in BINARY_FEATURES)
+
+# The three row sets used in this section. Test rows are never selected.
+TRAIN_A_ROWS = data[(data["split"] == "train") & (data["year"] >= MODEL_START_YEAR)].reset_index(drop=True)
+TRAIN_B_ROWS = data[data["split"] == "train"].reset_index(drop=True)
+VAL_ROWS = data[data["split"] == "validation"].reset_index(drop=True)
+SETS = {"train A (2003-2018)": TRAIN_A_ROWS, "train B (1950-2018)": TRAIN_B_ROWS, "validation (2019-2021)": VAL_ROWS}
+
+display(pd.DataFrame({"feature": FINAL_FEATURES,
+                      "type": ["binary 0/1" if c in BINARY_FEATURES else "continuous" for c in FINAL_FEATURES],
+                      "range in train A": [f"{TRAIN_A_ROWS[c].min():g} to {TRAIN_A_ROWS[c].max():g}" for c in FINAL_FEATURES]}))
+print({name: len(rows) for name, rows in SETS.items()}, "| not inputs:", NOT_INPUTS)
+''')
+
+# ---------------------------------------------------------------- 5.2
+md(r"""
+## 5.2 Missing-value audit
+
+Seven of the 18 features have gaps. Before choosing how to fill them, we check **why** each one is missing and whether the fact that it is missing says something about podium chances.
+""")
+
+code(r'''
+miss = pd.DataFrame({f"{name} n": rows[FINAL_FEATURES].isna().sum() for name, rows in SETS.items()})
+for name, rows in SETS.items():
+    miss[f"{name} %"] = (100 * rows[FINAL_FEATURES].isna().mean()).round(1)
+miss = miss[miss.filter(like=" n").sum(axis=1) > 0]
+display(miss)
+
+fig, ax = plt.subplots(figsize=(11, 3.6))
+pct = miss.filter(like=" %")
+pct.plot.bar(ax=ax, color=["#4C72B0", "#DD8452", "#55A868"])
+ax.set_ylabel("missing %")
+ax.set_title("Missing values per feature (only the 7 features with gaps)")
+ax.legend([c.replace(" %", "") for c in pct.columns], fontsize=8)
+plt.xticks(rotation=20, ha="right")
+plt.tight_layout()
+plt.show()
+''')
+
+code(r'''
+# WHY values are missing: each gap has one exact cause (checked on all non-test rows).
+nontest = pd.concat([TRAIN_B_ROWS, VAL_ROWS])
+causes = {
+    "grid_minus_quali missing  <=>  quali_missing = 1":
+        (nontest["grid_minus_quali"].isna() == (nontest["quali_missing"] == 1)).all(),
+    "reached_q3 missing  <=>  no_q3_format = 1 or quali_missing = 1":
+        (nontest["reached_q3"].isna() == ((nontest["no_q3_format"] == 1) | (nontest["quali_missing"] == 1))).all(),
+    "the 3 driver-form features are missing together  <=>  drv_experience = 0 (debut)":
+        ((nontest[DRV_FORM].isna().all(axis=1) == nontest[DRV_FORM].isna().any(axis=1))
+         & (nontest[DRV_FORM[0]].isna() == (nontest["drv_experience"] == 0))).all(),
+}
+for k, v in causes.items():
+    assert v, k
+    print("OK ", k)
+
+# Does missingness carry information? Podium rate when a value is missing vs overall.
+def missing_profile(rows):
+    no_q1 = rows["gap_q1_pct"].isna() & (rows["quali_missing"] == 0)
+    groups = {"qualifying exists, no Q1 time": no_q1, "no qualifying record (quali_missing)": rows["quali_missing"] == 1,
+              "driver form missing (debut)": rows[DRV_FORM[0]].isna(), "team form missing (new team / comeback)": rows[CONS_FORM].isna(),
+              "all rows": pd.Series(True, index=rows.index)}
+    return pd.DataFrame({g: {"rows": int(m.sum()), "podium %": round(100 * rows.loc[m, "podium"].mean(), 1) if m.any() else np.nan,
+                             "median grid": rows.loc[m, "grid"].median() if m.any() else np.nan} for g, m in groups.items()}).T
+print("\nTrain A (2003-2018):")
+display(missing_profile(TRAIN_A_ROWS))
+print("Train B (1950-2018):")
+display(missing_profile(TRAIN_B_ROWS))
+''')
+
+md(r"""
+**What the audit shows.**
+- **`gap_q1_pct` has two different kinds of gap.** (1) The driver **has a qualifying entry but no Q1 time** (crash, no lap set, lap deleted): these drivers start near the back and rarely reach the podium, so the gap means *slow*. (2) There is **no qualifying record at all** (most of model B's seasons): the data is simply absent, which says nothing about pace; `quali_missing` already marks it.
+- **`grid_minus_quali` and `reached_q3`** are missing **exactly** when `quali_missing` (or, for `reached_q3`, `no_q3_format`) is 1. The existing flags already describe these gaps, so a new indicator would only duplicate them.
+- **Driver form** is missing **exactly** on a driver's debut (all three columns together), and **team form** on a team's first race (or first race after a long absence). Both groups reach the podium much less often than average, so the fact that the value is missing is useful.
+- **Standings have no gaps**: they were filled by rule in 4.2 ("behind the last ranked driver, 0% of the leader's points") and carry the `no_standing_yet` flags.
+
+In model B the picture is the same, only much larger: most old seasons have no qualifying record at all.
+""")
+
+# ---------------------------------------------------------------- 5.3
+md(r"""
+## 5.3 The imputation step
+
+One small transformer, `F1Imputer`, does all of the filling. Steps, in this order:
+1. **Indicators first**, from the raw values (before anything is filled):
+   - `q1_time_missing` = no Q1 time **while a qualifying record exists** (it is never 1 when `quali_missing` is 1, so it doesn't duplicate that flag);
+   - `drv_form_missing` = the driver has no earlier race (debut);
+   - `cons_form_missing` = the team has no earlier race in its current history segment.
+2. **Fit on the training rows** (observed values only): the 95th and 99th percentiles and the median of `gap_q1_pct`, and the median of every continuous feature.
+3. **Fill:**
+
+| Gap | Filled with | Why |
+|---|---|---|
+| `gap_q1_pct`, qualifying record but no Q1 time | training **95th percentile** of the gap (a slow lap) | these drivers start at the back; the median would make them look mid-field, and 0 would make them look fastest |
+| `gap_q1_pct`, no qualifying record | training **median** (neutral) | the data is absent, not slow; `quali_missing` stays in the model |
+| `grid_minus_quali` | **0** ("no known penalty"; also the training median) | missing exactly when `quali_missing` = 1 |
+| `reached_q3` | **0**, keeping the column 0/1 | missing exactly when `no_q3_format` or `quali_missing` = 1; with those flags in the model, the constant doesn't limit what a linear model can learn |
+| driver form (3), team form | training **median** | the indicators carry the "debut / new team" information |
+| anything else (only possible in a new, partial record) | training median (continuous) or 0 (flags); a missing `quali_missing` is derived from whether the qualifying features are present | lets one incomplete record be scored safely |
+
+4. **Cap** `gap_q1_pct` at the training **99th percentile** (5.4). The cap is fitted on **observed** laps only, before any filling, so filled values can't move it.
+
+The output has **21 columns**: the 18 features (no missing values left) + the 3 indicators.
+""")
+
+code(r'''
+INDICATORS = ["q1_time_missing", "drv_form_missing", "cons_form_missing"]
+
+
+class F1Imputer(BaseEstimator, TransformerMixin):
+    """Missingness indicators, gap_q1_pct cap and fills for the 18 final features.
+
+    Every learned value comes from the rows passed to fit(). fill=False only adds the indicators and the cap
+    (used by experiment E1, where KNN imputation does the filling). cap_before_impute=False fits the cap on the
+    filled column instead of the observed laps (experiment E2).
+    """
+
+    def __init__(self, cap_quantile=0.99, slow_quantile=0.95, cap_before_impute=True, fill=True):
+        self.cap_quantile = cap_quantile
+        self.slow_quantile = slow_quantile
+        self.cap_before_impute = cap_before_impute
+        self.fill = fill
+
+    @staticmethod
+    def _prepare(X):
+        X = pd.DataFrame(X, columns=FINAL_FEATURES) if not isinstance(X, pd.DataFrame) else X[FINAL_FEATURES]
+        X = X.astype(float).copy()
+        # A partial record may lack the flag itself: no qualifying features at all -> no qualifying record.
+        unknown = X["quali_missing"].isna()
+        X.loc[unknown, "quali_missing"] = (X.loc[unknown, "gap_q1_pct"].isna()
+                                           & X.loc[unknown, "grid_minus_quali"].isna()).astype(float)
+        return X
+
+    @staticmethod
+    def _indicators(X):
+        return pd.DataFrame({"q1_time_missing": (X["gap_q1_pct"].isna() & (X["quali_missing"] == 0)).astype(float),
+                             "drv_form_missing": X[DRV_FORM].isna().all(axis=1).astype(float),
+                             "cons_form_missing": X[CONS_FORM].isna().astype(float)}, index=X.index)
+
+    def _fill_gap(self, X, ind):
+        gap = X["gap_q1_pct"].copy()
+        gap[ind["q1_time_missing"] == 1] = self.gap_slow_
+        return gap.fillna(self.gap_neutral_)
+
+    def fit(self, X, y=None):
+        X = self._prepare(X)
+        observed = X["gap_q1_pct"].dropna()
+        self.gap_slow_ = float(observed.quantile(self.slow_quantile))
+        self.gap_neutral_ = float(observed.median())
+        self.medians_ = X[CONTINUOUS_FEATURES].median()
+        if self.cap_before_impute:
+            self.gap_cap_ = float(observed.quantile(self.cap_quantile))
+        else:
+            self.gap_cap_ = float(self._fill_gap(X, self._indicators(X)).quantile(self.cap_quantile))
+        self.n_features_in_ = len(FINAL_FEATURES)
+        self.feature_names_in_ = np.array(FINAL_FEATURES, dtype=object)
+        return self
+
+    def transform(self, X):
+        X = self._prepare(X)
+        ind = self._indicators(X)                       # 1. indicators from the raw values
+        if self.fill:
+            X["gap_q1_pct"] = self._fill_gap(X, ind)
+            X["grid_minus_quali"] = X["grid_minus_quali"].fillna(0.0)
+            X["reached_q3"] = X["reached_q3"].fillna(0.0)
+            X[CONTINUOUS_FEATURES] = X[CONTINUOUS_FEATURES].fillna(self.medians_)   # form features + partial records
+            X[BINARY_FEATURES] = X[BINARY_FEATURES].fillna(0.0)
+        X["gap_q1_pct"] = X["gap_q1_pct"].clip(upper=self.gap_cap_)
+        return pd.concat([X, ind], axis=1)
+
+    def get_feature_names_out(self, input_features=None):
+        return np.array(FINAL_FEATURES + INDICATORS, dtype=object)
+
+
+def make_preprocessor(scaled=True, **imputer_args):
+    """scaled=True: for logistic regression and the neural network. scaled=False: for tree models."""
+    steps = [("impute", F1Imputer(**imputer_args))]
+    if scaled:
+        steps.append(("scale", ColumnTransformer([("continuous", StandardScaler(), CONTINUOUS_FEATURES)],
+                                                 remainder="passthrough", verbose_feature_names_out=False)))
+    return Pipeline(steps).set_output(transform="pandas")
+
+
+FIT_LOG = []   # every pre-processing fit in this section is recorded, to prove that only training rows were used
+
+
+def fit_on_training(pipe, rows, label):
+    assert set(rows["split"]) == {"train"}, f"{label}: fit on non-training rows"
+    FIT_LOG.append({"fit": label, "rows": len(rows), "splits": ",".join(sorted(set(rows["split"]))),
+                    "seasons": f"{rows['year'].min()}-{rows['year'].max()}"})
+    return pipe.fit(rows[FINAL_FEATURES])
+
+
+imp_A = fit_on_training(F1Imputer(), TRAIN_A_ROWS, "F1Imputer, model A")
+imp_B = fit_on_training(F1Imputer(), TRAIN_B_ROWS, "F1Imputer, model B")
+display(pd.DataFrame({
+    "model A (fitted on 2003-2018)": [imp_A.gap_slow_, imp_A.gap_neutral_, imp_A.gap_cap_] + list(imp_A.medians_[DRV_FORM + [CONS_FORM]]),
+    "model B (fitted on 1950-2018)": [imp_B.gap_slow_, imp_B.gap_neutral_, imp_B.gap_cap_] + list(imp_B.medians_[DRV_FORM + [CONS_FORM]]),
+}, index=["gap_q1_pct fill: no Q1 time (95th pct)", "gap_q1_pct fill: no qualifying record (median)", "gap_q1_pct cap (99th pct)"]
+   + [f"{c} fill (median)" for c in DRV_FORM + [CONS_FORM]]).round(3))
+
+# Model B check: does the rule still make sense with its very different qualifying coverage?
+for name, rows, imp in [("A", TRAIN_A_ROWS, imp_A), ("B", TRAIN_B_ROWS, imp_B)]:
+    out = imp.transform(rows[FINAL_FEATURES])
+    print(f"Model {name}: q1_time_missing = 1 on {int(out['q1_time_missing'].sum())} rows "
+          f"(podium {100 * rows.loc[out['q1_time_missing'] == 1, 'podium'].mean():.1f}%), "
+          f"quali_missing = 1 on {int(rows['quali_missing'].sum())} rows; "
+          f"q1_time_missing and quali_missing both 1: {int(((out['q1_time_missing'] == 1) & (out['quali_missing'] == 1)).sum())}; "
+          f"missing values left: {int(out.isna().sum().sum())}")
+''')
+
+md(r"""
+**What this did.**
+- The fitted values differ between the models because their training seasons differ (model B also includes the 1994–2002 qualifying data, with bigger gaps). Each model keeps its own values.
+- **Model B check:** the rule holds. `q1_time_missing` is 1 only for drivers who have a qualifying record without a Q1 time; it never overlaps with `quali_missing`. The thousands of model-B rows with no qualifying record get the **neutral** median and keep `quali_missing = 1`, so old seasons are not treated as "slow".
+- No missing values are left after this step.
+""")
+
+# ---------------------------------------------------------------- 5.4
+md(r"""
+## 5.4 Outliers: capping `gap_q1_pct`
+
+`gap_q1_pct` has a long right tail: a handful of Q1 laps are 10–33% slower than the fastest (rain, a damaged car, a lap aborted early). Beyond a few percent these drivers almost never reach the podium, so the exact size of the gap adds nothing, but one extreme lap stretches the scale that the neural network and the scaler rely on. We **cap** it at the training 99th percentile: every row is kept and the order of the values is unchanged; only the extreme values are pulled in.
+
+Not capped, on purpose:
+- **`grid_minus_quali`** (up to +23): a big value is a real penalty start, exactly the "qualified fast, started at the back" signal found in Q1.
+- **Model B's** `drv_champ_pos` (up to 104), `n_starters` (up to 34), `drv_avg_finish_5` (up to 31): real field sizes of the 1950s–80s.
+""")
+
+code(r'''
+fig, axes = plt.subplots(1, 2, figsize=(14, 3.8))
+for ax, (name, rows, imp) in zip(axes, [("model A, train 2003-2018", TRAIN_A_ROWS, imp_A), ("model B, train 1950-2018", TRAIN_B_ROWS, imp_B)]):
+    raw = rows["gap_q1_pct"].dropna()
+    after = imp.transform(rows[FINAL_FEATURES])["gap_q1_pct"]
+    bins = np.linspace(0, max(raw.max(), 1), 70)
+    ax.hist(raw, bins=bins, color="#8C8C8C", alpha=0.7, label=f"before: observed laps (n={len(raw):,})")
+    ax.hist(after, bins=bins, color="#4C72B0", alpha=0.5, label=f"after: capped + filled (n={len(after):,})")
+    ax.axvline(imp.gap_cap_, color="#C44E52", ls="--", label=f"cap = {imp.gap_cap_:.2f}%")
+    ax.axvline(imp.gap_slow_, color="#DD8452", ls=":", label=f"'no Q1 time' fill = {imp.gap_slow_:.2f}%")
+    ax.set_yscale("log")
+    ax.set_xlabel("gap to the fastest Q1 lap (%)")
+    ax.set_ylabel("rows (log scale)")
+    ax.set_title(f"gap_q1_pct before / after ({name})", fontsize=10)
+    ax.legend(fontsize=7)
+plt.tight_layout()
+plt.show()
+
+cap_table = []
+for name, rows, imp in [("A", TRAIN_A_ROWS, imp_A), ("B", TRAIN_B_ROWS, imp_B)]:
+    raw = rows["gap_q1_pct"]
+    capped = raw > imp.gap_cap_
+    cap_table.append({"model": name, "cap (%)": round(imp.gap_cap_, 2), "rows capped": int(capped.sum()),
+                      "largest value before": round(raw.max(), 2), "podiums among capped rows": int(rows.loc[capped, "podium"].sum()),
+                      "rows kept": len(rows)})
+display(pd.DataFrame(cap_table))
+''')
+
+md(r"""
+**What this shows.** The cap only touches the far tail (about 1% of observed laps; the table gives the counts). A few of those drivers still reached the podium (a slow Q1 lap in changing weather, or a quick driver who only needed one run to get through): after the cap they are still among the slowest Q1 laps, just not by an extreme number, and their rows are kept. The order of the values doesn't change, so a tree model sees the same splits. The second spike in the "after" histogram is the "no Q1 time" fill (a slow lap), and the neutral median fill for rows with no qualifying record sits in the bulk of the distribution (in model B this is a large spike, because most old seasons have no qualifying data).
+""")
+
+# ---------------------------------------------------------------- 5.5
+md(r"""
+## 5.5 Scaling
+
+- **Logistic regression and the neural network:** the 12 continuous features are **standardised** (training mean 0, standard deviation 1). Logistic regression's penalty and neural-network training both work best when features have similar scales; here they range from 0–1 (rates) to 0–324 (`drv_experience`).
+- **The 6 flags and 3 indicators stay 0/1**, so a coefficient still reads as "the effect of the flag being on".
+- **Tree models** (random forest, gradient boosting) get the same imputed table **without scaling**: a tree only uses the order of a feature's values, which scaling doesn't change.
+- No other transformation (log of grid, 1/grid, log of experience, log of the gap, a robust scaler) is applied: the check at the end of 5.6 shows none of them improves validation PR-AUC beyond noise, so they would add complexity without evidence.
+
+Column names are kept (pandas output), so later explanations (SHAP) can name every input.
+""")
+
+code(r'''
+scaled_A = fit_on_training(make_preprocessor(scaled=True), TRAIN_A_ROWS, "scaled pipeline, model A")
+after = scaled_A.transform(TRAIN_A_ROWS[FINAL_FEATURES])
+before = imp_A.transform(TRAIN_A_ROWS[FINAL_FEATURES])
+
+fig, axes = plt.subplots(1, 2, figsize=(15, 4.2))
+axes[0].boxplot([before[c] for c in CONTINUOUS_FEATURES], showfliers=False)
+axes[0].set_title("Continuous features after imputation, before scaling (train A)")
+axes[1].boxplot([after[c] for c in CONTINUOUS_FEATURES], showfliers=False)
+axes[1].set_title("After standardising (train A)")
+for ax in axes:
+    ax.set_xticks(range(1, len(CONTINUOUS_FEATURES) + 1), CONTINUOUS_FEATURES, rotation=60, ha="right", fontsize=8)
+plt.tight_layout()
+plt.show()
+
+summary = pd.DataFrame({"mean": after[CONTINUOUS_FEATURES].mean(), "std": after[CONTINUOUS_FEATURES].std(ddof=0)}).round(3)
+assert np.allclose(summary["mean"], 0, atol=1e-9) and np.allclose(summary["std"], 1, atol=1e-9)
+print("Train A after scaling: every continuous feature has mean 0 and standard deviation 1.")
+assert all(set(after[c].unique()) <= {0, 1} for c in BINARY_FEATURES + INDICATORS)
+print("Flags and indicators are still 0/1. Output columns:", list(after.columns))
+''')
+
+# ---------------------------------------------------------------- 5.6
+md(r"""
+## 5.6 Pre-processing order experiments
+
+The brief asks for at least two experiments where only the **order** of pre-processing steps changes. Common setup for every experiment:
+- the same **model A training rows** (2003–2018, unless stated) and the same **1,199 validation rows**;
+- the same downstream model: logistic regression (default settings, `max_iter=5000`), refitted for each version;
+- every learned value fitted on **training rows only**;
+- scores: validation **PR-AUC** (main) and **ROC-AUC**, and **F1** at the threshold that maximises F1 on the *training* predictions (so validation isn't used to choose it). The 95% interval of the PR-AUC difference comes from resampling the 60 validation races 500 times.
+
+A first check showed which orders are worth testing:
+- **Median imputation then scaling vs scaling then median imputation** is *not* a real experiment: the scaler ignores missing values when it is fitted, so both orders give almost the same numbers (only the scaler's mean and spread move slightly). It is shown below as a consistency check.
+- **E1** (KNN imputation vs scaling) and **E2** (capping vs imputation) do change the transformed data, so they are the two experiments.
+""")
+
+code(r'''
+y_val = VAL_ROWS["podium"].to_numpy()
+val_race = VAL_ROWS["raceId"].to_numpy()
+rng_s5 = np.random.default_rng(42)
+val_races = np.unique(val_race)
+VAL_BOOT = [np.concatenate([np.flatnonzero(val_race == r) for r in rng_s5.choice(val_races, len(val_races))]) for _ in range(500)]
+EXPERIMENTS = []
+EXP_PREDS = {}
+
+
+def evaluate_preprocessing(name, pre, train_rows=None, model_rows=None, fit_label=None, valid=True):
+    """Fit `pre` on training rows, fit logistic regression on the model rows, score validation."""
+    train_rows = TRAIN_A_ROWS if train_rows is None else train_rows
+    model_rows = train_rows if model_rows is None else model_rows
+    if valid:
+        fit_on_training(pre, train_rows, fit_label or name)
+    else:
+        pre.fit(train_rows[FINAL_FEATURES])                     # only for the labelled INVALID demonstration
+    X_tr, X_va = pre.transform(model_rows[FINAL_FEATURES]), pre.transform(VAL_ROWS[FINAL_FEATURES])
+    assert not X_tr.isna().any().any() and not X_va.isna().any().any()
+    lr = LogisticRegression(max_iter=5000).fit(X_tr, model_rows["podium"])
+    p_tr, p_va = lr.predict_proba(X_tr)[:, 1], lr.predict_proba(X_va)[:, 1]
+    prec, rec, thr = precision_recall_curve(model_rows["podium"], p_tr)
+    f1s = 2 * prec[:-1] * rec[:-1] / np.clip(prec[:-1] + rec[:-1], 1e-12, None)
+    threshold = thr[np.argmax(f1s)]
+    EXP_PREDS[name] = p_va
+    res = {"version": name, "val PR-AUC": round(average_precision_score(y_val, p_va), 4),
+           "val ROC-AUC": round(roc_auc_score(y_val, p_va), 4), "threshold (from train)": round(float(threshold), 3),
+           "val F1": round(f1_score(y_val, p_va >= threshold), 4)}
+    EXPERIMENTS.append(res)
+    return res, pre
+
+
+def pr_auc_difference(a, b):
+    """PR-AUC(b) - PR-AUC(a) with a 95% race-resampling interval."""
+    pa, pb = EXP_PREDS[a], EXP_PREDS[b]
+    d = [average_precision_score(y_val[i], pb[i]) - average_precision_score(y_val[i], pa[i]) for i in VAL_BOOT]
+    point = average_precision_score(y_val, pb) - average_precision_score(y_val, pa)
+    lo, hi = np.percentile(d, [2.5, 97.5])
+    return f"{point:+.4f} (95% interval {lo:+.4f} to {hi:+.4f})"
+
+
+# Consistency check: median imputation and standard scaling in both orders (no cap, no indicators).
+r1, _ = evaluate_preprocessing("check: median impute -> scale",
+                               make_pipeline(SimpleImputer(strategy="median"), StandardScaler()).set_output(transform="pandas"))
+r2, _ = evaluate_preprocessing("check: scale -> median impute",
+                               make_pipeline(StandardScaler(), SimpleImputer(strategy="median")).set_output(transform="pandas"))
+display(pd.DataFrame([r1, r2]))
+diff = np.abs(EXP_PREDS["check: median impute -> scale"] - EXP_PREDS["check: scale -> median impute"])
+print(f"Largest difference in a validation probability: {diff.max():.4f}; PR-AUC difference "
+      f"{pr_auc_difference('check: median impute -> scale', 'check: scale -> median impute')}")
+''')
+
+md(r"""
+**Consistency check.** As expected, the two orders give nearly the same model: the imputed value is the same median either way, and only the scaler's statistics shift a little (they include the filled values in one order and not in the other). This pair is therefore **not** used as one of the two experiments.
+""")
+
+md(r"""
+### E1: KNN imputation before scaling vs scaling before KNN imputation
+
+**What KNN imputation does:** a missing value is filled with the average of the **5 most similar training rows**, where "similar" is a distance computed over all features.
+- **Hypothesis:** without scaling, the distance is dominated by the features with large numbers (`drv_experience` 0–324, `drv_champ_pos`, `grid`), so the "similar" rows are mostly drivers with similar experience. After scaling, every feature counts equally. The **filled values should change**; whether the model's quality changes is the question.
+- **A:** indicators + cap → **KNN impute → scale** → logistic regression. **B:** indicators + cap → **scale → KNN impute** → logistic regression.
+- **Only the order changes.** Same rows, same 21 inputs, same indicators and cap (both fitted on training rows), same model.
+""")
+
+code(r'''
+scale_step = lambda: ColumnTransformer([("continuous", StandardScaler(), CONTINUOUS_FEATURES)], remainder="passthrough",
+                                       verbose_feature_names_out=False)
+E1_A = Pipeline([("indicators_cap", F1Imputer(fill=False)), ("knn", KNNImputer(n_neighbors=5)), ("scale", scale_step())]).set_output(transform="pandas")
+E1_B = Pipeline([("indicators_cap", F1Imputer(fill=False)), ("scale", scale_step()), ("knn", KNNImputer(n_neighbors=5))]).set_output(transform="pandas")
+rA, E1_A = evaluate_preprocessing("E1-A: KNN impute -> scale", E1_A)
+rB, E1_B = evaluate_preprocessing("E1-B: scale -> KNN impute", E1_B)
+display(pd.DataFrame([rA, rB]))
+print("PR-AUC difference (B - A):", pr_auc_difference("E1-A: KNN impute -> scale", "E1-B: scale -> KNN impute"))
+
+# How different are the FILLED values? Compare both in original units (train A rows that had a gap).
+raw = TRAIN_A_ROWS[FINAL_FEATURES]
+filled_A = E1_A[:-1].transform(raw)                                        # before scaling = original units
+sc_B = E1_B.named_steps["scale"].named_transformers_["continuous"]
+filled_B = E1_B.transform(raw)
+filled_B[CONTINUOUS_FEATURES] = sc_B.inverse_transform(filled_B[CONTINUOUS_FEATURES])
+rows_e1 = []
+for c in ["gap_q1_pct", "grid_minus_quali", "reached_q3"] + DRV_FORM + [CONS_FORM]:
+    m = raw[c].isna().to_numpy()
+    a, b = filled_A.loc[m, c].to_numpy(), filled_B.loc[m, c].to_numpy()
+    rows_e1.append({"feature": c, "filled cells": int(m.sum()), "mean fill, A (raw scale)": round(a.mean(), 3),
+                    "mean fill, B (scaled)": round(b.mean(), 3), "mean |A - B|": round(np.abs(a - b).mean(), 3),
+                    "cells that differ": int((~np.isclose(a, b)).sum())})
+display(pd.DataFrame(rows_e1))
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 3.8))
+m = raw["gap_q1_pct"].isna().to_numpy()
+bins = np.linspace(0, 8, 33)
+axes[0].hist(raw["gap_q1_pct"].dropna().clip(upper=8), bins=bins, density=True, color="#8C8C8C", alpha=0.5, label="observed laps")
+axes[0].hist(filled_A.loc[m, "gap_q1_pct"], bins=bins, density=True, histtype="step", lw=2, color="#4C72B0", label="filled, A: KNN on raw values")
+axes[0].hist(filled_B.loc[m, "gap_q1_pct"], bins=bins, density=True, histtype="step", lw=2, color="#DD8452", label="filled, B: KNN on scaled values")
+axes[0].set_xlabel("gap_q1_pct (%)")
+axes[0].set_title("E1: values KNN fills in for missing gap_q1_pct (train A)", fontsize=10)
+axes[0].legend(fontsize=8)
+for name, color in [("E1-A: KNN impute -> scale", "#4C72B0"), ("E1-B: scale -> KNN impute", "#DD8452")]:
+    p, r, _ = precision_recall_curve(y_val, EXP_PREDS[name])
+    axes[1].plot(r, p, color=color, label=f"{name} (PR-AUC {average_precision_score(y_val, EXP_PREDS[name]):.3f})")
+axes[1].set_xlabel("recall")
+axes[1].set_ylabel("precision")
+axes[1].set_title("E1: validation precision-recall curves", fontsize=10)
+axes[1].legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+### E2: capping before imputation vs imputation before capping
+
+- **Hypothesis:** the cap is a percentile. If it is fitted **after** filling, the filled values take part in the percentile and pull it toward them. That matters most where many values are filled, i.e. **model B** (most old seasons have no qualifying record, filled with the median).
+- **A (our pipeline):** fit the cap on the **observed** laps → fill → cap. **B:** fill → fit the cap on the **filled** column → cap.
+- **Only the order changes.** Same fills, same scaling, same model; every value fitted on the training rows of the model concerned.
+- **Run for both models.** A first check showed that for **model A** the two orders are almost identical (few values are filled, so the cap barely moves), while for **model B** they genuinely differ. So E2 is reported mainly on **model B** (trained on 1950–2018, scored on the same validation rows), with model A shown for comparison.
+""")
+
+code(r'''
+e2_rows = []
+for model, rows in [("B", TRAIN_B_ROWS), ("A", TRAIN_A_ROWS)]:
+    ra, pa = evaluate_preprocessing(f"E2-A ({model}): cap fitted on observed laps -> impute",
+                                    make_preprocessor(scaled=True, cap_before_impute=True), train_rows=rows)
+    rb, pb = evaluate_preprocessing(f"E2-B ({model}): impute -> cap fitted on filled column",
+                                    make_preprocessor(scaled=True, cap_before_impute=False), train_rows=rows)
+    cap_a, cap_b = pa.named_steps["impute"].gap_cap_, pb.named_steps["impute"].gap_cap_
+    gap_a = pa.named_steps["impute"].transform(rows[FINAL_FEATURES])["gap_q1_pct"]
+    gap_b = pb.named_steps["impute"].transform(rows[FINAL_FEATURES])["gap_q1_pct"]
+    changed = ~np.isclose(gap_a, gap_b)
+    e2_rows.append({"model": model, "cap A (observed)": round(cap_a, 3), "cap B (filled)": round(cap_b, 3),
+                    "training rows whose gap changes": int(changed.sum()), "largest change (pct points)": round(float(np.abs(gap_a - gap_b).max()), 3),
+                    "val PR-AUC A": ra["val PR-AUC"], "val PR-AUC B": rb["val PR-AUC"], "val ROC-AUC A": ra["val ROC-AUC"],
+                    "val ROC-AUC B": rb["val ROC-AUC"], "val F1 A": ra["val F1"], "val F1 B": rb["val F1"],
+                    "PR-AUC difference (B - A)": pr_auc_difference(ra["version"], rb["version"])})
+    if model == "B":
+        E2_PLOT = (rows, gap_a, gap_b, cap_a, cap_b)
+display(pd.DataFrame(e2_rows).set_index("model").T)
+
+rows, gap_a, gap_b, cap_a, cap_b = E2_PLOT
+observed = rows["gap_q1_pct"].notna()
+fig, ax = plt.subplots(figsize=(10, 3.6))
+bins = np.linspace(0, 12, 61)
+ax.hist(rows.loc[observed, "gap_q1_pct"].clip(upper=12), bins=bins, color="#8C8C8C", alpha=0.5, label="observed laps (before)")
+ax.axvline(cap_a, color="#4C72B0", ls="--", label=f"A: cap fitted on observed laps = {cap_a:.2f}%")
+ax.axvline(cap_b, color="#C44E52", ls="--", label=f"B: cap fitted after filling = {cap_b:.2f}%")
+ax.set_yscale("log")
+ax.set_xlabel("gap_q1_pct (%)")
+ax.set_ylabel("rows (log scale)")
+ax.set_title("E2 (model B): where each order puts the cap")
+ax.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+### Supporting diagnostic: fit pre-processing before vs after the era filter
+
+Relevant to the model A vs model B comparison. Model A's logistic regression is trained on 2003–2018 rows in both versions; only the rows used to **fit the pre-processing** change: 2003–2018 (A's own) vs 1950–2018 (B's). Old seasons have different typical values (e.g. many more retirements), so the medians and the scaler move.
+""")
+
+code(r'''
+ra, pa = evaluate_preprocessing("era: pre-processing fitted on 2003-2018", make_preprocessor(scaled=True), train_rows=TRAIN_A_ROWS)
+rb, pb = evaluate_preprocessing("era: pre-processing fitted on 1950-2018", make_preprocessor(scaled=True),
+                                train_rows=TRAIN_B_ROWS, model_rows=TRAIN_A_ROWS)
+display(pd.DataFrame([ra, rb]))
+print("PR-AUC difference:", pr_auc_difference(ra["version"], rb["version"]))
+sa, sb = pa.named_steps["scale"].named_transformers_["continuous"], pb.named_steps["scale"].named_transformers_["continuous"]
+display(pd.DataFrame({"scaler mean, fitted on 2003-2018": sa.mean_, "scaler mean, fitted on 1950-2018": sb.mean_},
+                     index=CONTINUOUS_FEATURES).round(2).loc[["drv_dnf_rate_5", "drv_experience", "drv_champ_pos", "n_starters"]])
+''')
+
+md(r"""
+### Educational demonstration (INVALID, not used): fitting pre-processing on training + validation rows
+
+This shows the leak that the pipeline design prevents. The medians, percentiles and scaler are fitted on **training + validation** rows (so the validation seasons influence how they themselves are transformed), while the model is still trained on training rows only. **This is wrong by design** and is not one of the two experiments.
+""")
+
+code(r'''
+ra, pa = evaluate_preprocessing("valid: pre-processing fitted on training rows", make_preprocessor(scaled=True))
+rb, pb = evaluate_preprocessing("INVALID: pre-processing fitted on training + validation rows", make_preprocessor(scaled=True),
+                                train_rows=pd.concat([TRAIN_A_ROWS, VAL_ROWS]), model_rows=TRAIN_A_ROWS, valid=False)
+display(pd.DataFrame([ra, rb]))
+moved = np.abs(EXP_PREDS[ra["version"]] - EXP_PREDS[rb["version"]])
+print(f"PR-AUC difference: {pr_auc_difference(ra['version'], rb['version'])}; "
+      f"largest change in a validation probability: {moved.max():.4f}")
+''')
+
+md(r"""
+### Transformation check (not an order experiment)
+
+Should any feature be transformed before scaling? Each version changes **one** thing in the final pipeline (5.7) and is compared with it on the same rows. This compares transformations, not orders, so it is not one of the two experiments; it is the evidence for the "no extra transformation" decision in 5.5.
+""")
+
+code(r'''
+from sklearn.preprocessing import FunctionTransformer, RobustScaler
+
+
+def with_extra_step(fn=None, scaler=StandardScaler):
+    steps = [("impute", F1Imputer())]
+    if fn is not None:
+        steps.append(("transform", FunctionTransformer(fn, feature_names_out="one-to-one")))
+    steps.append(("scale", ColumnTransformer([("continuous", scaler(), CONTINUOUS_FEATURES)], remainder="passthrough",
+                                             verbose_feature_names_out=False)))
+    return Pipeline(steps).set_output(transform="pandas")
+
+
+TRANSFORM_VERSIONS = {
+    "final pipeline (no extra transformation)": with_extra_step(),
+    "log(grid) instead of grid": with_extra_step(lambda X: X.assign(grid=np.log(X["grid"]))),
+    "1/grid instead of grid": with_extra_step(lambda X: X.assign(grid=1 / X["grid"])),
+    "log(1 + drv_experience)": with_extra_step(lambda X: X.assign(drv_experience=np.log1p(X["drv_experience"]))),
+    "log(1 + gap_q1_pct)": with_extra_step(lambda X: X.assign(gap_q1_pct=np.log1p(X["gap_q1_pct"]))),
+    "RobustScaler instead of StandardScaler": with_extra_step(scaler=RobustScaler),
+}
+transform_rows = []
+for name, pipe in TRANSFORM_VERSIONS.items():
+    res, _ = evaluate_preprocessing(f"transform check: {name}", pipe)
+    res["PR-AUC difference vs final pipeline"] = ("-" if name.startswith("final") else
+                                                  pr_auc_difference("transform check: final pipeline (no extra transformation)", res["version"]))
+    transform_rows.append(res)
+display(pd.DataFrame(transform_rows).set_index("version"))
+''')
+
+code(r'''
+experiments_df = (pd.DataFrame(EXPERIMENTS).drop_duplicates("version").set_index("version")
+                  .drop(columns="PR-AUC difference vs final pipeline", errors="ignore"))
+print("All pre-processing comparisons in 5.6 (validation, logistic regression):")
+display(experiments_df)
+''')
+
+md(r"""
+**What the experiments show.**
+- **E1 (KNN vs scaling order):** the order genuinely changes the **filled values**: unscaled, the "nearest" rows are chosen mainly by experience and championship position, so the filled gaps and form values differ (table above). But the validation scores of the two versions are within noise of each other: the 95% interval of the difference includes 0. **The order matters for the data, not measurably for this model's quality.** Scaling first is still the principled choice for any distance-based method.
+- **E2 (cap vs imputation order):** for **model B** the order changes the cap a lot (table above), because the many median-filled rows pull the 99th percentile down, so the "filled first" version also cuts down hundreds of real laps that the other version keeps. For model A the two orders are nearly identical. The validation scores differ by less than the noise in both models (the interval of the difference includes 0), so the score doesn't decide. We keep the **cap fitted on observed laps** for a reason of principle: the cap should describe real laps, and it shouldn't depend on how many rows happen to have no qualifying data.
+- **Era diagnostic:** fitting model A's pre-processing on all seasons moves the medians and scaler (e.g. retirement rates were much higher in old seasons) but changes the score only within noise. Each model keeps its own fit.
+- **Invalid demonstration:** fitting on training + validation changes individual validation probabilities but barely the PR-AUC here, because medians and means are stable with thousands of training rows. It is still a leak, which is why every fit in this notebook goes through `fit_on_training`.
+- **Transformation check:** no transformation beats the final pipeline beyond noise (every interval includes 0); `log(grid)` ties it, and `1/grid` and `log(1 + drv_experience)` score lower. So no extra transformation is added.
+- **Overall:** none of these choices improves validation performance beyond noise. The final pipeline is chosen for **correctness** (no leakage, filled values that mean something, a cap that can't be distorted), not for a score gain.
+""")
+
+# ---------------------------------------------------------------- 5.7
+md(r"""
+## 5.7 Final pre-processing pipelines
+
+Four fitted pipelines, used by the next sections:
+
+| | logistic regression / neural network (scaled) | tree models (not scaled) |
+|---|---|---|
+| **model A** | fitted on 2003–2018 | fitted on 2003–2018 |
+| **model B** | fitted on 1950–2018 | fitted on 1950–2018 |
+
+Each takes the **18 features** (raw, with missing values) and returns **21 inputs**. To use one: `PREPROCESSORS[("A", "scaled")].transform(rows[FINAL_FEATURES])`.
+""")
+
+code(r'''
+PREPROCESSORS = {
+    ("A", "scaled"): fit_on_training(make_preprocessor(scaled=True), TRAIN_A_ROWS, "final: model A, scaled"),
+    ("A", "tree"): fit_on_training(make_preprocessor(scaled=False), TRAIN_A_ROWS, "final: model A, tree"),
+    ("B", "scaled"): fit_on_training(make_preprocessor(scaled=True), TRAIN_B_ROWS, "final: model B, scaled"),
+    ("B", "tree"): fit_on_training(make_preprocessor(scaled=False), TRAIN_B_ROWS, "final: model B, tree"),
+}
+MODEL_INPUTS = {kind: list(PREPROCESSORS[("A", kind)].get_feature_names_out()) for kind in ["scaled", "tree"]}
+shapes = []
+for (model, kind), pre in PREPROCESSORS.items():
+    train_rows = TRAIN_A_ROWS if model == "A" else TRAIN_B_ROWS
+    for set_name, rows in [("train", train_rows), ("validation", VAL_ROWS)]:
+        out = pre.transform(rows[FINAL_FEATURES])
+        shapes.append({"model": model, "pipeline": kind, "rows": set_name, "shape": out.shape,
+                       "missing values": int(out.isna().sum().sum())})
+display(pd.DataFrame(shapes))
+print("Scaled pipeline inputs (21):", MODEL_INPUTS["scaled"])
+print("Tree pipeline inputs (21):  ", MODEL_INPUTS["tree"])
+''')
+
+# ---------------------------------------------------------------- 5.8
+md(r"""
+## 5.8 Leakage and behaviour checks
+
+Automated checks of the pipelines from 5.7:
+1. no missing value in any output;
+2. inputs are exactly the 18 features: no target, no identifier;
+3. every learned value equals the same value **recomputed by hand from the training rows only**, and every fit in this section used training rows only;
+4. partially missing records (a new driver, no qualifying data, no Q1 time, a missing grid) are filled as designed;
+5. feature names and dimensions are the same across models;
+6. `outputs/final_features.csv` is unchanged.
+""")
+
+code(r'''
+checks = []
+
+# 1. No missing values in any output.
+for (model, kind), pre in PREPROCESSORS.items():
+    for rows in [TRAIN_A_ROWS if model == "A" else TRAIN_B_ROWS, VAL_ROWS]:
+        assert not pre.transform(rows[FINAL_FEATURES]).isna().any().any()
+checks.append("no missing values in any pipeline output (train and validation, models A and B)")
+
+# 2. Inputs are the 18 features; no target or identifier enters or leaves the pipeline.
+for pre in PREPROCESSORS.values():
+    assert list(pre.feature_names_in_) == FINAL_FEATURES
+    assert not set(pre.get_feature_names_out()) & set(NOT_INPUTS)
+checks.append("pipelines take exactly the 18 features; podium, raceId, driverId, year and split never enter")
+
+# 3. Learned values = hand recomputation from training rows only.
+for model, rows in [("A", TRAIN_A_ROWS), ("B", TRAIN_B_ROWS)]:
+    pre = PREPROCESSORS[(model, "scaled")]
+    imp = pre.named_steps["impute"]
+    obs = rows["gap_q1_pct"].dropna()
+    assert np.isclose(imp.gap_cap_, obs.quantile(0.99)) and np.isclose(imp.gap_slow_, obs.quantile(0.95))
+    assert np.isclose(imp.gap_neutral_, obs.median())
+    assert np.allclose(imp.medians_, rows[CONTINUOUS_FEATURES].median())
+    filled = imp.transform(rows[FINAL_FEATURES])[CONTINUOUS_FEATURES]
+    scaler = pre.named_steps["scale"].named_transformers_["continuous"]
+    assert np.allclose(scaler.mean_, filled.mean()) and np.allclose(scaler.scale_, filled.std(ddof=0))
+fit_log = pd.DataFrame(FIT_LOG)
+assert (fit_log["splits"] == "train").all() and (fit_log["seasons"].str[-4:].astype(int) <= SPLIT_YEARS["train"][1]).all()
+checks.append(f"all learned values match a recomputation from training rows; all {len(fit_log)} fits in section 5 used training rows only")
+
+# 4. Partially missing records.
+pre, imp = PREPROCESSORS[("A", "tree")], PREPROCESSORS[("A", "tree")].named_steps["impute"]
+base = VAL_ROWS[FINAL_FEATURES].iloc[[0]].copy()
+cases = {"complete record": base.copy(),
+         "qualifying record, no Q1 time": base.assign(gap_q1_pct=np.nan),
+         "no qualifying data": base.assign(gap_q1_pct=np.nan, grid_minus_quali=np.nan, reached_q3=np.nan, quali_missing=1.0),
+         "debut driver, new team": base.assign(**{c: np.nan for c in DRV_FORM + [CONS_FORM]}),
+         "grid and quali_missing flag missing": base.assign(grid=np.nan, quali_missing=np.nan)}
+partial = pd.concat({k: pre.transform(v) for k, v in cases.items()}).droplevel(1)
+assert not partial.isna().any().any()
+assert partial.loc["qualifying record, no Q1 time", "gap_q1_pct"] == imp.gap_slow_ and partial.loc["qualifying record, no Q1 time", "q1_time_missing"] == 1
+r = partial.loc["no qualifying data"]
+assert r["gap_q1_pct"] == imp.gap_neutral_ and r["grid_minus_quali"] == 0 and r["reached_q3"] == 0 and r["q1_time_missing"] == 0 and r["quali_missing"] == 1
+r = partial.loc["debut driver, new team"]
+assert r["drv_form_missing"] == 1 and r["cons_form_missing"] == 1 and np.allclose(r[DRV_FORM + [CONS_FORM]], imp.medians_[DRV_FORM + [CONS_FORM]])
+r = partial.loc["grid and quali_missing flag missing"]
+assert r["grid"] == imp.medians_["grid"] and r["quali_missing"] == 0
+display(partial[["grid", "gap_q1_pct", "grid_minus_quali", "reached_q3", "quali_missing"] + DRV_FORM[:1] + [CONS_FORM] + INDICATORS])
+checks.append("partially missing records are filled as designed (5 cases)")
+
+# 5. Names and dimensions.
+for kind in ["scaled", "tree"]:
+    assert list(PREPROCESSORS[("B", kind)].get_feature_names_out()) == MODEL_INPUTS[kind] and len(MODEL_INPUTS[kind]) == 21
+assert set(MODEL_INPUTS["scaled"]) == set(MODEL_INPUTS["tree"]) == set(FINAL_FEATURES + INDICATORS)
+checks.append("models A and B produce the same 21 named inputs")
+
+# 6. The exported feature table is unchanged.
+assert hashlib.sha256(FINAL_FEATURES_PATH.read_bytes()).hexdigest() == FF_SHA_BEFORE
+checks.append("outputs/final_features.csv is unchanged by section 5")
+
+display(fit_log)
+for c in checks:
+    print("PASS", c)
+''')
+
+md(r"""
+**Summary of section 5.**
+- **Inputs:** the 18 features from `outputs/final_features.csv` (unchanged) → **21 model inputs** (18 features + `q1_time_missing`, `drv_form_missing`, `cons_form_missing`).
+- **Missing values:** a missing Q1 time with a qualifying record → a slow lap (training 95th percentile); no qualifying record → the training median, with `quali_missing` kept; `grid_minus_quali` and `reached_q3` → 0 (their flags explain why); form → training medians plus the indicators.
+- **Outliers:** only `gap_q1_pct` is capped (training 99th percentile, fitted on observed laps); every row is kept.
+- **Scaling:** continuous features standardised for logistic regression and the neural network; flags stay 0/1; tree models get the unscaled version.
+- **Model A and model B** fit everything on their own training seasons; validation and test are only transformed.
+- **Experiments:** E1 and E2 change the transformed data but not validation performance beyond noise; the pipeline is chosen for correctness, not for a score gain.
+""")
+
+
+# ================================================================ 6. PREDICTIVE MODELING
+md(r"""
+# 6. Predictive Modeling
+
+**Goal:** train and compare four model families on the pre-processed inputs, choose each one's settings without looking at the validation seasons, check them once on 2019–2021, and **freeze** everything before the test seasons are ever used.
+
+| | Model | Inputs |
+|---|---|---|
+| reference | rule "podium if grid ≤ 3"; logistic regression on `grid` only | grid |
+| 1 | logistic regression | 21 scaled inputs |
+| 2 | random forest | 21 unscaled inputs |
+| 3 | gradient boosting (`HistGradientBoostingClassifier`) | 21 unscaled inputs |
+| 4 | shallow neural network (PyTorch, 1–2 hidden layers) | 21 scaled inputs |
+
+How the section works:
+1. **6.2 Time-ordered cross-validation** inside the training seasons: four folds, each trained only on seasons **before** the two seasons it scores. All settings are chosen here.
+2. **6.3–6.7** baselines and the four families, each with a small fixed grid of settings.
+3. **6.8 Thresholds** from the out-of-fold predictions, frozen before validation is scored.
+4. **6.9** one validation score per final model, with race-resampling intervals; overfitting and probability quality.
+5. **6.10** model A (trained on 2003–2018) vs model B (1950–2018), plus training-window experiments.
+6. **6.11 Freeze.** The test seasons (2022–2024) are **not** used anywhere in this section.
+""")
+
+# ---------------------------------------------------------------- 6.1
+md(r"""
+## 6.1 Set-up: rows, metrics and guards
+
+- **Rows:** the training rows of model A (2003–2018) or model B (1950–2018) and the 1,199 validation rows, from section 5. Every table used here is checked to contain **no test row**.
+- **Every fit goes through one guard** (`fit6`), which refuses rows that aren't training rows, and, inside a cross-validation fold, rows from the seasons the fold scores or later. Every fit and every prediction is logged.
+- **Metrics:**
+  - **PR-AUC** (main): how well real podium finishers are ranked at the top. A random guess scores the podium rate (≈ 0.15).
+  - **ROC-AUC:** chance a podium row is ranked above a non-podium row. It looks high (≈ 0.93) even for simple models, because most non-podium rows are easy.
+  - **Precision** (of the predicted podiums, the share that were real), **recall** (of the real podiums, the share we found) and **F1** (their balance), at a frozen threshold.
+  - **Brier score:** the average squared error of the probabilities (lower is better).
+- **Comparing two models:** the PR-AUC difference on validation, with a 95% interval from resampling the 60 validation races 500 times (the same resamples for both models, i.e. paired). A difference only counts if the interval **excludes 0**.
+""")
+
+code(r'''
+import copy, json, platform, time
+import torch
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.metrics import brier_score_loss, confusion_matrix, precision_score, recall_score, roc_curve
+from sklearn.preprocessing import FunctionTransformer
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.use_deterministic_algorithms(True)
+torch.set_num_threads(1)          # small networks: one thread is fast enough and keeps results exactly reproducible
+print(f"python {platform.python_version()} | numpy {np.__version__} | pandas {pd.__version__} | "
+      f"scikit-learn {__import__('sklearn').__version__} | torch {torch.__version__}")
+
+TRAIN_ROWS = {"A": TRAIN_A_ROWS, "B": TRAIN_B_ROWS}
+for name, rows in [("train A", TRAIN_A_ROWS), ("train B", TRAIN_B_ROWS), ("validation", VAL_ROWS)]:
+    assert "test" not in set(rows["split"]), f"{name} contains test rows"
+print({name: f"{len(r):,} rows, {r['raceId'].nunique()} races, podium rate {r['podium'].mean():.3f}"
+       for name, r in [("train A", TRAIN_A_ROWS), ("train B", TRAIN_B_ROWS), ("validation", VAL_ROWS)]})
+
+FIT6_LOG, PREDICT6_LOG = [], []
+
+
+def fit6(estimator, rows, label, before=None, X=None, log=None):
+    """Fit on training rows only; inside a fold, only on seasons before `before`. X: already-transformed inputs.
+    log: where to record the fit (a worker process records into its own list, merged into FIT6_LOG afterwards)."""
+    assert set(rows["split"]) == {"train"}, f"{label}: non-training rows"
+    if before is not None:
+        assert rows["year"].max() < before, f"{label}: uses seasons from {before} or later"
+    (FIT6_LOG if log is None else log).append({"fit": label, "rows": len(rows), "seasons": f"{rows['year'].min()}-{rows['year'].max()}",
+                                               "must end before": before})
+    return estimator.fit(rows[FINAL_FEATURES] if X is None else X, rows["podium"])
+
+
+def log_predict(rows, label, log=None):
+    assert "test" not in set(rows["split"]), f"{label}: prediction on test rows"
+    (PREDICT6_LOG if log is None else log).append({"predict": label, "rows": len(rows), "splits": ",".join(sorted(set(rows["split"])))})
+
+
+def top3_per_race(p, race):
+    """1 for the 3 highest probabilities in each race (ties broken by row order), else 0."""
+    order = pd.DataFrame({"p": p, "race": race}).reset_index(drop=True)
+    rank = order.groupby("race")["p"].rank(method="first", ascending=False)
+    return (rank <= 3).astype(int).to_numpy()
+
+
+def scores(y, p, threshold=None, race=None):
+    out = {"PR-AUC": average_precision_score(y, p), "ROC-AUC": roc_auc_score(y, p), "Brier": brier_score_loss(y, p)}
+    if threshold is not None:
+        pred = (p >= threshold).astype(int)
+        out.update({"precision": precision_score(y, pred, zero_division=0), "recall": recall_score(y, pred),
+                    "F1": f1_score(y, pred), "predicted podiums": int(pred.sum())})
+    if race is not None:
+        out["F1 top-3 per race"] = f1_score(y, top3_per_race(p, race))
+    return out
+
+
+def paired_difference(p_base, p_new, y=None, boot=None):
+    """PR-AUC(new) - PR-AUC(base) on validation, with a 95% paired race-resampling interval."""
+    y = y_val if y is None else y
+    boot = VAL_BOOT if boot is None else boot
+    d = [average_precision_score(y[i], p_new[i]) - average_precision_score(y[i], p_base[i]) for i in boot]
+    lo, hi = np.percentile(d, [2.5, 97.5])
+    return average_precision_score(y, p_new) - average_precision_score(y, p_base), lo, hi
+''')
+
+# ---------------------------------------------------------------- 6.2
+md(r"""
+## 6.2 Time-ordered cross-validation inside the training seasons
+
+Settings are chosen with **forward-chaining** folds: each fold trains on all training seasons **before** a two-season block and scores that block. No fold ever uses a later season to predict an earlier one, and a season (so every race in it) is always entirely on one side.
+
+- The scoring blocks are **2011–12, 2013–14, 2015–16, 2017–18**, the same for model A (fold training starts in 2003) and model B (starts in 1950).
+- **Pre-processing is re-fitted inside every fold**, on that fold's training seasons only. The pipelines fitted in 5.7 used all of 2003–2018, so reusing them here would leak the scored seasons into their own pre-processing.
+- **Why not tune on 2019–2021?** It has only 60 races. The four blocks add up to 158 races of past seasons, so settings are chosen on more evidence, and the validation seasons stay an honest check that is used **once** per final model.
+""")
+
+code(r'''
+FOLDS = [(2011, 2012), (2013, 2014), (2015, 2016), (2017, 2018)]
+
+
+def fold_rows(model, k):
+    lo, hi = FOLDS[k]
+    rows = TRAIN_ROWS[model]
+    return rows[rows["year"] < lo], rows[rows["year"].between(lo, hi)]
+
+
+fold_table = []
+for model in ["A", "B"]:
+    for k, (lo, hi) in enumerate(FOLDS):
+        tr, sc = fold_rows(model, k)
+        assert tr["year"].max() < sc["year"].min(), "a fold trains on a later season"
+        assert not set(tr["raceId"]) & set(sc["raceId"]), "a race is split across fold training and scoring"
+        fold_table.append({"model": model, "fold": k + 1, "trains on": f"{tr['year'].min()}-{tr['year'].max()}",
+                           "training rows": len(tr), "scores": f"{lo}-{hi}", "scoring rows": len(sc),
+                           "scoring races": sc["raceId"].nunique(), "scoring podiums": int(sc["podium"].sum())})
+fold_table = pd.DataFrame(fold_table)
+for k in range(len(FOLDS)):   # both models score exactly the same rows
+    a, b = fold_rows("A", k)[1], fold_rows("B", k)[1]
+    assert a[["raceId", "driverId"]].reset_index(drop=True).equals(b[["raceId", "driverId"]].reset_index(drop=True))
+display(fold_table)
+
+fig, ax = plt.subplots(figsize=(11, 2.8))
+for k, (lo, hi) in enumerate(FOLDS):
+    ax.barh(k, lo - 2003, left=2003, color="#4C72B0", label="trains on (model A)" if k == 0 else None)
+    ax.barh(k, 2003 - 1950, left=1950, color="#A6BDDB", label="extra seasons for model B" if k == 0 else None)
+    ax.barh(k, hi - lo + 1, left=lo, color="#DD8452", label="scored" if k == 0 else None)
+ax.barh(len(FOLDS), 3, left=2019, color="#55A868", label="validation (used once per final model)")
+ax.set_yticks(range(len(FOLDS) + 1), [f"fold {k + 1}" for k in range(len(FOLDS))] + ["validation"])
+ax.set_xlabel("season")
+ax.set_title("Forward-chaining folds: always train on earlier seasons, score later ones")
+ax.legend(fontsize=7, loc="upper left")
+ax.invert_yaxis()
+plt.tight_layout()
+plt.show()
+print("Every fold trains only on earlier seasons; no race is split; models A and B score identical rows.")
+''')
+
+md(r"""
+**Common rules for every model family (fixed before any result is seen):**
+- **Score per setting:** the PR-AUC on each fold's scoring block; the **mean over the 4 folds** is the selection score.
+- **Tie-breaking (paired one-standard-error rule):** take the setting with the best mean. For every other setting, compute its **shortfall on each fold** (best setting's fold score minus its own) and the standard error of those 4 shortfalls (their standard deviation ÷ √4). A setting is a **tie** if its mean shortfall is at most that standard error, i.e. it is not clearly worse than the best; and any setting whose mean is at least as high as a tie's is a tie too (a better-scoring setting can never be excluded while a worse one is kept). The comparison is **paired** because every setting is scored on exactly the same folds: some seasons are simply harder for every model, and that shared difficulty must not count as uncertainty (the same logic as the paired race resampling used on validation). Among the ties, choose the **simplest / most regularised** one, by a fixed order per family:
+  - logistic regression: smaller `C` (stronger penalty), then no class weighting;
+  - random forest: shallower trees (`max_depth` 6 < 10 < unlimited), then bigger leaves, then fewer features per split (`sqrt` before 0.5);
+  - gradient boosting: fewer leaves per tree, then fewer trees, then bigger leaves, then smaller learning rate;
+  - neural network: fewer weights, then stronger weight decay, then more dropout.
+- **Out-of-fold predictions:** the chosen setting's predictions on the four scoring blocks (2011–2018), each made by a model that never saw those seasons. They are used for the threshold in 6.8.
+- **Final model:** the chosen setting refitted on **all** training seasons, using the pre-processing fitted in 5.7.
+""")
+
+code(r'''
+GRIDS = {
+    "logistic regression": [{"C": c, "class_weight": w} for c in [0.01, 0.1, 1, 10] for w in [None, "balanced"]],
+    "random forest": [{"max_depth": d, "min_samples_leaf": l, "max_features": f}
+                      for d in [6, 10, None] for l in [5, 20, 50] for f in ["sqrt", 0.5]],
+    "gradient boosting": [{"learning_rate": r, "max_leaf_nodes": n, "min_samples_leaf": l, "max_iter": it}
+                          for r in [0.05, 0.1] for n in [7, 15] for l in [20, 80] for it in [100, 300]],
+    "neural network": [{"hidden": h, "dropout": d, "weight_decay": w}
+                       for h in [(16,), (32,), (32, 16)] for d in [0.0, 0.2] for w in [1e-4, 1e-3]],
+}
+SCALED = {"logistic regression": True, "random forest": False, "gradient boosting": False, "neural network": True}
+
+
+def make_estimator(family, params, seed=SEED):
+    if family == "logistic regression":
+        return LogisticRegression(max_iter=5000, **params)
+    if family == "random forest":
+        return RandomForestClassifier(n_estimators=500, n_jobs=1, random_state=seed, **params)   # 1 job: bit-for-bit reproducible
+    if family == "gradient boosting":
+        return HistGradientBoostingClassifier(l2_regularization=1.0, early_stopping=False, random_state=seed, **params)
+    return ShallowNet(**params, seed=seed)
+
+
+def n_weights(hidden, n_in=21):
+    sizes = [n_in, *hidden, 1]
+    return sum(a * b + b for a, b in zip(sizes[:-1], sizes[1:]))
+
+
+SIMPLICITY = {   # smaller tuple = simpler / more regularised
+    "logistic regression": lambda p: (p["C"], p["class_weight"] is not None),
+    "random forest": lambda p: ({6: 0, 10: 1, None: 2}[p["max_depth"]], -p["min_samples_leaf"], 0 if p["max_features"] == "sqrt" else 1),
+    "gradient boosting": lambda p: (p["max_leaf_nodes"], p["max_iter"], -p["min_samples_leaf"], p["learning_rate"]),
+    "neural network": lambda p: (n_weights(p["hidden"]), -p["weight_decay"], -p["dropout"]),
+}
+print({family: len(grid) for family, grid in GRIDS.items()}, "settings per family")
+''')
+
+# ---------------------------------------------------------------- 6.3
+md(r"""
+## 6.3 Reference baselines
+
+- **Rule "podium if grid ≤ 3":** no learning at all. It shows what simply trusting the front row gives.
+- **Logistic regression on `grid` only:** the **primary baseline**. The question every other model must answer is: *does anything beyond the starting position help?*
+
+Both are scored on the same folds as the models, then once on validation.
+""")
+
+code(r'''
+grid_only = lambda: Pipeline([("pre", make_preprocessor(scaled=True)),
+                              ("grid", FunctionTransformer(lambda X: X[["grid"]], feature_names_out=lambda t, f: np.array(["grid"]))),
+                              ("model", LogisticRegression(max_iter=5000))])
+baseline_rows, BASELINE_OOF = [], []
+for k in range(len(FOLDS)):
+    tr, sc = fold_rows("A", k)
+    log_predict(sc, f"baseline fold {k + 1}")
+    rule = (sc["grid"] <= 3).astype(int)
+    pipe = fit6(grid_only(), tr, f"grid-only LR, fold {k + 1}", before=FOLDS[k][0])
+    p = pipe.predict_proba(sc[FINAL_FEATURES])[:, 1]
+    BASELINE_OOF.append(p)
+    baseline_rows.append({"fold": k + 1, "rule grid<=3: precision": precision_score(sc["podium"], rule),
+                          "rule grid<=3: recall": recall_score(sc["podium"], rule), "rule grid<=3: F1": f1_score(sc["podium"], rule),
+                          "grid-only LR: PR-AUC": average_precision_score(sc["podium"], p), "grid-only LR: ROC-AUC": roc_auc_score(sc["podium"], p)})
+BASELINE_OOF = np.concatenate(BASELINE_OOF)
+baseline_cv = pd.DataFrame(baseline_rows).set_index("fold")
+baseline_cv.loc["mean"] = baseline_cv.mean()
+display(baseline_cv.round(4))
+''')
+
+# ---------------------------------------------------------------- shared search code
+md(r"""
+### The search procedure (shared by 6.4–6.7)
+
+For each setting and each fold: fit pre-processing + model on the fold's training seasons, predict its scoring block, record the PR-AUC. The neural network adds an inner step (6.7). Every setting's four fold scores are kept in `SEARCH`.
+
+The (setting, fold) jobs are independent and each has a fixed seed, so they run in **parallel processes** (`joblib`) to keep the notebook's run time reasonable; the results are identical to running them one after another. The training-rows guard and the logging run inside every job.
+""")
+
+code(r'''
+SEARCH, OOF, CHOSEN = {}, {}, {}
+FOLD_COLS = [f"fold {k + 1}" for k in range(len(FOLDS))]
+
+
+def paired_ties(fold_scores, best):
+    """Rows not clearly worse than row `best`: mean per-fold shortfall at most one standard error of those paired
+    differences. Then every row scoring at least as high (on average) as one of those also counts, so a better-scoring
+    row can never be excluded while a worse one is kept."""
+    shortfall = fold_scores.rsub(fold_scores.loc[best], axis=1)          # best minus each, fold by fold
+    se = shortfall.std(axis=1, ddof=1) / np.sqrt(fold_scores.shape[1])
+    within = shortfall.mean(axis=1) <= se
+    mean = fold_scores.mean(axis=1)
+    return list(fold_scores.index[mean >= mean[within].min()])
+
+
+def cv_predict(model, family, params, k, seed=SEED, logs=(None, None)):
+    """Fit on fold k's training seasons and predict its scoring block. Returns (probabilities, extra info)."""
+    tr, sc = fold_rows(model, k)
+    lo = FOLDS[k][0]
+    log_predict(sc, f"{model} {family} fold {k + 1}", log=logs[1])
+    if family != "neural network":
+        pipe = Pipeline([("pre", make_preprocessor(scaled=SCALED[family])), ("model", make_estimator(family, params, seed))])
+        fit6(pipe, tr, f"{model} {family} fold {k + 1}", before=lo, log=logs[0])
+        return pipe.predict_proba(sc[FINAL_FEATURES])[:, 1], {}
+    return nn_fold(model, params, k, seed, logs)
+
+
+def cv_task(model, family, params, k, seed):
+    """One (setting, fold) job; runs in a separate process. Returns its predictions and its own fit/predict log."""
+    torch.use_deterministic_algorithms(True)
+    torch.set_num_threads(1)
+    logs = ([], [])
+    p, info = cv_predict(model, family, params, k, seed, logs)
+    return p, info, logs
+
+
+# Settings x folds are independent jobs with fixed seeds, so they run in parallel processes; the results are identical to
+# running them one by one. Every guard (fit6, log_predict) still runs inside each job.
+from joblib import Parallel, delayed
+import os
+N_JOBS = max(1, min(8, (os.cpu_count() or 2) - 1))
+
+
+def run_jobs(jobs):
+    out = Parallel(n_jobs=N_JOBS)(delayed(cv_task)(*job) for job in jobs)
+    for _, _, (fit_log, pred_log) in out:   # merge the workers' logs, in job order
+        FIT6_LOG.extend(fit_log)
+        PREDICT6_LOG.extend(pred_log)
+    return [(p, info) for p, info, _ in out]
+
+
+def run_search(model, family):
+    rows = []
+    jobs = [(model, family, params, k, SEED) for params in GRIDS[family] for k in range(len(FOLDS))]
+    results = iter(run_jobs(jobs))
+    for i, params in enumerate(GRIDS[family]):
+        fold_scores, preds, extra = [], [], []
+        for k in range(len(FOLDS)):
+            p, info = next(results)
+            sc = fold_rows(model, k)[1]
+            fold_scores.append(average_precision_score(sc["podium"], p))
+            preds.append(p)
+            extra.append(info)
+        row = {"setting": i, **{k: str(v) for k, v in params.items()},
+               **{f"fold {k + 1}": s for k, s in enumerate(fold_scores)},
+               "mean PR-AUC": np.mean(fold_scores), "fold SD": np.std(fold_scores, ddof=1)}
+        if family == "neural network":
+            row["best epochs (inner)"] = [e["best_epoch"] for e in extra]
+        rows.append(row)
+        OOF[(model, family, i)] = np.concatenate(preds)
+        if family == "neural network":
+            OOF[(model, family, i, "info")] = extra
+    table = pd.DataFrame(rows)
+    SEARCH[(model, family)] = table
+    # Paired one-standard-error rule, then the simplest setting.
+    best = table["mean PR-AUC"].idxmax()
+    ties = paired_ties(table[FOLD_COLS], best)
+    chosen = min(ties, key=lambda i: SIMPLICITY[family](GRIDS[family][i]))
+    CHOSEN[(model, family)] = {"setting": int(chosen), "params": GRIDS[family][chosen],
+                               "cv mean PR-AUC": table.loc[chosen, "mean PR-AUC"], "cv fold SD": table.loc[chosen, "fold SD"],
+                               "best mean PR-AUC": table.loc[best, "mean PR-AUC"], "settings within 1 SE": len(ties)}
+    return table
+
+
+OOF_ROWS = {m: pd.concat([fold_rows(m, k)[1] for k in range(len(FOLDS))]) for m in ["A", "B"]}
+y_oof = {m: OOF_ROWS[m]["podium"].to_numpy() for m in ["A", "B"]}
+
+
+def show_search(model, family):
+    t = SEARCH[(model, family)].copy()
+    c = CHOSEN[(model, family)]
+    t["chosen"] = np.where(t["setting"] == c["setting"], "<= chosen", "")
+    display(t.sort_values("mean PR-AUC", ascending=False).round(4).head(10))
+    print(f"Model {model}, {family}: best mean CV PR-AUC {c['best mean PR-AUC']:.4f}; {c['settings within 1 SE']} of "
+          f"{len(t)} setting(s) not clearly worse (paired one-SE rule); chosen (simplest of those): {c['params']} -> "
+          f"mean {c['cv mean PR-AUC']:.4f} (fold SD {c['cv fold SD']:.4f})")
+''')
+
+# ---------------------------------------------------------------- 6.4
+md(r"""
+## 6.4 Model 1: logistic regression
+
+**How it works:** each input gets a weight; the weighted sum is turned into a probability between 0 and 1. It can only draw a smooth, one-direction relationship per input, but it is hard to overfit and easy to explain.
+**Settings searched (8):** penalty strength `C` (smaller = stronger penalty, simpler model) × class weighting (none, or "balanced", which counts each podium row about 6 times more).
+""")
+
+code(r'''
+t0 = time.time()
+run_search("A", "logistic regression")
+show_search("A", "logistic regression")
+print(f"({time.time() - t0:.0f} s)")
+''')
+
+# ---------------------------------------------------------------- 6.5
+md(r"""
+## 6.5 Model 2: random forest
+
+**How it works:** 500 decision trees, each grown on a random sample of rows and choosing among a random subset of inputs at every split; the forest's probability is the average vote. Trees can learn steps and interactions (e.g. "fast in qualifying **and** starting near the front") that a linear model can't.
+**Risk:** deep trees memorise the training rows (training scores near perfect). Limiting depth and requiring bigger leaves controls this.
+**Settings searched (18):** `max_depth` (6, 10, unlimited) × `min_samples_leaf` (5, 20, 50) × `max_features` (`sqrt` ≈ 4 of 21 inputs, or half of them). 500 trees throughout.
+""")
+
+code(r'''
+t0 = time.time()
+run_search("A", "random forest")
+show_search("A", "random forest")
+print(f"({time.time() - t0:.0f} s)")
+''')
+
+# ---------------------------------------------------------------- 6.6
+md(r"""
+## 6.6 Model 3: gradient boosting
+
+**How it works:** small trees are added one at a time, each correcting the errors of the trees so far; the learning rate controls how big each correction is. Usually the strongest family on tables like ours, but it overfits if the trees are too big or too many.
+**Settings searched (16):** learning rate (0.05, 0.1) × leaves per tree (7, 15) × minimum rows per leaf (20, 80) × number of trees (100, 300). A fixed L2 penalty of 1. The library's built-in early stopping is **off**: it would hold out a *random* 10% of rows, which splits races and mixes seasons.
+""")
+
+code(r'''
+t0 = time.time()
+run_search("A", "gradient boosting")
+show_search("A", "gradient boosting")
+print(f"({time.time() - t0:.0f} s)")
+''')
+
+# ---------------------------------------------------------------- 6.7
+md(r"""
+## 6.7 Model 4: shallow neural network (PyTorch)
+
+**How it works:** the 21 scaled inputs feed one or two small hidden layers of units (each a weighted sum followed by a ReLU, which lets the network bend the relationship), then one output unit turned into a probability. Trained with the Adam optimiser on the log-loss, in mini-batches of 256 rows.
+**Regularisation:** **weight decay** (an L2 penalty on the weights), **dropout** (randomly switching off units during training) and **early stopping**.
+
+**Early stopping without leaking (inside every fold):**
+1. The fold's training seasons are split again in time: the **last two training seasons** are an *early-stopping subset*; the earlier seasons train the network (with pre-processing fitted on those earlier seasons only).
+2. Training stops when the log-loss on the early-stopping subset hasn't improved for 15 epochs; the best epoch is recorded.
+3. The network is then retrained on **all** the fold's training seasons for that many epochs, and only then scores the fold's scoring block. The scoring block never influences when training stops.
+4. The **final** network (on all training seasons) trains for the **median** of the four folds' best epochs.
+
+**Settings searched (12):** hidden layers (16), (32) or (32, 16) × dropout (0, 0.2) × weight decay (1e-4, 1e-3). Fixed: learning rate 0.001, batch size 256, at most 200 epochs. Seeds are fixed and PyTorch runs in deterministic mode; the chosen setting is re-run with **3 seeds**.
+""")
+
+code(r'''
+class ShallowNet:
+    """A 1-2 hidden-layer network with dropout and weight decay, trained with Adam on the log-loss."""
+
+    def __init__(self, hidden=(32,), dropout=0.0, weight_decay=1e-4, lr=1e-3, batch_size=256, seed=SEED, epochs=None):
+        self.hidden, self.dropout, self.weight_decay = tuple(hidden), dropout, weight_decay
+        self.lr, self.batch_size, self.seed, self.epochs = lr, batch_size, seed, epochs
+
+    def _build(self, n_in):
+        torch.manual_seed(self.seed)
+        layers, size = [], n_in
+        for h in self.hidden:
+            layers += [torch.nn.Linear(size, h), torch.nn.ReLU(), torch.nn.Dropout(self.dropout)]
+            size = h
+        layers.append(torch.nn.Linear(size, 1))
+        return torch.nn.Sequential(*layers)
+
+    @staticmethod
+    def _tensor(X):
+        return torch.tensor(np.asarray(X, dtype=np.float32))
+
+    def _loss(self, X, y):
+        self.net_.eval()
+        with torch.no_grad():
+            return torch.nn.functional.binary_cross_entropy_with_logits(self.net_(X).squeeze(1), y).item()
+
+    def fit(self, X, y, X_es=None, y_es=None, max_epochs=200, patience=15):
+        """With an early-stopping set: train until its loss stops improving and keep the best epoch's weights.
+        Without one: train for exactly self.epochs epochs."""
+        X, y = self._tensor(X), torch.tensor(np.asarray(y, dtype=np.float32))
+        self.net_ = self._build(X.shape[1])
+        opt = torch.optim.Adam(self.net_.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        gen = torch.Generator().manual_seed(self.seed)
+        early = X_es is not None
+        if early:
+            X_es, y_es = self._tensor(X_es), torch.tensor(np.asarray(y_es, dtype=np.float32))
+        n_epochs = max_epochs if early else self.epochs
+        self.history_ = {"train loss": [], "early-stopping loss": []}
+        best_loss, self.best_epoch_, best_state = np.inf, 0, None
+        for epoch in range(1, n_epochs + 1):
+            self.net_.train()
+            for idx in torch.randperm(len(X), generator=gen).split(self.batch_size):
+                opt.zero_grad()
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(self.net_(X[idx]).squeeze(1), y[idx])
+                loss.backward()
+                opt.step()
+            self.history_["train loss"].append(self._loss(X, y))
+            if early:
+                es_loss = self._loss(X_es, y_es)
+                self.history_["early-stopping loss"].append(es_loss)
+                if es_loss < best_loss - 1e-6:
+                    best_loss, self.best_epoch_, best_state = es_loss, epoch, copy.deepcopy(self.net_.state_dict())
+                elif epoch - self.best_epoch_ >= patience:
+                    break
+        if early:
+            self.net_.load_state_dict(best_state)
+        else:
+            self.best_epoch_ = n_epochs
+        return self
+
+    def predict_proba(self, X):
+        self.net_.eval()
+        with torch.no_grad():
+            p = torch.sigmoid(self.net_(self._tensor(X)).squeeze(1)).numpy().astype(float)
+        return np.column_stack([1 - p, p])
+
+
+ES_SEASONS = 2   # the last two seasons of a fold's training period form its early-stopping subset
+
+
+def nn_fold(model, params, k, seed=SEED, logs=(None, None)):
+    tr, sc = fold_rows(model, k)
+    lo = FOLDS[k][0]
+    es_start = lo - ES_SEASONS
+    inner_fit, inner_es = tr[tr["year"] < es_start], tr[tr["year"] >= es_start]
+    # 1. find the stopping epoch on the inner early-stopping subset (pre-processing fitted on the inner training seasons)
+    pre_inner = fit6(make_preprocessor(scaled=True), inner_fit, f"{model} NN fold {k + 1} inner pre-processing",
+                     before=es_start, log=logs[0])
+    finder = ShallowNet(**params, seed=seed).fit(pre_inner.transform(inner_fit[FINAL_FEATURES]), inner_fit["podium"],
+                                                  pre_inner.transform(inner_es[FINAL_FEATURES]), inner_es["podium"])
+    epochs = finder.best_epoch_
+    # 2. retrain on all of the fold's training seasons for that many epochs, then score the fold
+    pre = fit6(make_preprocessor(scaled=True), tr, f"{model} NN fold {k + 1} pre-processing", before=lo, log=logs[0])
+    net = ShallowNet(**params, seed=seed, epochs=epochs)
+    fit6(net, tr, f"{model} NN fold {k + 1}", before=lo, X=pre.transform(tr[FINAL_FEATURES]), log=logs[0])
+    return net.predict_proba(pre.transform(sc[FINAL_FEATURES]))[:, 1], {"best_epoch": epochs, "history": finder.history_}
+
+
+t0 = time.time()
+run_search("A", "neural network")
+show_search("A", "neural network")
+print(f"({time.time() - t0:.0f} s)")
+''')
+
+code(r'''
+# Loss curves of the chosen setting: the inner early-stopping runs of the four folds.
+c = CHOSEN[("A", "neural network")]
+info = OOF[("A", "neural network", c["setting"], "info")]
+fig, axes = plt.subplots(1, len(FOLDS), figsize=(16, 3.2), sharey=True)
+for k, ax in enumerate(axes):
+    h = info[k]["history"]
+    ax.plot(range(1, len(h["train loss"]) + 1), h["train loss"], label="training loss")
+    ax.plot(range(1, len(h["early-stopping loss"]) + 1), h["early-stopping loss"], label="early-stopping loss")
+    ax.axvline(info[k]["best_epoch"], color="#C44E52", ls="--", label=f"best epoch {info[k]['best_epoch']}")
+    es_from = FOLDS[k][0] - ES_SEASONS
+    ax.set_title(f"fold {k + 1}: train 2003-{es_from - 1}, stop on {es_from}-{es_from + 1}", fontsize=9)
+    ax.set_xlabel("epoch")
+    ax.legend(fontsize=7)
+axes[0].set_ylabel("log-loss")
+plt.suptitle(f"Neural network, chosen setting {c['params']}: inner early-stopping runs (model A)", fontsize=10)
+plt.tight_layout()
+plt.show()
+''')
+
+# ---------------------------------------------------------------- final fits
+md(r"""
+### Final models (model A) and the 3-seed check
+
+Each family's chosen setting is refitted on **all** training seasons (2003–2018), with the pre-processing fitted in 5.7. The neural network trains for the median of its four folds' best epochs. Then the chosen network setting is re-run with **3 seeds**, both in cross-validation and as a final model, to show how much it depends on the random start.
+""")
+
+code(r'''
+FAMILIES = ["logistic regression", "random forest", "gradient boosting", "neural network"]
+FINAL6 = {}
+
+
+def fit_final(model, family, seed=SEED):
+    c = CHOSEN[(model, family)]
+    pre = PREPROCESSORS[(model, "scaled" if SCALED[family] else "tree")]
+    rows = TRAIN_ROWS[model]
+    X = pre.transform(rows[FINAL_FEATURES])
+    est = make_estimator(family, c["params"], seed)
+    if family == "neural network":
+        est.epochs = int(np.median([e["best_epoch"] for e in OOF[(model, family, c["setting"], "info")]]))
+    fit6(est, rows, f"{model} {family} final (seed {seed})", X=X)
+    return {"pre": pre, "model": est}
+
+
+def predict_final(entry, rows, label):
+    log_predict(rows, label)
+    return entry["model"].predict_proba(entry["pre"].transform(rows[FINAL_FEATURES]))[:, 1]
+
+
+for family in FAMILIES:
+    FINAL6[("A", family)] = fit_final("A", family)
+print("Final model-A fits:", {f: CHOSEN[("A", f)]["params"] for f in FAMILIES})
+print("Neural network epochs for the final fit:", FINAL6[("A", "neural network")]["model"].epochs)
+
+# 3-seed check of the chosen network setting (cross-validation and final model).
+c = CHOSEN[("A", "neural network")]
+seed_rows = []
+SEEDS = [SEED, SEED + 1, SEED + 2]
+seed_preds = iter(run_jobs([("A", "neural network", c["params"], k, seed) for seed in SEEDS for k in range(len(FOLDS))]))
+for seed in SEEDS:
+    fold_scores = [average_precision_score(fold_rows("A", k)[1]["podium"], next(seed_preds)[0]) for k in range(len(FOLDS))]
+    entry = FINAL6[("A", "neural network")] if seed == SEED else fit_final("A", "neural network", seed)
+    p = predict_final(entry, VAL_ROWS, f"A NN seed {seed} validation")
+    seed_rows.append({"seed": seed, "mean CV PR-AUC": np.mean(fold_scores), "validation PR-AUC": average_precision_score(y_val, p)})
+seed_table = pd.DataFrame(seed_rows)
+display(seed_table.round(4))
+print(f"Across 3 seeds: CV PR-AUC {seed_table['mean CV PR-AUC'].mean():.4f} ± {seed_table['mean CV PR-AUC'].std():.4f}, "
+      f"validation PR-AUC {seed_table['validation PR-AUC'].mean():.4f} ± {seed_table['validation PR-AUC'].std():.4f}")
+''')
+
+code(r'''
+# Logistic regression: what the final model learned (weights on standardised inputs; flags are 0/1).
+lr_final = FINAL6[("A", "logistic regression")]["model"]
+coef = pd.Series(lr_final.coef_[0], index=MODEL_INPUTS["scaled"]).sort_values()
+fig, ax = plt.subplots(figsize=(9, 5.5))
+ax.barh(coef.index, coef.values, color=np.where(coef.values > 0, "#55A868", "#C44E52"))
+ax.axvline(0, color="black", lw=0.8)
+ax.set_xlabel("weight (positive = more likely podium)")
+ax.set_title("Logistic regression (model A, final): weights of the 21 inputs")
+plt.tight_layout()
+plt.show()
+''')
+
+# ---------------------------------------------------------------- 6.8
+md(r"""
+## 6.8 Decision rules: threshold and top-3 per race
+
+A model gives a probability; a yes/no prediction needs a rule. Two rules, both **fixed without validation labels**:
+1. **Probability threshold:** "podium" if the probability is at least *t*. *t* is the value that maximises F1 on the **out-of-fold predictions** (2011–2018, each made by a model that never saw those seasons), then frozen. Training-set predictions are not used, because they are overfitted (especially for the forest). This rule can predict any number of podiums per race.
+2. **Top-3 per race:** the 3 highest probabilities in each race are "podium". It only compares drivers within the same race (all known before the start) and predicts exactly 3 per race, like reality. With exactly 3 real and 3 predicted podiums per race, its precision, recall and F1 are equal.
+
+Raising the threshold makes predictions fewer but surer: precision goes up, recall goes down. F1 balances the two.
+""")
+
+code(r'''
+THRESHOLDS = {}
+
+
+def f1_best_threshold(y, p):
+    prec, rec, thr = precision_recall_curve(y, p)
+    f1 = 2 * prec[:-1] * rec[:-1] / np.clip(prec[:-1] + rec[:-1], 1e-12, None)
+    i = int(np.argmax(f1))
+    return float(thr[i]), float(f1[i])
+
+
+for family in FAMILIES:
+    p_oof = OOF[("A", family, CHOSEN[("A", family)]["setting"])]
+    THRESHOLDS[("A", family)], f1_oof = f1_best_threshold(y_oof["A"], p_oof)
+    CHOSEN[("A", family)]["oof F1 at threshold"] = f1_oof
+display(pd.DataFrame({f: {"threshold (frozen)": THRESHOLDS[("A", f)], "out-of-fold F1 at it": CHOSEN[("A", f)]["oof F1 at threshold"]}
+                      for f in FAMILIES}).T.round(4))
+
+fig, axes = plt.subplots(1, 4, figsize=(17, 3.4), sharey=True)
+for ax, family in zip(axes, FAMILIES):
+    p_oof = OOF[("A", family, CHOSEN[("A", family)]["setting"])]
+    prec, rec, thr = precision_recall_curve(y_oof["A"], p_oof)
+    ax.plot(thr, prec[:-1], label="precision")
+    ax.plot(thr, rec[:-1], label="recall")
+    ax.plot(thr, 2 * prec[:-1] * rec[:-1] / np.clip(prec[:-1] + rec[:-1], 1e-12, None), label="F1")
+    ax.axvline(THRESHOLDS[("A", family)], color="black", ls="--", label=f"frozen t = {THRESHOLDS[('A', family)]:.2f}")
+    ax.set_title(f"{family} (out-of-fold, 2011-2018)", fontsize=9)
+    ax.set_xlabel("threshold")
+    ax.legend(fontsize=7)
+plt.tight_layout()
+plt.show()
+''')
+
+# ---------------------------------------------------------------- 6.9
+md(r"""
+## 6.9 Validation (2019–2021): one score per final model
+
+Every final model is scored **once** on the validation seasons with its frozen threshold. Nothing below is used to change a setting, a threshold or a model; the "primary model" (6.11) is designated by the cross-validation scores, not by these.
+""")
+
+code(r'''
+VAL_PRED = {}
+for family in FAMILIES:
+    VAL_PRED[("A", family)] = predict_final(FINAL6[("A", family)], VAL_ROWS, f"A {family} validation")
+# Baselines, fitted on all model-A training seasons
+grid_pipe = fit6(grid_only(), TRAIN_A_ROWS, "grid-only LR final")
+log_predict(VAL_ROWS, "grid-only LR validation")
+VAL_PRED[("A", "grid-only LR")] = grid_pipe.predict_proba(VAL_ROWS[FINAL_FEATURES])[:, 1]
+rule_val = (VAL_ROWS["grid"] <= 3).astype(int).to_numpy()
+
+THRESHOLDS[("A", "grid-only LR")], _ = f1_best_threshold(y_oof["A"], BASELINE_OOF)
+CV_MEAN = {("A", f): CHOSEN[("A", f)]["cv mean PR-AUC"] for f in FAMILIES}
+CV_MEAN[("A", "grid-only LR")] = baseline_cv.loc["mean", "grid-only LR: PR-AUC"]
+
+val_table = [{"model": "rule: grid <= 3", "mean CV PR-AUC": np.nan, "PR-AUC": np.nan, "ROC-AUC": np.nan, "Brier": np.nan,
+              "threshold": np.nan, "precision": precision_score(y_val, rule_val), "recall": recall_score(y_val, rule_val),
+              "F1": f1_score(y_val, rule_val), "predicted podiums": int(rule_val.sum()), "F1 top-3 per race": np.nan}]
+for name in ["grid-only LR"] + FAMILIES:
+    s = scores(y_val, VAL_PRED[("A", name)], THRESHOLDS[("A", name)], val_race)
+    val_table.append({"model": name, "mean CV PR-AUC": CV_MEAN[("A", name)], "threshold": THRESHOLDS[("A", name)], **s})
+val_table = pd.DataFrame(val_table).set_index("model")
+print(f"Validation 2019-2021: {len(VAL_ROWS):,} rows, {int(y_val.sum())} podiums (3 per race); every model-A final model, frozen thresholds")
+display(val_table.round(4))
+
+diff_rows = []
+for name in FAMILIES:
+    for base in ["grid-only LR", "logistic regression"]:
+        if name == base:
+            continue
+        d, lo, hi = paired_difference(VAL_PRED[("A", base)], VAL_PRED[("A", name)])
+        diff_rows.append({"model": name, "compared with": base, "PR-AUC difference": d, "95% interval": f"[{lo:+.4f}, {hi:+.4f}]",
+                          "clearly different?": "yes" if lo > 0 or hi < 0 else "no (interval includes 0)"})
+print("Paired race-resampling comparison on validation (500 resamples of the 60 races):")
+display(pd.DataFrame(diff_rows).round(4))
+''')
+
+code(r'''
+COLORS = {"grid-only LR": "#8C8C8C", "logistic regression": "#4C72B0", "random forest": "#55A868",
+          "gradient boosting": "#DD8452", "neural network": "#C44E52"}
+fig, axes = plt.subplots(1, 2, figsize=(14, 4.6))
+for name in ["grid-only LR"] + FAMILIES:
+    p = VAL_PRED[("A", name)]
+    prec, rec, _ = precision_recall_curve(y_val, p)
+    axes[0].plot(rec, prec, color=COLORS[name], label=f"{name} ({average_precision_score(y_val, p):.3f})")
+    fpr, tpr, _ = roc_curve(y_val, p)
+    axes[1].plot(fpr, tpr, color=COLORS[name], label=f"{name} ({roc_auc_score(y_val, p):.3f})")
+axes[0].axhline(y_val.mean(), color="black", ls=":", lw=0.8, label=f"random guess ({y_val.mean():.3f})")
+axes[0].set_xlabel("recall")
+axes[0].set_ylabel("precision")
+axes[0].set_title("Precision-recall curves, validation 2019-2021 (PR-AUC)")
+axes[1].plot([0, 1], [0, 1], color="black", ls=":", lw=0.8)
+axes[1].set_xlabel("false positive rate")
+axes[1].set_ylabel("true positive rate (recall)")
+axes[1].set_title("ROC curves, validation 2019-2021 (ROC-AUC)")
+for ax in axes:
+    ax.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+
+fig, axes = plt.subplots(1, 4, figsize=(16, 3.6))
+for ax, family in zip(axes, FAMILIES):
+    pred = (VAL_PRED[("A", family)] >= THRESHOLDS[("A", family)]).astype(int)
+    cm = confusion_matrix(y_val, pred)
+    ax.imshow(cm, cmap="Blues")
+    for (i, j), v in np.ndenumerate(cm):
+        ax.text(j, i, v, ha="center", va="center", color="white" if v > cm.max() / 2 else "black", fontsize=11)
+    ax.set_xticks([0, 1], ["no podium", "podium"])
+    ax.set_yticks([0, 1], ["no podium", "podium"])
+    ax.set_xlabel("predicted")
+    ax.set_ylabel("actual")
+    ax.set_title(f"{family}\n(threshold {THRESHOLDS[('A', family)]:.2f})", fontsize=9)
+plt.suptitle("Confusion matrices, validation 2019-2021 (model A, frozen thresholds)", fontsize=10)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**What validation shows.**
+- **All four families rank podium finishers about equally well:** validation PR-AUC 0.716–0.735 (logistic regression 0.735, random forest 0.733, gradient boosting 0.721, neural network 0.716). **No family is clearly better than logistic regression**: every interval of the difference includes 0.
+- **Three of the four clearly beat the grid-only baseline** (0.676): logistic regression +0.059 (interval +0.011 to +0.107), random forest +0.057, gradient boosting +0.044. The neural network's +0.039 is not clearly different (its interval just includes 0). So the other features (qualifying pace, standings, form) **do** add information beyond the starting position.
+- **F1 tells a more modest story.** With the frozen thresholds the models reach F1 0.712–0.725, and the top-3-per-race rule 0.700–0.717. The plain rule "podium if grid ≤ 3" scores **0.717**. As yes/no predictions, the models are about as good as trusting the front row; their gain is in **ranking and probabilities** (PR-AUC, Brier score), e.g. recognising a fast car that starts further back, not in many more correct yes/no calls.
+- The thresholds chosen on 2011–2018 transfer reasonably: every model predicts 209–230 podiums for the 180 real ones, i.e. it leans towards recall (0.78–0.81) over precision (0.63–0.67).
+""")
+
+md(r"""
+### Overfitting: training vs cross-validation vs validation
+
+- **Training** = the final model scored on the rows it was trained on (optimistic by nature).
+- **Cross-validation** = the mean over the four folds (each scored on seasons the fold's model never saw); F1 here uses the out-of-fold predictions at the frozen threshold.
+- **Validation** = 2019–2021.
+
+A large gap between training and the other two means the model memorised its training rows.
+""")
+
+code(r'''
+over = []
+for family in FAMILIES:
+    entry = FINAL6[("A", family)]
+    p_tr = predict_final(entry, TRAIN_A_ROWS, f"A {family} training rows (overfitting check)")
+    p_oof = OOF[("A", family, CHOSEN[("A", family)]["setting"])]
+    t = THRESHOLDS[("A", family)]
+    over.append({"model": family,
+                 "PR-AUC train": average_precision_score(TRAIN_A_ROWS["podium"], p_tr), "PR-AUC CV": CV_MEAN[("A", family)],
+                 "PR-AUC validation": average_precision_score(y_val, VAL_PRED[("A", family)]),
+                 "ROC-AUC train": roc_auc_score(TRAIN_A_ROWS["podium"], p_tr),
+                 "ROC-AUC CV (out-of-fold)": roc_auc_score(y_oof["A"], p_oof),
+                 "ROC-AUC validation": roc_auc_score(y_val, VAL_PRED[("A", family)]),
+                 "F1 train": f1_score(TRAIN_A_ROWS["podium"], p_tr >= t), "F1 CV (out-of-fold)": f1_score(y_oof["A"], p_oof >= t),
+                 "F1 validation": f1_score(y_val, VAL_PRED[("A", family)] >= t)})
+over = pd.DataFrame(over).set_index("model")
+display(over.round(4))
+
+fig, ax = plt.subplots(figsize=(10, 3.6))
+x = np.arange(len(FAMILIES))
+for i, (col, color) in enumerate([("PR-AUC train", "#8C8C8C"), ("PR-AUC CV", "#4C72B0"), ("PR-AUC validation", "#55A868")]):
+    ax.bar(x + (i - 1) * 0.27, over[col], 0.27, color=color, label=col.replace("PR-AUC ", ""))
+    for xi, v in zip(x, over[col]):
+        ax.text(xi + (i - 1) * 0.27, v + 0.01, f"{v:.2f}", ha="center", fontsize=7)
+ax.set_xticks(x, FAMILIES)
+ax.set_ylim(0, 1.08)
+ax.set_ylabel("PR-AUC")
+ax.set_title("Training vs cross-validation vs validation PR-AUC (model A)")
+ax.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**Overfitting.** Small, by design.
+- Logistic regression and the network score about the same on their training rows as in cross-validation (0.69–0.71), so they did not memorise the training seasons.
+- The tree models show a modest gap: gradient boosting 0.736 on training vs 0.693 in cross-validation, the random forest 0.705 vs 0.684. The chosen settings are the shallow, heavily regularised ones (depth 6 with at least 50 rows per leaf; 7 leaves per tree, 100 trees), which kept the gap small.
+- **Validation is higher than cross-validation for every model** (by 0.01–0.05). That is not overfitting in reverse: 2019–2021 were dominated by a few teams, which makes podiums easier to predict, and the earlier CV seasons were harder (fold scores range from about 0.64 to 0.79 by season).
+""")
+
+md(r"""
+### Probability quality (calibration)
+
+A probability of 0.3 should come true about 30% of the time. Three checks on validation:
+- **Brier score** (in the validation table above; lower is better);
+- a **reliability diagram**: rows grouped by predicted probability, the actual podium rate of each group against the predicted one (perfect = the diagonal);
+- the **sum of predicted probabilities per race**: every race has exactly 3 podiums, so well-calibrated probabilities should add up to about 3. No re-calibration is applied (by decision); this only reports.
+""")
+
+code(r'''
+from sklearn.calibration import calibration_curve
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 4.4))
+axes[0].plot([0, 1], [0, 1], color="black", ls=":", lw=0.8, label="perfect")
+for family in FAMILIES:
+    frac, mean_pred = calibration_curve(y_val, VAL_PRED[("A", family)], n_bins=10, strategy="quantile")
+    axes[0].plot(mean_pred, frac, marker="o", ms=4, color=COLORS[family], label=family)
+axes[0].set_xlabel("mean predicted probability (10 groups of equal size)")
+axes[0].set_ylabel("actual podium rate")
+axes[0].set_title("Reliability diagram, validation 2019-2021 (model A)")
+axes[0].legend(fontsize=8)
+
+race_sums = pd.DataFrame({f: pd.Series(VAL_PRED[("A", f)]).groupby(val_race).sum().to_numpy() for f in FAMILIES})
+axes[1].boxplot([race_sums[f] for f in FAMILIES])
+axes[1].set_xticks(range(1, len(FAMILIES) + 1), FAMILIES, fontsize=8)
+axes[1].axhline(3, color="black", ls=":", label="3 podiums per race")
+axes[1].set_ylabel("sum of predicted probabilities")
+axes[1].set_title("Sum of probabilities per race (60 validation races)")
+axes[1].legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+display(race_sums.describe().loc[["mean", "min", "max"]].round(2))
+''')
+
+md(r"""
+**Probability quality.** Reasonable for every family.
+- Brier scores 0.064–0.065, better than the grid-only baseline (0.071).
+- On average the probabilities in a race add up to **3.0–3.3** for the 3 real podiums, so they are slightly too high overall, but not by much (no model uses class weighting, which would have inflated them).
+- The reliability diagram shows, group by group, how far each family's probabilities are from the diagonal. The groups are small (120 rows each), so a single group's deviation is mostly noise.
+- No re-calibration is applied, as decided.
+""")
+
+# ---------------------------------------------------------------- 6.10
+md(r"""
+## 6.10 Model A (2003–2018) vs model B (1950–2018)
+
+Model B gets **exactly the same treatment** as model A: the same four grids, the same four fold scoring blocks (fold training simply starts in 1950), the same tie-breaking rule, pre-processing re-fitted inside every fold and its own pipelines from 5.7 for the final fit, its own out-of-fold thresholds, and one validation score per final model.
+
+*Note:* the model-B searches are the most expensive cells of the notebook (four families on up to 20,000 rows per fold).
+""")
+
+code(r'''
+t0 = time.time()
+for family in FAMILIES:
+    run_search("B", family)
+    show_search("B", family)
+    FINAL6[("B", family)] = fit_final("B", family)
+    THRESHOLDS[("B", family)], f1_oof_b = f1_best_threshold(y_oof["B"], OOF[("B", family, CHOSEN[("B", family)]["setting"])])
+    CHOSEN[("B", family)]["oof F1 at threshold"] = f1_oof_b
+    VAL_PRED[("B", family)] = predict_final(FINAL6[("B", family)], VAL_ROWS, f"B {family} validation")
+print(f"({time.time() - t0:.0f} s for the model-B searches)")
+''')
+
+code(r'''
+ab = []
+for family in FAMILIES:
+    sa = scores(y_val, VAL_PRED[("A", family)], THRESHOLDS[("A", family)], val_race)
+    sb = scores(y_val, VAL_PRED[("B", family)], THRESHOLDS[("B", family)], val_race)
+    d, lo, hi = paired_difference(VAL_PRED[("A", family)], VAL_PRED[("B", family)])
+    ab.append({"model": family, "CV PR-AUC A": CHOSEN[("A", family)]["cv mean PR-AUC"], "CV PR-AUC B": CHOSEN[("B", family)]["cv mean PR-AUC"],
+               "val PR-AUC A": sa["PR-AUC"], "val PR-AUC B": sb["PR-AUC"], "val PR-AUC B - A": d, "95% interval": f"[{lo:+.4f}, {hi:+.4f}]",
+               "val ROC-AUC A": sa["ROC-AUC"], "val ROC-AUC B": sb["ROC-AUC"], "val F1 A": sa["F1"], "val F1 B": sb["F1"],
+               "val F1 top-3 A": sa["F1 top-3 per race"], "val F1 top-3 B": sb["F1 top-3 per race"],
+               "Brier A": sa["Brier"], "Brier B": sb["Brier"], "chosen B": str(CHOSEN[("B", family)]["params"])})
+ab = pd.DataFrame(ab).set_index("model")
+display(ab.round(4))
+
+fig, ax = plt.subplots(figsize=(10, 3.6))
+x = np.arange(len(FAMILIES))
+for i, (m, color) in enumerate([("A", "#4C72B0"), ("B", "#DD8452")]):
+    ax.bar(x + (i - 0.5) * 0.35, ab[f"CV PR-AUC {m}"], 0.35, color=color, alpha=0.45, label=f"model {m}: CV")
+    ax.scatter(x + (i - 0.5) * 0.35, ab[f"val PR-AUC {m}"], color=color, edgecolor="black", zorder=3, label=f"model {m}: validation")
+ax.set_xticks(x, FAMILIES)
+ax.set_ylim(0.5, 0.85)
+ax.set_ylabel("PR-AUC")
+ax.set_title("Model A vs model B: cross-validation (bars) and validation (dots)")
+ax.legend(fontsize=8, ncol=2)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**Model A vs model B.** No meaningful difference.
+- In cross-validation the two are within about 0.014 of each other for every family (model A ahead for logistic regression, equal elsewhere).
+- On validation, model B is slightly lower for logistic regression (−0.014) and the random forest (−0.002), and slightly higher for gradient boosting (+0.006) and the network (+0.016). **Every interval includes 0.**
+- **Fifty extra seasons (3.5× more rows) do not buy better podium predictions for 2019–2021.**
+""")
+
+md(r"""
+### Is it the amount of data or the age of the data?
+
+Model B differs from model A in two ways at once: **more** rows and **older** rows. Two analyses separate them. They use validation only to **describe** the effect (no setting is changed because of them), with logistic regression and gradient boosting at model A's chosen settings and pre-processing re-fitted on each training window.
+1. **Training start year:** train on `start`–2018 for start = 1950, 1970, 1980, 1994, 2003, 2010.
+2. **Same size, mixed eras:** five random samples of whole races from 1950–2018 with as many rows as model A (6,381), compared with model A (same size, modern only) and full model B (all rows).
+""")
+
+code(r'''
+def window_score(family, rows, label):
+    params = CHOSEN[("A", family)]["params"]
+    pipe = Pipeline([("pre", make_preprocessor(scaled=SCALED[family])), ("model", make_estimator(family, params))])
+    fit6(pipe, rows, label)
+    log_predict(VAL_ROWS, f"{label} validation")
+    return pipe.predict_proba(VAL_ROWS[FINAL_FEATURES])[:, 1]
+
+
+WINDOW_FAMILIES = ["logistic regression", "gradient boosting"]
+window = []
+win_pred = {}
+for start in [1950, 1970, 1980, 1994, 2003, 2010]:
+    rows = TRAIN_B_ROWS[TRAIN_B_ROWS["year"] >= start]
+    for family in WINDOW_FAMILIES:
+        win_pred[(family, start)] = window_score(family, rows, f"window {start}-2018 {family}")
+for start in [1950, 1970, 1980, 1994, 2003, 2010]:
+    rows = TRAIN_B_ROWS[TRAIN_B_ROWS["year"] >= start]
+    for family in WINDOW_FAMILIES:
+        d, lo, hi = paired_difference(win_pred[(family, 2003)], win_pred[(family, start)])
+        window.append({"training seasons": f"{start}-2018", "start": start, "rows": len(rows), "model": family,
+                       "val PR-AUC": average_precision_score(y_val, win_pred[(family, start)]),
+                       "difference vs 2003-2018": d, "95% interval": f"[{lo:+.4f}, {hi:+.4f}]", "low": lo, "high": hi})
+window = pd.DataFrame(window)
+display(window.pivot(index=["training seasons", "rows"], columns="model",
+                     values=["val PR-AUC", "difference vs 2003-2018", "95% interval"]).round(4))
+
+rng_sub = np.random.default_rng(SEED)
+races_b = TRAIN_B_ROWS.groupby("raceId").size()
+sub = []
+for s in range(5):
+    order = rng_sub.permutation(races_b.index.to_numpy())
+    keep = order[: int(np.searchsorted(races_b.loc[order].cumsum().to_numpy(), len(TRAIN_A_ROWS))) + 1]
+    rows = TRAIN_B_ROWS[TRAIN_B_ROWS["raceId"].isin(keep)]
+    for family in WINDOW_FAMILIES:
+        p = window_score(family, rows, f"same-size sample {s + 1} {family}")
+        sub.append({"sample": s + 1, "model": family, "rows": len(rows), "races": len(keep),
+                    "share of rows from 2003+": (rows["year"] >= 2003).mean(), "val PR-AUC": average_precision_score(y_val, p)})
+sub = pd.DataFrame(sub)
+size_era = []
+for family in WINDOW_FAMILIES:
+    s = sub[sub["model"] == family]["val PR-AUC"]
+    size_era.append({"model": family, "A: 2003-2018 (6,381 rows, modern)": average_precision_score(y_val, win_pred[(family, 2003)]),
+                     "same size, mixed eras (mean of 5)": s.mean(), "same size, mixed eras (SD)": s.std(),
+                     "B: 1950-2018 (22,092 rows)": average_precision_score(y_val, win_pred[(family, 1950)])})
+display(pd.DataFrame(size_era).set_index("model").round(4))
+print("Rows and race counts of the same-size samples:", sub.groupby("sample")[["rows", "races"]].first().to_dict("list"))
+
+fig, ax = plt.subplots(figsize=(10, 3.8))
+for family, color in [("logistic regression", "#4C72B0"), ("gradient boosting", "#DD8452")]:
+    w = window[window["model"] == family]
+    ax.plot(w["start"], w["val PR-AUC"], marker="o", color=color, label=f"{family}: trained on start-2018")
+    ax.axhline(sub[sub["model"] == family]["val PR-AUC"].mean(), color=color, ls=":", label=f"{family}: same size as A, mixed eras")
+ax.set_xlabel("first training season")
+ax.set_ylabel("validation PR-AUC")
+ax.set_title("Training window: does adding older seasons help? (all windows end in 2018)")
+ax.legend(fontsize=7)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**Amount vs age of data** (descriptive only; nothing was changed because of it).
+- **Same size, different eras:** with the same number of rows, the modern-only window (model A) scores higher than random samples of races from all eras: logistic regression 0.735 vs 0.716 (± 0.009 over the five samples), gradient boosting 0.721 vs 0.712 (± 0.010). At equal size, **old races are less useful** than modern ones, because the relationships changed (reliability, grid sizes, how often the front row converts).
+- **Adding older seasons on top of 2003–2018** slightly hurts logistic regression (about −0.011 for every start before 2003) and slightly helps gradient boosting (+0.001 to +0.006), which can treat old and new seasons differently through `quali_missing` and the other era-linked inputs. Both effects are small compared with the noise of 60 races.
+- **Conclusion:** model A's 2003+ window is a sound default. Model B is kept for comparison, as planned.
+""")
+
+# ---------------------------------------------------------------- 6.11
+md(r"""
+## 6.11 Final selection and freeze
+
+**Everything below is frozen now, before the test seasons are used:** for each of the 8 final models (4 families × model A and model B) and the two baselines: the chosen setting, the fitted pre-processing, the fitted model, the training seasons, the threshold, and (for the network) the number of epochs and the seed. Nothing is re-tuned after this point.
+
+**Primary model (rule fixed in advance):** among the model-A families, the highest **mean cross-validation** PR-AUC; if a simpler family is not clearly worse by the same paired one-standard-error rule (on the four folds), the simpler family wins (logistic regression < random forest < gradient boosting < neural network). Validation scores do **not** decide it, so the validation comparison in 6.9 stays an honest check.
+
+The frozen settings are also written to `outputs/frozen_models.json` (settings, thresholds and a fingerprint; no data), so the later test evaluation can show it uses exactly these.
+""")
+
+code(r'''
+SIMPLER_FAMILY = {f: i for i, f in enumerate(FAMILIES)}
+family_folds = pd.DataFrame({f: SEARCH[("A", f)].loc[CHOSEN[("A", f)]["setting"], FOLD_COLS] for f in FAMILIES}).T.astype(float)
+best = family_folds.mean(axis=1).idxmax()
+near = paired_ties(family_folds, best)
+PRIMARY_MODEL = ("A", min(near, key=SIMPLER_FAMILY.get))
+display(family_folds.assign(mean=family_folds.mean(axis=1)).round(4))
+print(f"Highest mean CV PR-AUC: {best} ({family_folds.loc[best].mean():.4f}); not clearly worse (paired one-SE rule): {near}")
+print(f"Primary model: {PRIMARY_MODEL[1]}, model {PRIMARY_MODEL[0]}")
+
+FROZEN = {}
+for (m, family), entry in FINAL6.items():
+    c = CHOSEN[(m, family)]
+    FROZEN[f"{m} | {family}"] = {
+        "model version": m, "training seasons": f"{TRAIN_ROWS[m]['year'].min()}-{TRAIN_ROWS[m]['year'].max()}",
+        "family": family, "settings": {k: (list(v) if isinstance(v, tuple) else v) for k, v in c["params"].items()},
+        "pre-processing": f"PREPROCESSORS[('{m}', '{'scaled' if SCALED[family] else 'tree'}')]",
+        "threshold": round(THRESHOLDS[(m, family)], 6), "seed": SEED,
+        "epochs": int(entry["model"].epochs) if family == "neural network" else None,
+        "mean CV PR-AUC": round(c["cv mean PR-AUC"], 6),
+        "validation PR-AUC": round(average_precision_score(y_val, VAL_PRED[(m, family)]), 6),
+        "primary": (m, family) == PRIMARY_MODEL}
+FROZEN["A | grid-only LR (baseline)"] = {"model version": "A", "training seasons": "2003-2018", "family": "logistic regression on grid",
+                                         "threshold": round(THRESHOLDS[("A", "grid-only LR")], 6),
+                                         "validation PR-AUC": round(average_precision_score(y_val, VAL_PRED[("A", "grid-only LR")]), 6)}
+FROZEN["rule: grid <= 3 (baseline)"] = {"rule": "podium if grid <= 3"}
+FROZEN_MODELS = {**FINAL6, ("A", "grid-only LR"): {"pipe": grid_pipe}}
+FROZEN_FINGERPRINT = hashlib.sha256(json.dumps(FROZEN, sort_keys=True).encode()).hexdigest()
+FROZEN_PATH = CLEAN_DATA_DIR.parent / "frozen_models.json"
+FROZEN_PATH.write_text(json.dumps({"fingerprint": FROZEN_FINGERPRINT, "models": FROZEN}, indent=1), encoding="utf-8")
+display(pd.DataFrame(FROZEN).T.drop(columns=["rule"], errors="ignore"))
+print(f"Frozen {len(FROZEN)} entries -> {FROZEN_PATH} | fingerprint {FROZEN_FINGERPRINT[:16]}...")
+
+
+def predict_frozen(key, rows):
+    """Probabilities and both decision rules of a frozen model, for any rows (used later for the test seasons)."""
+    if key == ("A", "grid-only LR"):
+        p = FROZEN_MODELS[key]["pipe"].predict_proba(rows[FINAL_FEATURES])[:, 1]
+    else:
+        e = FROZEN_MODELS[key]
+        p = e["model"].predict_proba(e["pre"].transform(rows[FINAL_FEATURES]))[:, 1]
+    return pd.DataFrame({"probability": p, "threshold rule": (p >= THRESHOLDS[key]).astype(int),
+                         "top-3 rule": top3_per_race(p, rows["raceId"].to_numpy())}, index=rows.index)
+
+
+# The frozen objects reproduce the validation predictions exactly (so they can be reused unchanged later).
+for key in FROZEN_MODELS:
+    assert np.array_equal(predict_frozen(key, VAL_ROWS)["probability"].to_numpy(), VAL_PRED[key]), key
+print("predict_frozen reproduces every frozen model's validation predictions exactly.")
+''')
+
+code(r'''
+# Final guards for section 6.
+fit_log6, pred_log6 = pd.DataFrame(FIT6_LOG), pd.DataFrame(PREDICT6_LOG)
+fold_fits = fit_log6[fit_log6["must end before"].notna()]
+assert (fold_fits["seasons"].str[-4:].astype(int) < fold_fits["must end before"]).all(), "a fold fit used a later season"
+assert fit_log6["seasons"].str[-4:].astype(int).max() <= SPLIT_YEARS["train"][1], "a fit used a non-training season"
+assert pred_log6["splits"].isin(["train", "validation"]).all(), "a prediction was made on test rows"
+assert not any("test" in field.lower() for record in FROZEN.values() for field in record), "a test metric in the frozen record"
+assert hashlib.sha256(FINAL_FEATURES_PATH.read_bytes()).hexdigest() == FF_SHA_BEFORE, "final_features.csv changed"
+print(f"PASS {len(fit_log6)} fits in section 6, all on training rows; all {len(fold_fits)} cross-validation fits used only seasons "
+      f"before their scoring block (asserted at fit time and re-checked from the log)")
+print(f"PASS {len(pred_log6)} predictions, only on training or validation rows; no test row was used and no test metric computed")
+print("PASS outputs/final_features.csv unchanged")
+display(fit_log6.groupby("seasons").size().rename("fits").to_frame().T)
+''')
+
+md(r"""
+**Summary of section 6.**
+- **Settings** were chosen by time-ordered cross-validation on 2003–2018 (paired one-standard-error rule, simplest of the ties). Model A chose:
+  - logistic regression: `C = 1`, no class weighting;
+  - random forest: depth 6, at least 50 rows per leaf, `sqrt` features;
+  - gradient boosting: learning rate 0.05, 7 leaves, at least 80 rows per leaf, 100 trees;
+  - neural network: one hidden layer of 16 units, no dropout, weight decay 0.001, 144 epochs.
+- **Validation (2019–2021, used once):** PR-AUC 0.716–0.735 for the four families. Three clearly beat the grid-only baseline (0.676); none is clearly better than logistic regression. As yes/no predictions (F1 ≈ 0.71–0.72), the models are about as good as the rule "grid ≤ 3" (0.717); their value is in ranking and probabilities.
+- **Primary model: logistic regression, model A.** Highest mean cross-validation PR-AUC (0.703), the simplest family, and well-calibrated probabilities. Its improvement over the grid-only baseline is clear (+0.059, interval +0.011 to +0.107); its edge over the other families is not.
+- **Model A vs model B:** no meaningful difference. At equal size, modern seasons are more useful than old ones.
+- **Frozen:** 8 models (4 families × A and B) + 2 baselines, with settings, fitted pipelines, thresholds and a fingerprint (`outputs/frozen_models.json`). **The test seasons 2022–2024 have not been used**; they are evaluated once, in a separate step, with exactly these frozen models.
+""")
+
+
 nb = {
     "cells": cells,
     "metadata": {

@@ -12,7 +12,7 @@ This README is the project log. It records **what was done, why, and what was tr
 
 | Path | What it is |
 |---|---|
-| `f1_podium_prediction.ipynb` | **The deliverable.** One run-all notebook (the brief requires a single notebook). Sections 1–10. Saved with outputs. |
+| `f1_podium_prediction.ipynb` | **The deliverable.** One run-all notebook (the brief requires a single notebook). The committed copy is the **executed** run of sections 1–10 (commit `f5660ee`); the generator now also contains sections 11–12, and the executed notebook with them will replace this copy once a verified full run is saved (see 7.8 "Status"). |
 | `tools/build_notebook.py` | **Generator** that writes every markdown and code cell of the notebook. The notebook was built from this script. |
 | `tools/run_notebook.py` | Executes the notebook top to bottom with `jupyter_client` and stores the outputs (no `nbconvert` needed). |
 | `outputs/anomalies/` | CSVs written by notebook section 1.12: one per raw table, plus `_summary.csv`. |
@@ -21,6 +21,8 @@ This README is the project log. It records **what was done, why, and what was tr
 | `outputs/frozen_models.json` | **The frozen section-6 models**, written by notebook 6.11: for each of the 8 final models (4 families × model A and B) and the 2 baselines, the chosen settings, pre-processing, threshold, training seasons, seed / epochs, CV and validation PR-AUC, and a SHA-256 fingerprint of the whole record. No data and no test metric. Rewritten on every run (identical as long as nothing changes). |
 | `outputs/model_artifacts/` | **The fitted frozen models as files**, written by notebook 6.12 on every run: one `cloudpickle` file per scikit-learn model (fitted pre-processing + model), `*_preprocessor.pkl` + `*_weights.pt` (PyTorch `state_dict`) per network, the grid-only baseline, `reference_validation_predictions.npz`, `manifest.json` (files + SHA-256, full-precision thresholds incl. exact hex, architecture/epochs, input columns, frozen fingerprint, library versions) and `load_artifacts.py`. ~6 MB (mostly the two random forests). See README 7.3 "Model artifacts". |
 | `outputs/frozen_models_v2.json`, `outputs/model_artifacts_v2/` | **The second freeze (v2, section 7)**: same structure as v1 (record + fingerprint; fitted models, manifest, reference validation predictions, loader). The v2 record also stores the v1 fingerprint and a `changed from v1` flag. **The test evaluation (7.5) uses these files.** The v1 files stay as the record of the first freeze. |
+| `outputs/podium_inference.py` | **The inference interface** (`PodiumPredictor`), written by notebook section 11 and usable outside the notebook: `PodiumPredictor('outputs/model_artifacts_v2').predict_proba(records)` / `.predict_race(entries)`. Loads only the frozen v2 primary model (checksums + fingerprint). |
+| `.gitignore` | Ignores `__pycache__/` (bytecode caches created when the notebook loads `load_artifacts.py` / `podium_inference.py`). |
 | `../Dataset.zip` | Raw data (one folder above the repo, **not** in git). Read directly from the zip, never extracted. |
 | `../GUC_..._2026-09-30....pdf` | The milestone brief (one folder above the repo). |
 
@@ -36,12 +38,12 @@ python tools/run_notebook.py  f1_podium_prediction.ipynb    # execute top to bot
   - keep editing `tools/build_notebook.py` and regenerate (that's how sections 1–3 were made), **or**
   - edit the notebook directly from now on and stop using the generator.
 - The data path is auto-detected: env var `F1_DATA` → Kaggle mount `/kaggle/input/formula-1-world-championship-1950-2020` → `../Dataset.zip` → `Dataset.zip` → `../Dataset` / `Dataset` / `data/raw`. It works on Kaggle (submission requirement) and locally.
-- Environment: the notebook prints its versions in 6.1. Last full run: Python 3.14, numpy 2.4, pandas 2.3, scikit-learn 1.8, PyTorch 2.10 (CPU), joblib (parallel CV jobs). Earlier sections were first built with Python 3.10 / numpy 2.2. SHAP and LIME are installed for the XAI section; XGBoost/LightGBM/Keras are not used.
+- Environment: the notebook prints its versions in 6.1. Last full run: Python 3.14, numpy 2.4, pandas 2.3, scikit-learn 1.8, PyTorch 2.10 (CPU), joblib (parallel CV jobs). **Do not install or uninstall packages while the notebook runs:** on 18 Oct torch was uninstalled mid-run, so a new parallel worker could not import it (`BrokenProcessPool`); torch 2.10.0+cpu was reinstalled (all versions again equal the ones recorded with the v2 freeze). The CV runner now also falls back to running the jobs in the main process if a worker dies (`F1_N_JOBS=1` forces serial runs). Earlier sections were first built with Python 3.10 / numpy 2.2. SHAP and LIME are installed for the XAI section; XGBoost/LightGBM/Keras are not used.
 - On Windows, set `PYTHONIOENCODING=utf-8` when printing names with accents from a script (the terminal codepage otherwise fails on e.g. *Räikkönen*).
 
 ### Git
 - Work happens on branch **`amr`** (repo `Farah-Essam/ACL-2`; earlier work on `youssef`, merged into `amr`).
-- Commits so far: audit + cleaning + questions (`d7fda8a`); cleaning review fixes, Indianapolis 500 removal, cleaned-dataset export and the approved section-4 plan (`45d54b0`); section 4 feature selection & engineering (16 Oct 2026). `Project.code-workspace` is a local editor file and is not committed.
+- Commits so far: audit + cleaning + questions (`d7fda8a`); cleaning review fixes, Indianapolis 500 removal, cleaned-dataset export and the approved section-4 plan (`45d54b0`); section 4 feature selection & engineering (16 Oct 2026); section-4 review fixes + feature export (`bce49fd`); sections 5–6 (`a3ac4f7`); sections 7–8 (`a8c1dcc`); sections 9–10 (`f5660ee`); final compliance round: sections 11–12, accuracy and metric choice, season pin, worker fallback, docs (18 Oct 2026). `Project.code-workspace` is a local editor file and is not committed.
 - Commit or push only when the user asks.
 
 ---
@@ -57,7 +59,7 @@ python tools/run_notebook.py  f1_podium_prediction.ipynb    # execute top to bot
 - **Models:** ≥ 2 statistical models + 1 shallow NN on the same table; ROC-AUC, PR-AUC, F1 on validation **and** test; thresholds and hyperparameters chosen without the test set; baseline required; ≥ 3 modeling attempts.
 - **Experiments:** feature-group ablation; ≥ 2 preprocessing-order experiments.
 - **XAI:** permutation importance + SHAP (global); LIME and/or local SHAP; explicitly **not causal**.
-- **Deliverables:** run-all notebook, inference function (complete + partially-missing record), PDF report, Kaggle notebook link, GitHub repo link. **Deadline: 18 Oct 2026, 23:59.**
+- **Deliverables:** run-all notebook, inference function (complete + partially-missing record), PDF report, Kaggle notebook link, GitHub repo link. **Deadline: 18 Oct 2026, 23:59 in the brief; extended by the team to Mon 19 Oct 2026, 23:59 (confirm against the official course announcement).** Submission form: https://forms.gle/esDxHsvfzffYHVAZ9 (Kaggle link, GitHub link, PDF report).
 - Evaluation: every team member can be asked to justify any step. "An AI suggested it" isn't a justification, so every choice needs evidence in the notebook.
 
 ---
@@ -76,7 +78,9 @@ python tools/run_notebook.py  f1_podium_prediction.ipynb    # execute top to bot
 | **8. Exploratory (post-test)** | done (17 Oct 2026) | 8 configurations on the historical folds only (grid shape, race-relative features, GB reference); no change to the frozen models. Results in README 7.5 |
 | **9. Feature-group ablation** | done (17 Oct 2026) | leave-one-group-out refits of LR and HGB (frozen v2 settings) on the historical folds. Results in README 7.7 |
 | **10. Explainable AI** | done (17 Oct 2026) | LR weights / odds ratios, global + local SHAP, complete-race top-3 explanations, LIME (supplementary), individual + grouped permutation importance, tree SHAP for HGB, method comparison. Results in README 7.7 |
-| 8+. Ablation, XAI, inference, report | to do | |
+| **11. Final inference** (11.1–11.5) | done (18 Oct 2026) | `PodiumPredictor` (written to `outputs/podium_inference.py`): frozen primary model, schema checks, single records (complete / partially missing) and complete races (top 3); reproduces every frozen validation/test probability and every race's official picks exactly. Results in README 7.8 |
+| **12. Known limitations and conclusions** | done (18 Oct 2026) | consolidated, evidence-based limitations (data/era, models, explanations, reproducibility) and conclusions |
+| PDF analytical report | see README 7.8 | built from the executed notebook's outputs |
 
 Variables available after running sections 1–4:
 - `RAW`: dict of raw tables, **all strings** (`dtype=str`, `keep_default_na=False`).
@@ -481,9 +485,20 @@ Order: Phase 1 re-tuning → Phase 2 freeze v2 → Phase 3 one-time test → Pha
 - **LIME** may need `pip install lime` (internet). If that fails, 10.6 prints a clear limitation message instead of silently skipping.
 - **Runtime:** Sections 9–10 take about 1 minute; on Kaggle (4 CPUs) the whole notebook is estimated at 1.5–2 hours, mostly Sections 6–7.
 
-### 7.8 Later steps
+### 7.8 Final compliance round (18 Oct 2026): sections 11–12, metrics, season pin
 
-1. ~~Ablation and XAI~~: done (sections 9–10). Inference function with two modes: a complete race → its 3 most likely podium finishers (official output), a single driver → podium probability (use `load_model_artifacts('outputs/model_artifacts_v2')`, which already handles partial records); report.
+Changes after the compliance audit against the original brief. **No model, feature, threshold, split or frozen result changed**; the v1/v2 fingerprints are verified as before.
+- **Accuracy and the metric choice (6.1, 6.9, 7.5):** `scores()` also reports **accuracy**, so the validation and test tables show it for every model, next to a new reference row **"always 'no podium'"** (accuracy ≈ 0.85 with precision/recall/F1 = 0), which shows why accuracy is misleading at a 15% podium rate. 6.1 now states the **primary metric (PR-AUC)** and the **secondary metrics** (ROC-AUC, binary F1, precision, recall, accuracy, race-level top-3 F1, Brier) and why accuracy is not used for any decision.
+- **Season pin (1.0) and split check (4.1):** raw tables are filtered in memory to seasons ≤ 2024 right after loading (nothing dropped with our files; a newer Kaggle download could contain 2025+ races, which would otherwise enter the test set). 4.1 asserts the established split: model A 300 / 60 / 68 races and 6,381 / 1,199 / 1,354 rows; model B 986 races / 22,092 training rows.
+- **Section 11, final inference (brief deliverable 7):** `PodiumPredictor` in `outputs/podium_inference.py` (written by the notebook, usable outside it). It loads only the frozen primary model (checksums + v2 fingerprint), validates the schema (18 features present, numeric, finite, flags 0/1, ranges; `grid` must be known; missing values allowed elsewhere and filled by the frozen pre-processing), returns probabilities with identifiers and the list of unknown inputs, and for a complete race (rows = `n_starters`, one `raceId`, unique drivers) the 3 most likely podium finishers (ties by grid, then `driverId`, as in 7.10); incomplete races are refused unless `allow_incomplete=True` (warning). Checks: identical probabilities on all 1,199 validation and 1,354 test rows and identical picks in all 128 races. Demos: complete record (Verstappen, 2021 Abu Dhabi, 0.909), the same record with qualifying details and form unknown (0.807), the full 2024 Abu Dhabi GP (Norris, Sainz, Verstappen; 2 of 3 correct), and 11 invalid inputs.
+- **Section 12:** consolidated limitations (qualifying-coverage drift, era sensitivity, season predictability, recording quirks, identity choices, information ceiling, top-3 vs grid not clearly different, calibration, sample size, post-test work, non-causal explanations, reproducibility) and conclusions.
+- **Post-test exploratory checks (outside the notebook, historical folds only, nothing changed):** Run 11, a driver-form reset after breaks of > 550 days (+ comeback flag): identical logistic-regression podium picks, PR-AUC ±0.004; Run 12, XGBoost (24 settings + nested check): no clear gain over logistic regression. Details in `TRAINING_RUNS.md`.
+- **Notebook map** in the title cell (brief section → notebook section); `.gitignore` for `__pycache__/` (the loaders' bytecode cache).
+- **Parallel-worker fallback (6.2, `run_jobs`):** if a joblib worker dies or cannot start (`BrokenProcessPool` / `TerminatedWorkerError`), the jobs are re-run in the main process. The jobs are seeded and independent, so results are identical; nothing from the failed attempt is kept. `F1_N_JOBS` (environment variable) sets the number of workers (`1` = serial).
+- **Status (18 Oct 2026, 22:10):**
+  - **Verified:** the inference interface against the frozen files, 16/16 checks (identical probabilities on all 1,199 validation and 1,354 test rows, identical top-3 picks in all 128 races, complete / partial / full-race cases, every invalid-input case refused). A full VS Code run (21:34–21:59) reproduced the frozen state: v1 `53625c66…` and v2 `2ebc3457…` fingerprints unchanged, all 46 protected files (raw data, cleaned data, anomaly reports, `final_features.csv`, frozen records) byte-identical, all 18 models with identical predictions and thresholds; it passed the 4.1 split check and the 7.5 freeze check and reached section 11.
+  - **Not yet done:** that run's outputs were not saved into the notebook, so an **executed notebook with sections 11–12** (and the new accuracy columns) still has to be produced and saved; then the **PDF report** (builder ready: every figure and number is taken from the executed notebook), the **Kaggle** notebook and the submission form.
+- **Remaining, outside the notebook:** the PDF report, the Kaggle notebook (attach the dataset `rohanrao/formula-1-world-championship-1950-2020`, enable Internet for `pip install lime`), pushing `amr` to GitHub, and the submission form.
 
 ---
 

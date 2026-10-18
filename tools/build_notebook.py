@@ -20,6 +20,20 @@ md(r"""
 **Task:** predict whether a driver finishes on the podium (`positionOrder <= 3`) using only information available **after qualifying and before the race starts**.
 **Grain (one prediction = one row):** one driver entering one race → unique (`raceId`, `driverId`).
 **Data:** Kaggle / Ergast *Formula 1 World Championship (1950–2024)*, 14 relational CSVs.
+
+**Notebook map (brief section → notebook section):**
+
+| Brief | Notebook |
+|---|---|
+| 1. Data cleaning & auditing (EDA before/after, sentinels, typing, one row per driver and race, keys) | 1. Data Audit, 2. Data Cleaning |
+| 2. Data-engineering questions (Q1–Q3) | 3. Data-Engineering Questions |
+| 3. Feature selection & engineering, data split | 4. Feature Selection & Engineering |
+| Pre-processing, preprocessing-order experiments | 5. Pre-processing |
+| 4. Predictive modelling (statistical models, shallow neural network, baseline, metrics on validation and test) | 6. Predictive Modeling, 7. Final optimisation and test evaluation (8. post-test exploration) |
+| 5. Experiments: feature-group ablation | 9. Feature-group ablation |
+| 6. Model explainability (permutation importance, SHAP, LIME / local SHAP) | 10. Explainable AI |
+| Deliverable 7: inference function (complete and partially-missing record) | 11. Final inference |
+| Report: known limitations | 12. Known limitations and conclusions |
 """)
 
 md(r"""
@@ -30,6 +44,7 @@ This section **only looks** at the data. Nothing is cleaned or modified. The onl
 Ground rules:
 - **Raw files stay immutable.** The CSVs are read straight from `Dataset.zip` (or the Kaggle input folder); nothing is extracted, and nothing is written next to the raw data.
   We fingerprint every file (SHA-256) now and re-check it at the end of the section (1.13).
+- **Seasons are pinned to 1950–2024** (the brief's dataset). If a newer download contains later seasons, they are dropped in memory right after loading (1.0), so the split, the frozen models and the test results always refer to the same rows (checked again in 4.1).
 - **Everything is loaded as text first** (`dtype=str`, `keep_default_na=False`), so pandas cannot silently convert placeholders
   like `\N`, `""` or `"NA"` into `NaN`, or guess types for us. We want to *see* every raw value before deciding what it means.
 """)
@@ -109,7 +124,27 @@ RAW = {t: pd.read_csv(io.BytesIO(b), dtype=str, keep_default_na=False, na_filter
 # NAIVE: what plain pd.read_csv() would give us; only used to show what pandas guesses.
 NAIVE = {t: pd.read_csv(io.BytesIO(b), low_memory=False) for t, b in RAW_BYTES.items()}
 
+# Season pin. The brief's dataset covers 1950-2024, and the split, the frozen models and the test results were
+# fixed on exactly those seasons. A newer download (e.g. the live Kaggle dataset) may contain later seasons;
+# they are dropped here, in memory only (the raw files are never changed), so that 2025+ races can never
+# enter the test set. With the 1950-2024 files nothing is dropped.
+LAST_SEASON = 2024
+kept_races = set(RAW["races"].loc[RAW["races"]["year"].astype(int) <= LAST_SEASON, "raceId"])
+season_pin = {}
+for t in TABLES:
+    if t == "seasons":
+        keep = RAW[t]["year"].astype(int) <= LAST_SEASON
+    elif "raceId" in RAW[t].columns:
+        keep = RAW[t]["raceId"].isin(kept_races)
+    else:
+        continue
+    season_pin[t] = int((~keep).sum())
+    RAW[t] = RAW[t][keep].reset_index(drop=True)
+    NAIVE[t] = NAIVE[t][keep.to_numpy()].reset_index(drop=True)
+
 print(f"Loaded {len(RAW)} tables; fingerprints recorded.")
+print(f"Season pin (<= {LAST_SEASON}): rows dropped per table: "
+      + (", ".join(f"{t} {n}" for t, n in season_pin.items() if n) or "none (the files end in 2024)"))
 ''')
 
 md(r"""
@@ -2577,6 +2612,14 @@ display(split_summary)
 race_sets = results_full.assign(set=season_split(results_full["year"])).groupby("raceId")["set"].nunique()
 assert (race_sets == 1).all(), "a race is split across sets"
 print("Every race belongs to exactly one set.")
+
+# The split the frozen models and the test results were built on (races, rows). If a different dataset version
+# changes any of these, the notebook stops here instead of silently evaluating on different rows.
+ESTABLISHED_SPLIT = {("A (2003+)", "train"): (300, 6381), ("A (2003+)", "validation"): (60, 1199), ("A (2003+)", "test"): (68, 1354),
+                     ("B (all years)", "train"): (986, 22092), ("B (all years)", "validation"): (60, 1199), ("B (all years)", "test"): (68, 1354)}
+got = {(r.model, r.set): (r.races, r.rows) for r in split_summary.itertuples()}
+assert got == ESTABLISHED_SPLIT, f"the split differs from the one the models were frozen on: {got}"
+print("Split sizes match the established split (test: 68 races, 1,354 driver entries).")
 ''')
 
 md(r"""
@@ -4132,11 +4175,14 @@ md(r"""
 
 - **Rows:** the training rows of model A (2003–2018) or model B (1950–2018) and the 1,199 validation rows, from section 5. Every table used here is checked to contain **no test row**.
 - **Every fit goes through one guard** (`fit6`), which refuses rows that aren't training rows, and, inside a cross-validation fold, rows from the seasons the fold scores or later. Every fit and every prediction is logged.
-- **Metrics:**
-  - **PR-AUC** (main): how well real podium finishers are ranked at the top. A random guess scores the podium rate (≈ 0.15).
+- **Primary metric: PR-AUC.** It measures how well the real podium finishers are ranked above everyone else, over all thresholds. It is the right headline for this task because podiums are **rare** (about 15% of rows, 3 per race) and the official output is a **ranking** (the three most likely drivers per race, 7.10). A random guess scores the podium rate (≈ 0.15), so the scale has a clear floor. Every model choice (settings, primary model) uses PR-AUC from cross-validation.
+- **Secondary metrics** (reported for every model, never used to pick settings):
   - **ROC-AUC:** chance a podium row is ranked above a non-podium row. It looks high (≈ 0.93) even for simple models, because most non-podium rows are easy.
-  - **Precision** (of the predicted podiums, the share that were real), **recall** (of the real podiums, the share we found) and **F1** (their balance), at a frozen threshold.
-  - **Brier score:** the average squared error of the probabilities (lower is better).
+  - **Binary F1, precision, recall** at the frozen threshold: precision = of the predicted podiums, the share that were real; recall = of the real podiums, the share we found; F1 = their balance.
+  - **Accuracy** at the same threshold: the share of all rows classified correctly.
+  - **Race-level top-3 F1:** F1 of the official output (exactly three picks per race), 6.8 and 7.10.
+  - **Brier score:** the average squared error of the probabilities (lower is better), for calibration.
+- **Why accuracy is misleading here:** about 85% of rows are "no podium", so a model that **never** predicts a podium is already about 85% accurate while finding none of the podium finishers (precision, recall and F1 = 0). Accuracy is dominated by the easy majority class, so two models with very different podium-finding ability can have almost the same accuracy. It is reported for completeness, next to a reference row "always 'no podium'" in the validation and test tables, but no decision uses it.
 - **Comparing two models:** the PR-AUC difference on validation, with a 95% interval from resampling the 60 validation races 500 times (the same resamples for both models, i.e. paired). A difference only counts if the interval **excludes 0**.
 """)
 
@@ -4144,7 +4190,7 @@ code(r'''
 import copy, json, platform, time
 import torch
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
-from sklearn.metrics import brier_score_loss, confusion_matrix, precision_score, recall_score, roc_curve
+from sklearn.metrics import accuracy_score, brier_score_loss, confusion_matrix, precision_score, recall_score, roc_curve
 from sklearn.preprocessing import FunctionTransformer
 
 SEED = 42
@@ -4192,7 +4238,7 @@ def scores(y, p, threshold=None, race=None):
     if threshold is not None:
         pred = (p >= threshold).astype(int)
         out.update({"precision": precision_score(y, pred, zero_division=0), "recall": recall_score(y, pred),
-                    "F1": f1_score(y, pred), "predicted podiums": int(pred.sum())})
+                    "F1": f1_score(y, pred), "accuracy": accuracy_score(y, pred), "predicted podiums": int(pred.sum())})
     if race is not None:
         out["F1 top-3 per race"] = f1_score(y, top3_per_race(p, race))
     return out
@@ -4388,12 +4434,19 @@ def cv_task(model, family, params, k, seed):
 # Settings x folds are independent jobs with fixed seeds, so they run in parallel processes; the results are identical to
 # running them one by one. Every guard (fit6, log_predict) still runs inside each job.
 from joblib import Parallel, delayed
+from joblib.externals.loky.process_executor import BrokenProcessPool, TerminatedWorkerError
 import os
-N_JOBS = max(1, min(8, (os.cpu_count() or 2) - 1))
+N_JOBS = int(os.environ.get("F1_N_JOBS", max(1, min(8, (os.cpu_count() or 2) - 1))))   # F1_N_JOBS=1 -> run serially
 
 
 def run_jobs(jobs):
-    out = Parallel(n_jobs=N_JOBS)(delayed(cv_task)(*job) for job in jobs)
+    try:
+        out = Parallel(n_jobs=N_JOBS)(delayed(cv_task)(*job) for job in jobs)
+    except (BrokenProcessPool, TerminatedWorkerError) as e:
+        # A worker process died or could not start (e.g. a library unavailable to it). The jobs are seeded and
+        # independent, so running them in this process gives the same results; nothing from the failed attempt is kept.
+        print(f"  parallel workers failed ({type(e).__name__}); running these {len(jobs)} jobs serially", flush=True)
+        out = [cv_task(*job) for job in jobs]
     for _, _, (fit_log, pred_log) in out:   # merge the workers' logs, in job order
         FIT6_LOG.extend(fit_log)
         PREDICT6_LOG.extend(pred_log)
@@ -4751,9 +4804,13 @@ THRESHOLDS[("A", "grid-only LR")], _ = f1_best_threshold(y_oof["A"], BASELINE_OO
 CV_MEAN = {("A", f): CHOSEN[("A", f)]["cv mean PR-AUC"] for f in FAMILIES}
 CV_MEAN[("A", "grid-only LR")] = baseline_cv.loc["mean", "grid-only LR: PR-AUC"]
 
-val_table = [{"model": "rule: grid <= 3", "mean CV PR-AUC": np.nan, "PR-AUC": np.nan, "ROC-AUC": np.nan, "Brier": np.nan,
+val_table = [{"model": "always 'no podium' (accuracy reference)", "mean CV PR-AUC": np.nan, "PR-AUC": np.nan, "ROC-AUC": np.nan,
+              "Brier": np.nan, "threshold": np.nan, "precision": 0.0, "recall": 0.0, "F1": 0.0,
+              "accuracy": accuracy_score(y_val, np.zeros_like(y_val)), "predicted podiums": 0, "F1 top-3 per race": np.nan},
+             {"model": "rule: grid <= 3", "mean CV PR-AUC": np.nan, "PR-AUC": np.nan, "ROC-AUC": np.nan, "Brier": np.nan,
               "threshold": np.nan, "precision": precision_score(y_val, rule_val), "recall": recall_score(y_val, rule_val),
-              "F1": f1_score(y_val, rule_val), "predicted podiums": int(rule_val.sum()), "F1 top-3 per race": np.nan}]
+              "F1": f1_score(y_val, rule_val), "accuracy": accuracy_score(y_val, rule_val), "predicted podiums": int(rule_val.sum()),
+              "F1 top-3 per race": np.nan}]
 for name in ["grid-only LR"] + FAMILIES:
     s = scores(y_val, VAL_PRED[("A", name)], THRESHOLDS[("A", name)], val_race)
     val_table.append({"model": name, "mean CV PR-AUC": CV_MEAN[("A", name)], "threshold": THRESHOLDS[("A", name)], **s})
@@ -5844,9 +5901,12 @@ print(f"Test 2022-2024: {len(TEST_ROWS):,} rows, {len(test_races)} races, {int(y
 
 KEYS_A = [("A", f) for f in FAMILIES]
 KEYS_B = [("B", f) for f in FAMILIES]
-test_table = [{"model": "rule: grid <= 3", "version": "-", "PR-AUC": np.nan, "ROC-AUC": np.nan, "Brier": np.nan, "threshold": np.nan,
+test_table = [{"model": "always 'no podium' (accuracy reference)", "version": "-", "PR-AUC": np.nan, "ROC-AUC": np.nan, "Brier": np.nan,
+               "threshold": np.nan, "precision": 0.0, "recall": 0.0, "F1": 0.0, "accuracy": accuracy_score(y_test, np.zeros_like(y_test)),
+               "predicted podiums": 0, "F1 top-3 per race": np.nan},
+              {"model": "rule: grid <= 3", "version": "-", "PR-AUC": np.nan, "ROC-AUC": np.nan, "Brier": np.nan, "threshold": np.nan,
                "precision": precision_score(y_test, rule_test), "recall": recall_score(y_test, rule_test), "F1": f1_score(y_test, rule_test),
-               "predicted podiums": int(rule_test.sum()), "F1 top-3 per race": np.nan}]
+               "accuracy": accuracy_score(y_test, rule_test), "predicted podiums": int(rule_test.sum()), "F1 top-3 per race": np.nan}]
 for key in [("A", "grid-only LR")] + KEYS_A + KEYS_B:
     s = scores(y_test, TEST_PRED[key], TEST_THRESHOLDS[key], test_race)
     test_table.append({"model": key[1] + (" (primary)" if key == PRIMARY_MODEL_V2 else ""), "version": key[0],
@@ -7221,6 +7281,384 @@ md(r"""
 - **Context** looks moderate in SHAP measure (A) but negligible in ablation, grouped permutation and SHAP measure (B): age and experience cancel.
 
 **These explanations describe the model, not Formula 1.** They show which pre-race information the model uses to rank drivers, not what *causes* a podium; correlated inputs mean that credit between grid, qualifying, standings and form is partly a matter of method.
+""")
+
+
+# ================================================================ 11. INFERENCE
+md(r"""
+# 11. Final inference: predicting the podium of a new race
+
+**Brief, deliverable 7:** "Inference function, demonstrated on a complete and a partially-missing record."
+
+**Model:** the official frozen primary model, **logistic regression, model A (v2)**, loaded from `outputs/model_artifacts_v2/` together with its fitted pre-processing (section 5). Nothing is re-fitted: the files are checked against their SHA-256 checksums and the verified v2 fingerprint before use.
+
+**Interface** (written to `outputs/podium_inference.py`, so it can also be used outside this notebook, next to the model files):
+
+| Function | Input | Output |
+|---|---|---|
+| `PodiumPredictor(artifact_dir, expected_fingerprint)` | the v2 model folder | a predictor bound to the frozen primary model (refuses any other model files) |
+| `predictor.predict_proba(records)` | one record (dict), a list of records, or a DataFrame with the **18 pre-race features**; any other columns (e.g. `raceId`, `driverId`, a name) are passed through unchanged | one row per driver: `podium_probability` (0–1) and `missing_inputs` (which features were unknown) |
+| `predictor.predict_race(race_entries)` | **every starter of one race** (with `raceId`, `driverId` and the 18 features) | all drivers ranked by probability, with `predicted_podium = True` for exactly the **three most likely podium finishers** |
+
+**Rules the interface enforces** (each violation raises a clear `PodiumInputError` instead of returning a number):
+- **Schema:** all 18 feature columns must be present (a value may be unknown: `None` / `NaN`); values must be numeric and finite; flags must be 0 or 1; rates and shares in [0, 1]; positions ≥ 1; age 15–70.
+- **Missing values:** allowed for every feature **except `grid`** (after qualifying the starting position is always known). Unknown values are filled by the frozen pre-processing exactly as in training (5.3): missing-value flags are set, qualifying gaps get the fitted fills, other values the training medians, unknown flags 0. The output lists which inputs were unknown.
+- **Race mode:** exactly one `raceId`; unique `driverId`; `n_starters` known and equal for every driver; and the number of drivers supplied must equal `n_starters` (otherwise the race is **incomplete** and is refused, unless `allow_incomplete=True` is passed, which ranks only the supplied drivers and warns). Ties in probability are broken by grid position, then `driverId`, exactly as in the evaluation (7.10).
+
+**What the output means:** a probability that the driver finishes in the top three. The three picks of a race are the three **most likely podium finishers**; their order (`probability_rank` 1–3) is **not** a prediction of 1st, 2nd and 3rd place (the model only estimates "podium or not", as the brief requires).
+""")
+
+code(r'''
+import importlib.util
+import warnings
+
+INFERENCE_SOURCE = r"""
+# podium_inference.py: written by f1_podium_prediction.ipynb, section 11. Usage outside the notebook:
+#   from podium_inference import PodiumPredictor
+#   predictor = PodiumPredictor("outputs/model_artifacts_v2")
+#   predictor.predict_proba(records)         # one row per driver: podium probability
+#   predictor.predict_race(race_entries)     # every starter of one race: the 3 most likely podium finishers
+# The model estimates "podium or not". The three picks of a race are NOT a prediction of 1st, 2nd and 3rd place.
+import importlib.util
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+FEATURES = ["grid", "pit_lane_start", "gap_q1_pct", "grid_minus_quali", "reached_q3", "no_q3_format", "quali_missing",
+            "drv_champ_pos", "cons_points_share", "drv_no_standing_yet", "cons_no_standing_yet", "drv_podium_rate_5",
+            "drv_avg_finish_5", "drv_dnf_rate_5", "cons_podium_rate_5", "n_starters", "drv_experience", "drv_age"]
+FLAGS = ["pit_lane_start", "reached_q3", "no_q3_format", "quali_missing", "drv_no_standing_yet", "cons_no_standing_yet"]
+# Allowed range of a known value (None = no bound).
+RANGES = {"grid": (1, None), "gap_q1_pct": (0, None), "drv_champ_pos": (1, None), "cons_points_share": (0, 1),
+          "drv_podium_rate_5": (0, 1), "drv_avg_finish_5": (1, None), "drv_dnf_rate_5": (0, 1), "cons_podium_rate_5": (0, 1),
+          "n_starters": (1, None), "drv_experience": (0, None), "drv_age": (15, 70)}
+MUST_BE_KNOWN = ["grid"]            # after qualifying the starting position is always known
+RACE_KEYS = ["raceId", "driverId"]
+PRIMARY = "A_logistic_regression"
+
+
+class PodiumInputError(ValueError):
+    pass
+
+
+class PodiumPredictor:
+    def __init__(self, artifact_dir, expected_fingerprint=None):
+        folder = Path(artifact_dir)
+        spec = importlib.util.spec_from_file_location("frozen_v2_loader", folder / "load_artifacts.py")
+        loader = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(loader)
+        models, manifest = loader.load_model_artifacts(folder)        # checks every file against its SHA-256
+        if expected_fingerprint is not None and manifest["frozen fingerprint"] != expected_fingerprint:
+            raise RuntimeError("the model files are not the expected frozen version")
+        primary = [name for name, m in manifest["models"].items() if m.get("primary")]
+        if primary != [PRIMARY] or manifest["input columns"] != FEATURES:
+            raise RuntimeError(f"unexpected model files: primary {primary}, input columns {manifest['input columns']}")
+        self.model_name = PRIMARY
+        self.fingerprint = manifest["frozen fingerprint"]
+        self._predict = models[PRIMARY]["predict"]
+
+    @staticmethod
+    def _frame(records):
+        if isinstance(records, dict):
+            records = [records]
+        if isinstance(records, list):
+            if not records or not all(isinstance(r, dict) for r in records):
+                raise PodiumInputError("records must be a dict, a non-empty list of dicts, or a DataFrame")
+            records = pd.DataFrame(records)
+        if not isinstance(records, pd.DataFrame):
+            raise PodiumInputError("records must be a dict, a non-empty list of dicts, or a DataFrame")
+        if records.empty:
+            raise PodiumInputError("no records given")
+        return records.reset_index(drop=True)
+
+    def validate(self, records):
+        # Returns (the records, their 18 features as floats); raises PodiumInputError on any schema problem.
+        df = self._frame(records)
+        absent = [c for c in FEATURES if c not in df.columns]
+        if absent:
+            raise PodiumInputError(f"missing feature column(s) {absent}: all {len(FEATURES)} features must be present "
+                                   "(use None / NaN for a value that is unknown)")
+        X = pd.DataFrame(index=df.index)
+        for c in FEATURES:
+            num = pd.to_numeric(df[c], errors="coerce")
+            bad = df[c].notna() & num.isna()
+            if bad.any():
+                raise PodiumInputError(f"non-numeric value(s) in {c}: {df.loc[bad, c].tolist()[:5]}")
+            X[c] = num.astype(float)
+        if np.isinf(X.to_numpy()).any():
+            raise PodiumInputError("infinite values are not allowed")
+        for c in MUST_BE_KNOWN:
+            if X[c].isna().any():
+                raise PodiumInputError(f"{c} must be known (rows {X.index[X[c].isna()].tolist()})")
+        for c in FLAGS:
+            bad = X[c].notna() & ~X[c].isin([0, 1])
+            if bad.any():
+                raise PodiumInputError(f"{c} must be 0 or 1 (or unknown); got {X.loc[bad, c].tolist()[:5]}")
+        for c, (lo, hi) in RANGES.items():
+            v = X[c]
+            bad = v.notna() & (((v < lo) if lo is not None else False) | ((v > hi) if hi is not None else False))
+            if bad.any():
+                raise PodiumInputError(f"{c} must lie in [{lo}, {hi}]; got {v[bad].tolist()[:5]}")
+        return df, X
+
+    def predict_proba(self, records):
+        df, X = self.validate(records)
+        p = np.asarray(self._predict(X), dtype=float)
+        if p.shape != (len(X),) or not np.all((p >= 0) & (p <= 1)):
+            raise RuntimeError("the model returned invalid probabilities")
+        out = df[[c for c in df.columns if c not in FEATURES]].copy()     # identifiers and extra columns, unchanged
+        out["podium_probability"] = p
+        out["missing_inputs"] = [", ".join(X.columns[row]) or "-" for row in X.isna().to_numpy()]
+        return out
+
+    def predict_race(self, race_entries, allow_incomplete=False):
+        df = self._frame(race_entries)
+        absent = [c for c in RACE_KEYS if c not in df.columns]
+        if absent:
+            raise PodiumInputError(f"a race prediction needs the identifier columns {RACE_KEYS}; missing {absent}")
+        if df[RACE_KEYS].isna().any().any():
+            raise PodiumInputError("raceId and driverId must be known for every driver")
+        if df["raceId"].nunique() != 1:
+            raise PodiumInputError(f"one race per call; got raceIds {sorted(df['raceId'].unique().tolist())}")
+        if df["driverId"].duplicated().any():
+            raise PodiumInputError(f"duplicate driverId(s): {df.loc[df['driverId'].duplicated(), 'driverId'].tolist()}")
+        _, X = self.validate(df)
+        if X["n_starters"].isna().any() or X["n_starters"].nunique() != 1:
+            raise PodiumInputError("n_starters must be known and the same for every driver of the race")
+        n_starters = int(X["n_starters"].iloc[0])
+        complete = len(df) == n_starters
+        if not complete:
+            msg = f"incomplete race entry: {len(df)} drivers supplied, but n_starters = {n_starters}"
+            if not allow_incomplete:
+                raise PodiumInputError(msg + " (pass allow_incomplete=True to rank only the supplied drivers)")
+            warnings.warn(msg + "; the three picks are only among the supplied drivers")
+        if len(df) < 3:
+            raise PodiumInputError("a race needs at least 3 drivers")
+        # Same order as the evaluation: ties in probability are broken by grid position, then driverId.
+        order = df.assign(_grid=X["grid"]).sort_values(["_grid", "driverId"], kind="mergesort").index
+        df = df.loc[order].reset_index(drop=True)
+        out = self.predict_proba(df)
+        out["grid"] = pd.to_numeric(df["grid"]).to_numpy()
+        out["probability_rank"] = out["podium_probability"].rank(method="first", ascending=False).astype(int)
+        out["predicted_podium"] = out["probability_rank"] <= 3
+        out["complete_race"] = complete
+        return out.sort_values("probability_rank").reset_index(drop=True)
+"""
+
+INFERENCE_PATH = CLEAN_DATA_DIR.parent / "podium_inference.py"
+INFERENCE_PATH.write_text(INFERENCE_SOURCE.lstrip("\n"), encoding="utf-8")
+_spec = importlib.util.spec_from_file_location("podium_inference", INFERENCE_PATH)
+podium_inference = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(podium_inference)
+PodiumPredictor, PodiumInputError = podium_inference.PodiumPredictor, podium_inference.PodiumInputError
+
+assert podium_inference.FEATURES == FINAL_FEATURES
+predictor = PodiumPredictor(ARTIFACT_DIR_V2, expected_fingerprint=FROZEN_V2_FINGERPRINT)
+print(f"Inference interface written to {INFERENCE_PATH} and loaded.")
+print(f"Model: {predictor.model_name} (frozen v2, fingerprint {predictor.fingerprint[:16]}...); "
+      f"inputs: the {len(podium_inference.FEATURES)} features of section 4.6.")
+''')
+
+md(r"""
+### 11.1 Check: the interface reproduces the frozen model exactly
+
+Before the demonstrations, the interface is run on **every** validation and test row and on every race, and compared with the predictions already reported in sections 7.3–7.10 (`VAL_PRED_V2`, `TEST_PRED`). This is a reproduction check only: no number is used to change anything.
+""")
+
+code(r'''
+ID = ["raceId", "driverId"]
+repro = []
+for period, rows, frozen in [("validation 2019-2021", VAL_ROWS, VAL_PRED_V2[OFFICIAL]), ("test 2022-2024", TEST_ROWS, TEST_PRED[OFFICIAL])]:
+    p = predictor.predict_proba(rows[ID + FINAL_FEATURES])["podium_probability"].to_numpy()
+    official = rows.loc[top3_per_race(frozen, rows["raceId"].to_numpy()) == 1, ID]
+    race_out = pd.concat([predictor.predict_race(g[ID + FINAL_FEATURES]) for _, g in rows.groupby("raceId", sort=False)])
+    picks = race_out.loc[race_out["predicted_podium"], ID]
+    same_picks = set(map(tuple, picks.to_numpy())) == set(map(tuple, official.to_numpy()))
+    repro.append({"period": period, "drivers": len(rows), "races": rows["raceId"].nunique(),
+                  "probabilities identical to the frozen model": bool(np.array_equal(p, frozen)),
+                  "largest difference": float(np.abs(p - frozen).max()),
+                  "races with exactly 3 picks": int((race_out.groupby("raceId")["predicted_podium"].sum() == 3).sum()),
+                  "picks identical to the official output (7.10)": same_picks})
+repro = pd.DataFrame(repro)
+display(repro)
+assert repro["probabilities identical to the frozen model"].all() and repro["picks identical to the official output (7.10)"].all()
+assert (repro["races with exactly 3 picks"] == repro["races"]).all()
+print("The inference interface reproduces the frozen primary model exactly (every probability and every race's three picks).")
+''')
+
+md(r"""
+### 11.2 Demonstration 1: a complete driver record
+
+One real record, **all 18 features known**: Max Verstappen before the 2021 Abu Dhabi Grand Prix (validation season). The record is typed in as a plain dictionary, as a user would supply it.
+""")
+
+code(r'''
+race_names = CLEAN["races"].set_index("raceId")
+driver_names = CLEAN["drivers"].set_index("driverId")
+full_name = lambda d: f"{driver_names.loc[d, 'forename']} {driver_names.loc[d, 'surname']}"
+race_name = lambda r: f"{race_names.loc[r, 'year']} {race_names.loc[r, 'name']}"
+
+demo_race = int(race_names[(race_names["year"] == 2021) & (race_names["name"] == "Abu Dhabi Grand Prix")].index[0])
+demo_driver = int(CLEAN["drivers"].loc[CLEAN["drivers"]["driverRef"] == "max_verstappen", "driverId"].iloc[0])
+row = VAL_ROWS[(VAL_ROWS["raceId"] == demo_race) & (VAL_ROWS["driverId"] == demo_driver)]
+complete_record = {"raceId": demo_race, "driverId": demo_driver, "driver": full_name(demo_driver),
+                   **{c: (None if pd.isna(v) else float(v)) for c, v in row[FINAL_FEATURES].iloc[0].items()}}
+print(f"Input record ({race_name(demo_race)}):")
+display(pd.Series(complete_record, name="value").to_frame())
+
+result_complete = predictor.predict_proba(complete_record)
+display(result_complete)
+frozen_value = VAL_PRED_V2[OFFICIAL][row.index[0]]
+assert result_complete["podium_probability"].iloc[0] == frozen_value
+print(f"Podium probability {result_complete['podium_probability'].iloc[0]:.3f} "
+      f"(identical to the frozen model's validation prediction for this row: {frozen_value:.3f}).")
+''')
+
+md(r"""
+### 11.3 Demonstration 2: a partially-missing driver record
+
+The same driver and race, but as if the **qualifying details and recent form were unknown**: `gap_q1_pct`, `grid_minus_quali`, `reached_q3`, `quali_missing` and the three driver-form features are `None`. The interface accepts the record, reports which inputs were unknown, and the frozen pre-processing fills them exactly as in training. The table below shows what the model actually receives in both cases (the 21 model inputs before scaling).
+""")
+
+code(r'''
+UNKNOWN = ["gap_q1_pct", "grid_minus_quali", "reached_q3", "quali_missing", "drv_podium_rate_5", "drv_avg_finish_5", "drv_dnf_rate_5"]
+partial_record = {**complete_record, **{c: None for c in UNKNOWN}}
+result_partial = predictor.predict_proba(partial_record)
+display(result_partial)
+
+imputer = XPRE.named_steps["impute"]                 # the frozen fitted pre-processing of the primary model (section 10.1)
+feature_frame = lambda rec: pd.DataFrame([rec])[FINAL_FEATURES].astype(float)
+model_view = pd.DataFrame({"complete record": imputer.transform(feature_frame(complete_record)).iloc[0],
+                           "partial record": imputer.transform(feature_frame(partial_record)).iloc[0]})
+model_view["filled?"] = np.where(model_view.index.isin(UNKNOWN), "filled by the frozen pre-processing", "")
+print("What the model receives (21 inputs, before scaling):")
+display(model_view.round(3))
+print(f"Podium probability: complete record {result_complete['podium_probability'].iloc[0]:.3f}, "
+      f"partial record {result_partial['podium_probability'].iloc[0]:.3f}.")
+''')
+
+md(r"""
+**What the two records show:**
+- With everything known, the model gives Verstappen a high podium probability (he started on pole, in strong recent form).
+- With qualifying details and recent form unknown, the interface still returns a valid probability. `quali_missing` is inferred as 1 (no qualifying information at all), so the qualifying gap gets the **neutral** fill (the training median) rather than the "slow lap" fill, and recent form gets the training medians with `drv_form_missing = 1`. The probability drops, because the model can no longer see his strong recent form: it now only knows the grid position, the standings and the context. A partial record therefore gives a more cautious, less informed estimate, which is the expected behaviour.
+""")
+
+md(r"""
+### 11.4 Demonstration 3: predicting the podium of a complete race
+
+All starters of the **2024 Abu Dhabi Grand Prix** (the last race of the dataset, a test-season race already evaluated in 7.5) are passed in at once. The interface checks that the entry is complete (number of drivers = `n_starters`), ranks the drivers by probability and marks the three most likely podium finishers. The actual result is added **afterwards**, only to show how the picks turned out.
+""")
+
+code(r'''
+last_race = int(race_names[(race_names["year"] == 2024) & (race_names["name"] == "Abu Dhabi Grand Prix")].index[0])
+entries = TEST_ROWS.loc[TEST_ROWS["raceId"] == last_race, ID + FINAL_FEATURES].copy()
+entries.insert(2, "driver", entries["driverId"].map(full_name))
+race_prediction = predictor.predict_race(entries)
+
+shown = race_prediction[["probability_rank", "driver", "raceId", "driverId", "grid", "podium_probability", "predicted_podium", "missing_inputs"]].copy()
+actual = TEST_ROWS.loc[TEST_ROWS["raceId"] == last_race].set_index("driverId")["podium"]
+shown["actual podium (added after the prediction)"] = shown["driverId"].map(actual).astype(bool)
+print(f"{race_name(last_race)}: {len(entries)} starters supplied, complete race: {bool(race_prediction['complete_race'].iloc[0])}")
+display(shown.round(3))
+picks = shown[shown["predicted_podium"]]
+print("Predicted podium (the three most likely podium finishers, not a finishing order): "
+      + ", ".join(f"{d} ({p:.2f})" for d, p in zip(picks["driver"], picks["podium_probability"])))
+print(f"Correct picks: {int(picks['actual podium (added after the prediction)'].sum())} of 3")
+
+fig, ax = plt.subplots(figsize=(10, 5))
+top = shown.head(10)[::-1]
+ax.barh(top["driver"] + " (grid " + top["grid"].astype(int).astype(str) + ")", top["podium_probability"],
+        color=np.where(top["predicted_podium"], "#C44E52", "#8C8C8C"))
+for y, (p, a) in enumerate(zip(top["podium_probability"], top["actual podium (added after the prediction)"])):
+    ax.text(p + 0.01, y, f"{p:.2f}" + ("  (podium)" if a else ""), va="center", fontsize=8)
+ax.set_xlim(0, 1.1)
+ax.set_xlabel("podium probability (frozen primary model)")
+ax.set_title(f"{race_name(last_race)}: the 10 most likely podium finishers\n(red = the three predicted podium finishers; '(podium)' = actual result)", fontsize=10)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+### 11.5 Demonstration 4: invalid inputs are refused explicitly
+
+Each case below is passed to the interface on purpose; the interface must refuse it with a clear message instead of returning a misleading number.
+""")
+
+code(r'''
+def attempt(label, call):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            out = call()
+            status = f"accepted ({len(out)} rows)"
+        except PodiumInputError as err:
+            status = f"REFUSED: {err}"
+    note = "; ".join(str(w.message) for w in caught)
+    return {"case": label, "result": status, "warning": note or "-"}
+
+
+without_age = {k: v for k, v in complete_record.items() if k != "drv_age"}
+race_full = entries.copy()
+cases = [
+    attempt("a feature column is absent (drv_age)", lambda: predictor.predict_proba(without_age)),
+    attempt("a non-numeric value (grid = 'P3')", lambda: predictor.predict_proba({**complete_record, "grid": "P3"})),
+    attempt("an impossible flag (reached_q3 = 2)", lambda: predictor.predict_proba({**complete_record, "reached_q3": 2})),
+    attempt("a share outside [0, 1] (cons_points_share = 1.4)", lambda: predictor.predict_proba({**complete_record, "cons_points_share": 1.4})),
+    attempt("the starting position unknown (grid = None)", lambda: predictor.predict_proba({**complete_record, "grid": None})),
+    attempt("an empty input", lambda: predictor.predict_proba([])),
+    attempt("an incomplete race (2 of the starters left out)", lambda: predictor.predict_race(race_full.iloc[2:])),
+    attempt("the same incomplete race, allow_incomplete=True", lambda: predictor.predict_race(race_full.iloc[2:], allow_incomplete=True)),
+    attempt("a driver entered twice", lambda: predictor.predict_race(pd.concat([race_full, race_full.iloc[:1]]))),
+    attempt("two races mixed in one call", lambda: predictor.predict_race(pd.concat([race_full, TEST_ROWS.loc[TEST_ROWS["raceId"] != last_race, ID + FINAL_FEATURES].head(3)]))),
+    attempt("race mode without driverId", lambda: predictor.predict_race(race_full.drop(columns="driverId"))),
+]
+pd.set_option("display.max_colwidth", 200)
+display(pd.DataFrame(cases))
+pd.set_option("display.max_colwidth", 60)
+''')
+
+md(r"""
+**Summary of section 11:**
+- The inference interface uses the **frozen** primary model and its fitted pre-processing, verified by checksum and fingerprint; it reproduces every validation and test probability and every race's official three picks **exactly** (11.1).
+- **Complete record** (11.2) and **partially-missing record** (11.3): both return a valid probability; unknown inputs are listed and filled by the frozen pre-processing as in training.
+- **Complete race** (11.4): exactly three predicted podium finishers, with race and driver identifiers preserved; the rank among the three is a likelihood order, not a finishing order.
+- **Invalid inputs** (11.5): absent columns, non-numeric or impossible values, an unknown grid position, incomplete races, duplicate drivers and mixed races are refused with an explicit message; an incomplete race is only ranked when the caller explicitly allows it, with a warning.
+""")
+
+# ================================================================ 12. LIMITATIONS AND CONCLUSIONS
+md(r"""
+# 12. Known limitations and conclusions
+
+The limitations below are the ones the experiments in this notebook actually show; each points to its evidence.
+
+**Data and era**
+- **Qualifying-coverage drift:** qualifying times exist for most drivers only from 2003 onwards (1.7, 5.2: `gap_q1_pct` missing for 1.8% of model-A training rows but 64.8% of model B's). Model A therefore trains on 2003–2018 only; model B uses all seasons with missing-value flags, so it partly learns "qualifying missing = old era". Fifty extra seasons neither helped nor hurt measurably (6.10, 7.9).
+- **Era sensitivity:** front-row conversion depends strongly on the decade (46–54% in the 1950s–80s vs 74–75% since 2010, 3.1.1), and model B's training PR-AUC is far lower on old seasons (≈ 0.56–0.58 vs ≈ 0.70, 7.6). Results describe the modern era and may not transfer to very different eras.
+- **Season predictability:** the primary model's test PR-AUC moves from 0.65 (2024, several competitive teams) to 0.78 (2023, one dominant team) (7.8). How dominant one team is matters more than the 2022 rule change, and no feature measures it directly.
+- **Recording quirks:** pit-lane starts are only recorded from 2015 (7 model-A training rows, so `pit_lane_start` is unreliable); on 2021–22 sprint weekends `grid_minus_quali` also reflects the sprint result; "no standing yet" means "0 points so far" before 2010 but mostly "first race / debut" later; withdrawn cars leave gaps in the grid numbering (e.g. 2005 United States GP), which `n_starters` only partly corrects; formation-lap failures cannot be told apart from lap-1 retirements (2.6).
+- **Identity choices:** shared-drive duplicates of the 1950s use a documented proxy (2.6, rule B); renamed teams (Toro Rosso → AlphaTauri → RB, Force India → Racing Point → Aston Martin) restart their form under a new ID; team form restarts after a break of more than 550 days, driver form does not (a post-test check, `TRAINING_RUNS.md` Run 11, found that adding a driver reset changes no podium pick).
+
+**Models**
+- **Information ceiling:** the starting grid dominates. Removing it costs about 0.16–0.19 correct podium picks per race (9), and it carries about four times the SHAP importance of the next input (10.3). The four model families perform the same within noise on validation and test (6.9, 7.7); post-test checks of race-aware rankers, extra features and XGBoost (section 8; `TRAINING_RUNS.md` Runs 8, 9, 11 and 12) found no clear improvement either.
+- **Podium picks vs the grid:** on the test seasons the official top-3 picks get 2.00 correct drivers per race vs 1.96 for the grid's top three, a difference that is **not** clear (+0.044, interval −0.088 to +0.176, 7.10). The model's clear advantage is in ranking all drivers and in probabilities (test PR-AUC 0.705 vs 0.647 for the grid-only model, 7.7).
+- **Probabilities slightly too high:** on the test seasons they sum to about 3.3 per race instead of 3 (7.9).
+- **Threshold rule:** the frozen-threshold decision can name any number of podium finishers per race (242 for 204 real podiums on test), which is why the official output is the top 3 per race (7.10).
+- **Limited sample:** validation has 60 races and test 68, so differences of a few hundredths are within noise; every comparison is reported with a race-resampling interval.
+- **Unpredictable events:** crashes, weather, safety cars and strategy are not in the pre-race data, so podiums like Kvyat's from 14th in the wet 2019 German GP (10.4) cannot be foreseen.
+- **Post-test work:** the test seasons were evaluated once (7.5). Section 8 and the exploratory runs recorded in `TRAINING_RUNS.md` were done afterwards on the historical folds only and changed nothing.
+
+**Explanations**
+- **Not causal.** Permutation importance, SHAP and LIME describe what the model relies on, not what causes a podium (10). Correlated inputs (grid, qualifying, standings, form) share credit differently depending on the method (10.9). LIME's local fits are weak (R² 0.14–0.55, 10.6), so local SHAP is the reference.
+
+**Reproducibility**
+- The frozen models are verified by fingerprint before the test (7.5) and in every later section. Under other library versions (e.g. on Kaggle) small numeric differences are reported as warnings within a tolerance, while any structural difference (features, settings, pre-processing, model types) stops the notebook.
+
+**Conclusions**
+- A leakage-safe, one-row-per-driver-and-race table (24,645 rows, 18 pre-race features) supports a podium model that clearly beats a grid-only baseline on unseen seasons (test PR-AUC 0.705 vs 0.647, ROC-AUC 0.937).
+- The official output, the three most likely podium finishers per race, gets 2 of 3 right on average on the test seasons (top-3 F1 0.667) and all three in 16 of 68 races.
+- Starting position and recent form explain most of what the model does; qualifying, standings and context add smaller, overlapping information.
 """)
 
 

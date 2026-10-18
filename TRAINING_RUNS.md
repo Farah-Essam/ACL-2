@@ -370,6 +370,66 @@ No model was trained or changed here; the frozen logistic regression A (v2) was 
 
 ---
 
+## Run 11: Driver-form reset after long breaks (exploratory, after the test; historical CV folds only)
+
+**Status:** run **outside the notebook**, like Runs 8–9. Validation and test seasons were not used, and no frozen model, feature file or notebook output changed.
+
+**Why:** team form restarts after a gap of more than 550 days (4.2.1), but driver form did not: a driver returning after a long break was judged on results from before it (e.g. Schumacher 2010 carried a podium rate of 0.6 from 2006; Alonso 2021 an average finish of 16 from 2018).
+
+**What was tested** (model A, frozen v2 settings, preprocessing refitted in each fold; decision rule fixed before running, as in Runs 8–9: top-3 F1 gain > 0, better in ≥ 3 of 4 folds, PR-AUC not lower, 95% interval for correct picks per race above 0):
+- **R1:** driver form (podium rate, average finish, retirement rate over the last 5 races) restarts after a gap of more than 550 days, the same rule as team form.
+- **R2:** R1 plus a `drv_comeback` flag (first race after such a gap, not a debut).
+- **Reach:** 71 of 6,381 rows in 2003–2018 change (18 comeback races, 5 podiums); in the scoring folds 2011–2018, 16 rows and 3 podiums. The baselines reproduce the Section 8 out-of-fold predictions exactly.
+
+| Configuration | CV PR-AUC | CV top-3 F1 | Correct / race | PR-AUC gain [95% interval] | Correct / race gain [95% interval] | Folds improved (top-3 / PR-AUC) | Rule |
+|---|---|---|---|---|---|---|---|
+| LR baseline | 0.7032 | 0.6658 | 1.997 | – | – | – | – |
+| LR + driver reset | 0.7034 | 0.6658 | 1.997 | +0.0002 [−0.0006, +0.0010] | 0.000 [0.000, 0.000] | 0 / 1 | fail |
+| LR + reset + comeback flag | 0.7035 | 0.6658 | 1.997 | +0.0003 [−0.0004, +0.0014] | 0.000 [0.000, 0.000] | 0 / 3 | fail |
+| Gradient boosting baseline | 0.6937 | 0.6592 | 1.978 | – | – | – | – |
+| GB + driver reset | 0.6897 | 0.6591 | 1.977 | −0.0039 [−0.0071, +0.0007] | 0.000 [−0.013, +0.019] | 1 / 2 | fail |
+| GB + reset + comeback flag | 0.6897 | 0.6591 | 1.977 | −0.0039 [−0.0071, +0.0007] | 0.000 [−0.013, +0.019] | 1 / 2 | fail |
+
+**Outcome:**
+- **No effect on the podium pick:** logistic regression picks the same three drivers in every one of the 158 fold races; gradient boosting changes the picks in 2 races, with no net gain.
+- PR-AUC moves by at most 0.004, inside the noise; the comeback flag is too rare (18 races) to matter, and gradient boosting never uses it.
+- **Decision:** frozen models and features kept. The missing driver reset is documented as a limitation with this evidence: correcting it would not change the results.
+
+---
+
+## Run 12: XGBoost (exploratory, after the test; historical CV folds only)
+
+**Status:** run **outside the notebook**, like Runs 8–11 (xgboost 3.4.1). Validation and test seasons were not used, and no frozen model changed.
+
+**What was tested:** XGBoost on model A's 21 inputs, with the same pre-processing as gradient boosting refitted in each fold. 24 settings (depth 2/3/4, learning rate 0.03/0.1, 150/400 trees, min child weight 1/10; subsample and column sample 0.8, L2 1.0), chosen by mean CV PR-AUC as in Sections 6–7. Because picking the best of 24 on the same folds flatters it, a **nested** version was also run: for folds 2–4, the setting is chosen on the earlier folds only. Same decision rule as Run 11.
+
+| Model (4 folds, 158 races) | CV PR-AUC | ROC-AUC | Top-3 F1 | Correct / race | Exact-3 rate |
+|---|---|---|---|---|---|
+| LR A (primary, v2) | 0.7032 | 0.9375 | 0.6658 | 1.997 | 0.265 |
+| Gradient boosting A (v2) | 0.6937 | 0.9403 | 0.6592 | 1.978 | 0.233 |
+| XGBoost (best of 24: depth 2, lr 0.03, 150 trees) | 0.6992 | 0.9412 | 0.6718 | 2.015 | 0.264 |
+
+| Comparison | PR-AUC gain [95%] | Correct / race gain [95%] | Folds better (top-3 / PR-AUC) | Rule |
+|---|---|---|---|---|
+| XGBoost vs LR (4 folds) | −0.004 [−0.026, +0.010] | +0.019 [−0.038, +0.076] | 2 / 2 of 4 | fail |
+| XGBoost vs gradient boosting (4 folds) | +0.006 [−0.003, +0.011] | +0.038 [0.000, +0.076] | 4 / 3 of 4 | fail (interval touches 0) |
+| Nested XGBoost vs LR (folds 2013–18, 119 races) | −0.015 [−0.040, +0.004] | +0.067 [−0.008, +0.151] | 3 / 1 of 3 | fail (PR-AUC lower) |
+| Nested XGBoost vs gradient boosting (same) | −0.001 [−0.017, +0.013] | +0.059 [+0.017, +0.114] | 3 / 1 of 3 | fail (PR-AUC lower) |
+
+**Outcome:**
+- **No clear gain over the primary model:** ranking (PR-AUC) is slightly worse, and the podium-pick gain (+0.02 to +0.07 correct drivers per race) has intervals that include 0.
+- **A small, consistent edge over our gradient boosting on the podium pick** (better in every fold, nested interval above 0), but not in ranking, so the pre-set rule is not met.
+- **The chosen setting is the simplest in the grid** (depth 2, lowest learning rate, fewest trees), i.e. at the grid's edge: the data favours near-additive models, which is what logistic regression already is.
+- **Decision:** frozen models kept. A podium-pick edge for shallow boosting is a lead for a future version, to be confirmed on new seasons, not on the already-seen test.
+
+---
+
+## Section 11: Final inference (no training)
+
+The inference interface (`outputs/podium_inference.py`, notebook section 11) **loads** the frozen primary model (logistic regression A, v2) and its fitted pre-processing; nothing is trained or tuned. It reproduces every frozen validation (1,199) and test (1,354) probability exactly and the official three picks of all 128 races (11.1).
+
+---
+
 ## Summary: what changed from run to run, and why
 
 | Step | Change | Why | Effect |
@@ -386,4 +446,6 @@ No model was trained or changed here; the frozen logistic regression A (v2) was 
 | Run 8 (exploratory, outside the notebook) | Race-aware rankers, `log(grid)`, better form features, selecting by top-3 F1 | Proposed enhancements aimed at the podium pick | None improves the podium pick; the pairwise ranker is clearly worse; `log(grid)` helps PR-AUC only |
 | Run 9 (exploratory, outside the notebook) | Recent team qualifying form, circuit history (driver and circuit × grid band) | New information available in our own data | No improvement; circuit history slightly hurts; frozen model kept |
 | Run 10 (Section 9 ablation) | Each feature group removed in turn and the model refitted (LR and HGB, frozen settings) | Brief requires a feature-group ablation | Grid clearly the most important (−0.16 to −0.19 correct picks per race without it); form second; qualifying / standings / context largely overlap with them |
+| Run 11 (exploratory, outside the notebook) | Driver form restarts after a > 550-day break (as team form does), optionally with a comeback flag | Stale driver form after long breaks (23 comebacks in 2003+) | No effect: identical LR podium picks, PR-AUC ±0.004; features and frozen models kept, documented as a limitation |
+| Run 12 (exploratory, outside the notebook) | XGBoost, 24 settings tuned by CV, plus a nested check | Would a different boosting library help? | No clear gain over LR; small podium-pick edge over our gradient boosting but lower PR-AUC; frozen models kept |
 | Section 10 (explainability) | No training: weights, SHAP, LIME, permutation and race explanations of the frozen primary model | Brief requires XAI | Grid and form dominate every method; SHAP is exact for this model; LIME is unreliable here |

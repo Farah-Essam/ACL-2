@@ -14,6 +14,7 @@ This README is the project log. It records **what was done, why, and what was tr
 |---|---|
 | `f1_podium_prediction.ipynb` | **The deliverable.** One run-all notebook (the brief requires a single notebook). Currently sections 1–3. Saved with outputs. |
 | `tools/build_notebook.py` | **Generator** that writes every markdown and code cell of the notebook. The notebook was built from this script. |
+| `Section 5 and 6 by Claude.md` | **Every decision and result of sections 5–6**, made by Claude on the user's request (16 Oct 2026): reasons, numbers, what was tried and rejected, what to revisit. |
 | `tools/run_notebook.py` | Executes the notebook top to bottom with `jupyter_client` and stores the outputs (no `nbconvert` needed). |
 | `outputs/anomalies/` | CSVs written by notebook section 1.12: one per raw table, plus `_summary.csv`. |
 | `outputs/clean_data/` | **The cleaned dataset**, written by notebook section 2.13: 15 CSVs (`model_base`, `results_full`, every cleaned table, the `*_prerace` standings), `schema.json` (column types), `manifest.csv` (rows + SHA-256) and its own `README.md`. Load with `load_clean("<table>")` to get the exact types back. Rewritten on every run; never edit by hand. |
@@ -66,8 +67,9 @@ python tools/run_notebook.py  f1_podium_prediction.ipynb    # execute top to bot
 | **2. Data Cleaning** (2.1–2.13) | **closed** (review fixes applied 15 Oct 2026; 2.13 exports the cleaned dataset to `outputs/clean_data/`) | All cleaning applied in memory on copies. 2.9.1 status mapping with row counts; 2.10 re-validation (all 21 FKs); 2.10.2 proof that standings are post-race; 2.11 six before/after plot pairs |
 | **3. Data-Engineering Questions** (3.1–3.3) | done | Q1 (+ two robustness sections), Q2, Q3, each with plots and plain-language answers |
 | **4. Feature Selection & Engineering** (4.1–4.6) | done (16 Oct 2026) | split, 22 candidate features with leakage asserts, evidence plots (train only), redundancy, trials on validation, final 18-feature table. Results in README 7.1 |
-| 5. Pre-processing | **next** | decisions pending (README 7.2) |
-| 6+. Models, experiments, XAI, inference | to do | |
+| **5. Pre-processing** (5.1–5.4) | done (16 Oct 2026), **decisions by Claude** | pipeline fitted on training seasons only, before/after plots, `log(grid)` trial, 3 order experiments. See `Section 5 and 6 by Claude.md` |
+| **6. Predictive modeling** (6.1–6.7) | done (16 Oct 2026), **decisions by Claude** | models A and B: grid-only reference, logistic regression (baseline), random forest, gradient boosting, neural network; tuning on validation; 6 improvement attempts (all rejected); final test results; limitations |
+| 7+. Ablation, XAI, inference function, report | to do | |
 
 Variables available after running sections 1–4:
 - `RAW`: dict of raw tables, **all strings** (`dtype=str`, `keep_default_na=False`).
@@ -78,6 +80,7 @@ Variables available after running sections 1–4:
 - `model_base`: 2003+, pre-race columns + target only; the start of the modeling table.
 - Helpers: `is_missing`, `duration_to_seconds`, `log_step`, `STATUS_GROUPS`, `STATUS_CATEGORIES`, `NON_START_STATUSES`, `RULE_B_OVERRIDES`, `UNUSED_TABLES`, `DEFERRED_TABLES`, `NATIONALITY_TO_COUNTRY`, `season_order`, `CLEAN_DATA_DIR`, `load_clean(name)` (reads an exported table back with its exact types).
 - Section 4: `feat` (all 24,645 rows 1950–2024: keys, `year`, `split`, `podium`, every candidate feature), `season_split(year)`, `FEATURE_GROUPS`, `ALL_CANDIDATES`, `FINAL_FEATURES` (the 18 chosen), `TRAIN_A` / `VAL` (model-A training rows, validation rows), `TRIALS` (every trial's scores), `form_features(n)`, `run_trial`, `gain_interval`.
+- Sections 5–6: `PodiumPreprocessor`, `DATA[version][split]` (version A/B; split train/validation/test), `LOG_GRID`, `ORDER_EXPERIMENTS`, `MODEL_SPECS`, `TUNING` / `BEST` (per (version, model)), `CURRENT` (final model per version), `IMPROVEMENTS_DF`, `COMPARISON` (all models × sets × metrics), `FINAL`, helpers `scores`, `best_f1_threshold`, `top3_per_race`, `cur_predict`.
 
 ---
 
@@ -205,18 +208,50 @@ Notebook layout:
 - Fix found while plotting: in round 1 nobody has standings, so "behind everyone ranked" had become position 1 for everyone. Now round-1 rows are set to the back (number of starters), with the `no_standing_yet` flag.
 - **Final 18 features (`FINAL_FEATURES`):** grid `grid`, `pit_lane_start` · qualifying `gap_q1_pct`, `grid_minus_quali`, `reached_q3`, `no_q3_format`, `quali_missing` · standings `drv_champ_pos`, `cons_points_share`, `drv_no_standing_yet`, `cons_no_standing_yet` · form `drv_podium_rate_5`, `drv_avg_finish_5`, `drv_dnf_rate_5`, `cons_podium_rate_5` · context `n_starters`, `drv_experience`, `drv_age`. Model B uses the same 18.
 
-### 7.2 Section 5: Pre-processing. DECISIONS NEEDED
+### 7.2 Pre-processing and modeling decisions: MADE BY CLAUDE, NOT BY THE USER (16 Oct 2026). BUILT
 
-- How to fill missing values: form for a debut (1.1% of train rows), team form for a new team, `reached_q3` before 2006 (16.6% of model-A train), `gap_q1_pct` (1.8%), all qualifying features for model B before 2003. (Section 4 used a provisional median + "was missing" indicator.)
-- Scaling for logistic regression and the NN (standardise? robust scaler?), fitted on training seasons only.
-- Grid shape: the podium rate falls steeply from pole (79%, 62%, 50%, ...). A transform (e.g. log or 1/grid) may help the linear model.
-- The two (or more) pre-processing-order experiments to report.
+> ⚠️ **The user asked Claude to choose these** ("the best decisions that are defensible and give the best results"). They were **not** reviewed or chosen by the user. If any of them turns out wrong or hard to defend, change it here and in the notebook. Each line gives the reason, so it can be checked. **Sections 5 and 6 are built; the full record (with all results and later changes, e.g. widened grids, the E2/E3 experiments, six improvement attempts) is in `Section 5 and 6 by Claude.md`.** The plan below is the original one; where the built version differs, that file wins.
+
+**Headline results (test seasons 2022–2024, never used for choices):** grid-only reference PR-AUC 0.647. Selected models (best on validation): **A = random forest, test PR-AUC 0.706, ROC-AUC 0.937, F1 0.668**; **B = neural network, test PR-AUC 0.704, ROC-AUC 0.937, F1 0.660**. All tuned models are within noise of each other (logistic regression A 0.710, B 0.723; gradient boosting A 0.718, B 0.721). A ≈ B. No improvement attempt (race ranks, per-race normalisation, recency weights, training window, monotonic constraints, ensemble) beat the tuned models on validation.
+
+**Pre-processing (section 5).** One pipeline per model, **fitted on the training seasons only** and then applied unchanged to validation and test.
+
+| # | Decision | Why |
+|---|---|---|
+| P1 | **Fill missing values by meaning first:** `reached_q3` = 0 before 2006 (the `no_q3_format` flag says why); `grid_minus_quali` = 0 when qualifying is missing (no known penalty); model B before 2003: qualifying features filled, with the `quali_missing` flag marking them | the value has a real meaning, so a statistic would be the wrong fill |
+| P2 | **Everything else: training median + a "no history" flag.** Debut form → `drv_no_history`; new team → `cons_no_history`; `gap_q1_pct` (no Q1 time) → median | the flag lets the model treat "unknown" separately from "average"; the median is robust to outliers |
+| P3 | **Gradient boosting gets the raw NaN** (it handles missing values natively); only the other models get the filled values | it learns the best direction for missing values by itself |
+| P4 | **Outliers: cap at the 1st/99th percentile of the training seasons** (`gap_q1_pct`, `drv_champ_pos`, `drv_avg_finish_5`, `drv_age`); **log(1 + x)** for `drv_experience` (long tail) | percentiles from the data instead of hand-picked limits; capping stops a few extreme rows (wet Q1, 104th in the championship) from pulling a linear model |
+| P5 | **Standard scaling** (mean 0, std 1) for logistic regression and the neural network; none for tree models | regularised logistic regression and the NN need comparable scales; trees don't |
+| P6 | **`log(grid)` tested as a trial** for logistic regression / NN; kept only if validation PR-AUC doesn't drop | podium chance falls steeply from pole (79%, 62%, 50%, ...), and a straight line misses that |
+| P7 | **No resampling** (no SMOTE / undersampling) for the ~14% podium rate. Imbalance is handled by **PR-AUC**, the **validation-tuned threshold**, and `class_weight` tried as a hyperparameter | resampling breaks the "3 podiums per race" structure and distorts the probabilities |
+| P8 | **Before/after plots** for each step (distributions and ranges of the affected features) | brief: "effect of the step on data distribution/range/values" |
+
+**Pre-processing-order experiments (brief: at least 2):**
+- **E1 – where the pipeline is fitted:** on the training seasons only (correct) vs on all seasons including validation + test (leaky). Shows how much "peeking" inflates scores.
+- **E2 – capping before vs after scaling:** cap outliers then scale (chosen) vs scale then cap. With outliers present, scaling first is distorted by them.
+- Both scored on validation PR-AUC with the baseline logistic regression, and E1 with the best model as well.
+
+**Models (section 6):**
+
+| # | Decision | Why |
+|---|---|---|
+| M1 | **Naive reference:** logistic regression on grid only (0.676 validation PR-AUC in 4.5) | shows what the other features add |
+| M2 | **Baseline (required):** logistic regression on all 18 features | the simplest reasonable model |
+| M3 | **Statistical models:** random forest and gradient boosting (`HistGradientBoostingClassifier`) | different families (bagging vs boosting); gradient boosting is usually the strongest on tables like this |
+| M4 | **Shallow NN:** scikit-learn `MLPClassifier`, 1–2 hidden layers, early stopping | allowed by the brief ("standard library"), already installed (no Keras/PyTorch needed) |
+| M5 | **Same rows and same 18 features for every model** (per model version A / B) | brief: scores must be directly comparable |
+| M6 | **Hyperparameters:** small grids, chosen on **validation PR-AUC**; fixed random seeds | test seasons never used for choices |
+| M7 | **No refit on train + validation** before the test | the threshold chosen on validation would then belong to a different model; the scores stay clean |
+
+**Metrics and threshold:**
+- **Primary: PR-AUC** (podiums are ~14% of rows; it measures whether the real podium finishers are ranked on top). **Secondary: ROC-AUC.** Also reported: **F1, precision, recall** at the threshold (= five metrics).
+- **Threshold:** the one that maximises **F1 on validation**. Compared with a **top 3 per race** rule (each race has exactly 3 podiums). Reported on validation and test.
 
 ### 7.3 Later steps
 
-1. **Models:** baseline (e.g. logistic regression on grid) + ≥ 2 statistical models + shallow NN; ROC-AUC, PR-AUC, F1 on val/test; threshold chosen on validation. Podium rate ~14%, so PR-AUC matters.
-2. **Two model versions on the same validation/test seasons:** **A** = 2003+ (full qualifying); **B** = all years 1950–2018 for training, missing qualifying left as NaN + flag. (Replaces the earlier "grid only, all seasons" idea.)
-3. Ablation by feature group (grid, qualifying, standings, form); ≥ 2 preprocessing-order experiments; XAI; inference function; report.
+1. ~~Build sections 5 and 6~~ done (see `Section 5 and 6 by Claude.md`). **User to review the Claude-made decisions**, especially which final model to report (section 6 of that file).
+2. Feature-group ablation (grid, qualifying, standings, form, context) with the best model; XAI (permutation importance, SHAP, LIME/local SHAP); inference function; PDF report.
 
 ---
 
@@ -239,6 +274,7 @@ Notebook layout:
 | Review (15 Oct 2026): Rule B described as "grid > 0 first, then lowest resultId" | Both rows had grid > 0 in all 82 pairs, so only the resultId decided; the proxy kept the wrong car for Ascari 1951 (gave the 1951 French GP 4 podium rows), González 1954 and Moss 1961 | Reworded to "lowest resultId as a proxy" + `RULE_B_OVERRIDES` (3 verified pairs). 1951 French GP now has 3 podium rows |
 | Review: status taxonomy had Wheel / Rear wing / Undertray / Vibrations as mechanical but Wheel nut / Front wing as unclear, plus a 7th group "did not start" | Inconsistent; Q3 counts depend on it | Six groups only, consistent assignment (README §5 row 8); Q3 numbers updated |
 | Q2 included the Indianapolis 500 (1950–1960) | 380 of its 381 starts were American drivers at a US circuit (all "home"), with no away drivers in the same race: 16% of all home starts | Indy removed in cleaning (2.6.1); Q2 answer unchanged (−0.59 → −0.60 pts), Indy version kept as a robustness column |
+| Sections 5–6 (Claude, 16 Oct): first hyperparameter grids | Best settings at the grid edges; gradient boosting overfitted (train 0.82 vs val 0.70) | Grids widened once; a check beyond the new edges gained ≤ 0.0007. Details in `Section 5 and 6 by Claude.md` |
 | A few hard-coded claims in the markdown ("pre-1965", "few dozen rows", "~135 starts", "1–6 points") | Didn't match the computed numbers exactly | Replaced with computed values or corrected text. **Rule: every number in the markdown must match the output** |
 
 ---

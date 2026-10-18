@@ -3166,6 +3166,783 @@ md(r"""
 """)
 
 
+# ================================================================ 5. PRE-PROCESSING
+md(r"""
+# 5. Pre-processing
+
+> The pre-processing and modeling decisions in sections 5 and 6 were **chosen by Claude on the user's request** (README 7.2, and `Section 5 and 6 by Claude.md`). Each one is written with its reason, so it can be reviewed and changed.
+
+**Goal:** turn the 18 features from section 4 into inputs every model can use, without leaking information from the validation or test seasons.
+
+**The one rule:** every statistic used to transform the data (medians, percentiles, means, standard deviations) is **learned from the training seasons only**. Then it is applied, unchanged, to validation and test. In practice the pre-processing is a scikit-learn step inside each model's pipeline, so `fit` only ever sees training rows.
+
+| Step | What | Why |
+|---|---|---|
+| 1. Fill by meaning | `reached_q3` = 0 before 2006 (no Q3 existed; the `no_q3_format` flag says so); `grid_minus_quali` = 0 when qualifying is missing (no known penalty) | the value has a real meaning, so no statistic is needed |
+| 2. "No history" flags | `drv_no_history` (driver's first race: no form), `cons_no_history` (team's first race) | lets the model treat "unknown" differently from "average" |
+| 3. Log of experience | `drv_experience` → log(1 + starts) | very long tail (0 to 400 starts); the difference between 0 and 20 starts matters more than between 200 and 220 |
+| 4. Cap outliers | `gap_q1_pct`, `drv_champ_pos`, `drv_avg_finish_5`, `drv_age` capped at the 1st / 99th percentile of the training seasons | a few extreme rows (a wet Q1, 100th in the championship) would pull a linear model |
+| 5. Fill the rest | training **median** (e.g. `gap_q1_pct` without a Q1 time, form of a debut driver, all qualifying features of model B before 2003) | robust to outliers; the flags from step 2 and `quali_missing` keep the information that a value was missing |
+| 6. Scale | mean 0, standard deviation 1 | logistic regression (regularised) and the neural network need comparable scales |
+
+**Per model:** logistic regression and the neural network use all six steps. The random forest uses steps 1–5 (trees don't need scaling or capping, but scikit-learn's forest needs no missing values). Gradient boosting uses steps 1–3 and keeps the remaining missing values as they are: it handles them natively and learns the best direction for them.
+""")
+
+code(r'''
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.metrics import f1_score, precision_recall_curve, precision_score, recall_score
+from sklearn.model_selection import ParameterGrid
+from sklearn.neural_network import MLPClassifier
+
+FEATS = list(FINAL_FEATURES)
+CAP_COLS = ["gap_q1_pct", "drv_champ_pos", f"drv_avg_finish_{FORM_WINDOW}", "drv_age"]
+
+
+class PodiumPreprocessor(BaseEstimator, TransformerMixin):
+    """Pre-processing for the podium models. Every statistic is learned in fit() (training seasons only).
+
+    impute / cap / scale switch steps 5 / 4 / 6 on or off; log_grid adds log(grid);
+    flags_before_impute and cap_before_scale exist only for the pre-processing-order experiments (5.4).
+    """
+
+    def __init__(self, impute=True, cap=True, scale=True, log_grid=False,
+                 flags_before_impute=True, cap_before_scale=True):
+        self.impute, self.cap, self.scale, self.log_grid = impute, cap, scale, log_grid
+        self.flags_before_impute, self.cap_before_scale = flags_before_impute, cap_before_scale
+
+    def _base(self, X):
+        X = X.astype(float).copy()
+        X["reached_q3"] = X["reached_q3"].fillna(0.0)                     # step 1
+        X["grid_minus_quali"] = X["grid_minus_quali"].fillna(0.0)
+        if self.flags_before_impute:                                        # step 2
+            X["drv_no_history"] = X[f"drv_podium_rate_{FORM_WINDOW}"].isna().astype(float)
+            X["cons_no_history"] = X[f"cons_podium_rate_{FORM_WINDOW}"].isna().astype(float)
+        X["drv_experience"] = np.log1p(X["drv_experience"])                # step 3
+        if self.log_grid:
+            X["grid"] = np.log(X["grid"])
+        return X
+
+    def _cap(self, X, lo, hi):
+        cols = [c for c in CAP_COLS if c in X.columns]
+        X[cols] = X[cols].clip(lower=lo[cols], upper=hi[cols], axis=1)
+        return X
+
+    def _impute(self, X):
+        X = X.fillna(self.median_)
+        if not self.flags_before_impute:                                    # order experiment: flags after filling
+            X["drv_no_history"] = X[f"drv_podium_rate_{FORM_WINDOW}"].isna().astype(float)
+            X["cons_no_history"] = X[f"cons_podium_rate_{FORM_WINDOW}"].isna().astype(float)
+        return X
+
+    def fit(self, X, y=None):
+        X = self._base(X)
+        self.lo_, self.hi_ = X[CAP_COLS].quantile(0.01), X[CAP_COLS].quantile(0.99)
+        if self.cap and self.cap_before_scale:
+            X = self._cap(X, self.lo_, self.hi_)
+        self.median_ = X.median()
+        if self.impute:
+            X = self._impute(X)
+        self.mean_, self.std_ = X.mean(), X.std(ddof=0).replace(0, 1.0)
+        if self.scale and self.cap and not self.cap_before_scale:
+            Z = (X - self.mean_) / self.std_
+            self.zlo_, self.zhi_ = Z[CAP_COLS].quantile(0.01), Z[CAP_COLS].quantile(0.99)
+        self.columns_ = list(X.columns)
+        return self
+
+    def transform(self, X):
+        X = self._base(X)
+        if self.cap and self.cap_before_scale:
+            X = self._cap(X, self.lo_, self.hi_)
+        if self.impute:
+            X = self._impute(X)
+        if self.scale:
+            X = (X - self.mean_) / self.std_
+            if self.cap and not self.cap_before_scale:
+                X = self._cap(X, self.zlo_, self.zhi_)
+        return X[self.columns_]
+
+
+# Model tables: same 18 features, same validation and test seasons; model B trains on 1950-2018.
+DATA = {}
+for version, start in [("A", MODEL_START_YEAR), ("B", MODEL_B_TRAIN_START)]:
+    d = feat[feat["year"] >= start]
+    DATA[version] = {s: d[d["split"] == s].reset_index(drop=True) for s in ["train", "validation", "test"]}
+assert DATA["A"]["validation"]["raceId"].equals(DATA["B"]["validation"]["raceId"])
+assert DATA["A"]["test"]["raceId"].equals(DATA["B"]["test"]["raceId"])
+
+display(pd.DataFrame({f"{v} {s}": [len(DATA[v][s]), int(DATA[v][s]["raceId"].nunique())]
+                      for v in DATA for s in ["train", "validation"]}, index=["rows", "races"]))
+''')
+
+md(r"""
+**Check: the output is complete and leak-free.** After fitting on the training seasons, no missing value is left (for the models that need it), every column is finite, and the transform of the validation rows uses only statistics learned from training rows.
+""")
+
+code(r'''
+for version in ["A", "B"]:
+    tr, va = DATA[version]["train"][FEATS], DATA[version]["validation"][FEATS]
+    prep = PodiumPreprocessor().fit(tr)
+    out_tr, out_va = prep.transform(tr), prep.transform(va)
+    assert not out_tr.isna().any().any() and not out_va.isna().any().any()
+    assert np.isfinite(out_tr.to_numpy()).all() and np.isfinite(out_va.to_numpy()).all()
+    # fitting on train only: refitting with the validation rows added must change the statistics
+    prep_all = PodiumPreprocessor().fit(pd.concat([tr, va]))
+    assert not np.allclose(prep.median_, prep_all.median_) or not np.allclose(prep.mean_, prep_all.mean_)
+    print(f"Model {version}: {out_tr.shape[1]} columns after pre-processing, no missing values, all finite "
+          f"(train {len(out_tr):,} rows, validation {len(out_va):,} rows)")
+print("Columns:", list(out_tr.columns))
+''')
+
+# ---------------------------------------------------------------- 5.2
+md(r"""
+## 5.2 Effect of the pre-processing on the data
+
+The plots compare the **training rows of model A** before and after each step: distributions, ranges and missing values.
+""")
+
+code(r'''
+tr_raw = DATA["A"]["train"][FEATS].astype(float)
+prep_A = PodiumPreprocessor(scale=False).fit(tr_raw)          # unscaled, to show the real units
+tr_noscale = prep_A.transform(tr_raw)
+tr_scaled = PodiumPreprocessor().fit(tr_raw).transform(tr_raw)
+
+fig, axes = plt.subplots(2, 4, figsize=(18, 7))
+pairs = [("gap_q1_pct", "gap to fastest Q1 (%)", 60), ("drv_champ_pos", "driver championship position", 40),
+         ("drv_experience", "career starts (after: log(1 + starts))", 40), (f"drv_avg_finish_{FORM_WINDOW}", "average finish, last 5", 30)]
+for j, (col, label, bins) in enumerate(pairs):
+    axes[0, j].hist(tr_raw[col].dropna(), bins=bins, color="#8C8C8C")
+    axes[0, j].set_title(f"Before: {col}", fontsize=10)
+    axes[1, j].hist(tr_noscale[col], bins=bins, color="#4C72B0")
+    axes[1, j].set_title(f"After: {col}", fontsize=10)
+    axes[1, j].set_xlabel(label)
+fig.suptitle("Training rows of model A: before (top) and after (bottom) capping / log / filling", y=1.0)
+plt.tight_layout()
+plt.show()
+
+ranges = pd.DataFrame({
+    "before min": tr_raw.min(), "before max": tr_raw.max(), "before missing": tr_raw.isna().sum(),
+    "after min": tr_noscale[FEATS].min(), "after max": tr_noscale[FEATS].max(), "after missing": tr_noscale[FEATS].isna().sum(),
+    "scaled mean": tr_scaled[FEATS].mean(), "scaled std": tr_scaled[FEATS].std(ddof=0),
+}).round(2)
+display(ranges)
+print("Caps learned from the training seasons (1st / 99th percentile):")
+display(pd.DataFrame({"lower cap": prep_A.lo_, "upper cap": prep_A.hi_}).round(2))
+''')
+
+md(r"""
+**What the pre-processing changed** (training rows of model A):
+- **Capping:** `gap_q1_pct` went from 0–33% to 0–7.9% (the 99th percentile). The long tail of wet or broken-down Q1 laps is gone; the small spike at 7.9% is those rows, now capped. `drv_champ_pos` 1–28 → 1–25, `drv_avg_finish_5` 1–24 → 1.6–20.2, `drv_age` 17–44 → 19–41.
+- **Log:** `drv_experience` 0–324 starts became 0–5.8. The distribution is no longer squeezed against zero, so the difference between a rookie and a driver with 20 races is visible.
+- **Missing values:** 1,061 `reached_q3` gaps (2003–2005) became 0 by meaning; 113 `gap_q1_pct` and 72 form gaps were filled with the training median, with the new `drv_no_history` / `cons_no_history` flags marking them. After pre-processing **no value is missing**.
+- **Scaling:** every column now has mean 0 and standard deviation 1 on the training rows, so logistic regression and the neural network treat all features on the same footing.
+""")
+
+# ---------------------------------------------------------------- 5.3
+md(r"""
+## 5.3 Trial: log(grid) for the linear models
+
+Section 4.3 showed that the podium chance falls **steeply** from pole (79%, 62%, 50%, then under 5% from 8th). A logistic regression can only bend its curve in one fixed way, so `log(grid)` may fit this shape better. Decision rule: keep it for logistic regression and the neural network if validation PR-AUC does not drop (both model versions).
+""")
+
+code(r'''
+def lr_pipeline(prep=None, **lr_params):
+    return make_pipeline(prep if prep is not None else PodiumPreprocessor(), LogisticRegression(max_iter=5000, **lr_params))
+
+
+def val_pr_auc(pipe, version):
+    d = DATA[version]
+    pipe.fit(d["train"][FEATS], d["train"]["podium"])
+    return average_precision_score(d["validation"]["podium"], pipe.predict_proba(d["validation"][FEATS])[:, 1])
+
+
+log_grid_trial = pd.DataFrame({v: {"grid as is": val_pr_auc(lr_pipeline(PodiumPreprocessor(log_grid=False)), v),
+                                   "log(grid)": val_pr_auc(lr_pipeline(PodiumPreprocessor(log_grid=True)), v)}
+                               for v in ["A", "B"]}).round(4)
+display(log_grid_trial.rename_axis("validation PR-AUC (logistic regression)"))
+LOG_GRID = bool((log_grid_trial.loc["log(grid)"] >= log_grid_trial.loc["grid as is"]).all())
+print("Use log(grid) for logistic regression and the neural network:", LOG_GRID)
+''')
+
+md(r"""
+**Result:** `log(grid)` raises validation PR-AUC for **both** versions (A: 0.7244 → 0.7313, B: 0.7202 → 0.7283), so it is **used for logistic regression and the neural network**. The tree models don't need it: a tree splits on the order of the values, which a log doesn't change.
+""")
+
+# ---------------------------------------------------------------- 5.4
+md(r"""
+## 5.4 Pre-processing-order experiments
+
+The brief asks for at least two experiments where the **order** of pre-processing steps changes. Each is scored with the baseline logistic regression on validation PR-AUC, for both model versions:
+
+- **E1 – fit before or after the split:** the pre-processing statistics are learned from the **training seasons only** (correct) or from **all seasons, including validation and test** (leaky: the model indirectly "sees" the future seasons' medians, percentiles and scales). Only feature values are used, never the test labels.
+- **E2 – missing-value flags before or after filling:** the `no_history` flags are created **before** the gaps are filled (correct: they record which rows were missing) or **after** (the gaps are already filled, so the flags are all 0 and the information is lost).
+- **E3 – capping before or after scaling:** outliers are capped **before** scaling (chosen: the mean and standard deviation are computed without the extreme rows) or **after** scaling (the extreme rows first distort the scale, then get capped in scaled units).
+""")
+
+code(r'''
+def order_experiment(make_prep, leaky_fit=False):
+    out = {}
+    for v in ["A", "B"]:
+        d = DATA[v]
+        prep = make_prep()
+        fit_rows = pd.concat([d["train"], d["validation"], d["test"]]) if leaky_fit else d["train"]
+        prep.fit(fit_rows[FEATS])
+        lr = LogisticRegression(max_iter=5000).fit(prep.transform(d["train"][FEATS]), d["train"]["podium"])
+        p = lr.predict_proba(prep.transform(d["validation"][FEATS]))[:, 1]
+        out[v] = average_precision_score(d["validation"]["podium"], p)
+    return out
+
+
+ORDER_EXPERIMENTS = pd.DataFrame({
+    "E1 fit on training seasons (chosen)": order_experiment(lambda: PodiumPreprocessor(log_grid=LOG_GRID)),
+    "E1 fit on all seasons (leaky)": order_experiment(lambda: PodiumPreprocessor(log_grid=LOG_GRID), leaky_fit=True),
+    "E2 flags before filling (chosen)": order_experiment(lambda: PodiumPreprocessor(log_grid=LOG_GRID)),
+    "E2 flags after filling": order_experiment(lambda: PodiumPreprocessor(log_grid=LOG_GRID, flags_before_impute=False)),
+    "E3 cap before scaling (chosen)": order_experiment(lambda: PodiumPreprocessor(log_grid=LOG_GRID)),
+    "E3 cap after scaling": order_experiment(lambda: PodiumPreprocessor(log_grid=LOG_GRID, cap_before_scale=False)),
+}).T.round(4)
+ORDER_EXPERIMENTS.columns = ["model A val PR-AUC", "model B val PR-AUC"]
+display(ORDER_EXPERIMENTS)
+
+# How much do the learned statistics move when the pipeline is fitted on all seasons?
+d = DATA["A"]
+p_train = PodiumPreprocessor(log_grid=LOG_GRID).fit(d["train"][FEATS])
+p_all = PodiumPreprocessor(log_grid=LOG_GRID).fit(pd.concat([d["train"], d["validation"], d["test"]])[FEATS])
+display(pd.DataFrame({"median (train only)": p_train.median_[CAP_COLS], "median (all seasons)": p_all.median_[CAP_COLS],
+                      "99th pct (train only)": p_train.hi_, "99th pct (all seasons)": p_all.hi_}).round(3))
+
+fig, ax = plt.subplots(figsize=(10, 3.8))
+y = np.arange(len(ORDER_EXPERIMENTS))
+ax.barh(y - 0.2, ORDER_EXPERIMENTS["model A val PR-AUC"], 0.4, label="model A", color="#4C72B0")
+ax.barh(y + 0.2, ORDER_EXPERIMENTS["model B val PR-AUC"], 0.4, label="model B", color="#DD8452")
+ax.set_yticks(y, ORDER_EXPERIMENTS.index)
+ax.invert_yaxis()
+lo = ORDER_EXPERIMENTS.min().min()
+ax.set_xlim(lo - 0.02, ORDER_EXPERIMENTS.max().max() + 0.01)
+ax.set_xlabel("validation PR-AUC (logistic regression)")
+ax.set_title("Pre-processing-order experiments")
+ax.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**What the experiments show.**
+- All three experiments change validation PR-AUC by **less than 0.002**, far below the noise of 60 validation races (about ±0.047).
+- **E1 (leaky fit):** slightly *lower* (A −0.0008, B −0.0003). The statistics barely move when the validation and test seasons are added (median `gap_q1_pct` 1.36% vs 1.22%, its 99th percentile 7.86% vs 7.50%), because medians and percentiles are robust. The leak exists in principle; here it simply doesn't pay. We keep the correct order, since a leak that happens to be harmless on this data can still matter elsewhere.
+- **E2 (flags after filling):** almost identical. Only ~1% of training rows have no form history, and a debut driver is already recognisable from `drv_experience` = 0, so for a linear model the flag adds little. We keep the flags because they are free and the tree models can use them.
+- **E3 (cap after scaling):** identical for A, +0.001 for B. Capping and scaling only stretch or shift a column, which a logistic regression absorbs in its coefficients.
+- **Lesson:** the *order* rules matter for correctness (never learn from the future), but with robust steps (medians, percentile caps) the effect on the scores is negligible for this data.
+""")
+
+# ================================================================ 6. MODELS
+md(r"""
+# 6. Predictive modeling
+
+**Task:** binary classification, podium (1) or not (0), for one driver in one race, using the 18 pre-race features.
+
+**Models** (same rows and same features within each model version, so scores are directly comparable):
+
+| Model | Role | Why |
+|---|---|---|
+| Logistic regression, **grid only** | naive reference | how far the starting position alone gets us |
+| **Logistic regression**, all features | **baseline** (required) | the simplest reasonable model; a weighted sum of the features turned into a probability |
+| **Random forest** | statistical model 1 | many decision trees on random subsets of rows and features, averaged; captures non-linear effects and interactions |
+| **Gradient boosting** (`HistGradientBoostingClassifier`) | statistical model 2 | trees built one after another, each fixing the previous ones' errors; usually the strongest on tables like this |
+| **Neural network** (`MLPClassifier`, 1–2 hidden layers) | shallow NN | layers of weighted sums with a non-linear activation; early stopping prevents overfitting |
+
+**Two versions:** **A** trains on 2003–2018 (full qualifying data). **B** trains on 1950–2018 (qualifying missing before ~2003, flagged). Both are validated on 2019–2021 and tested on 2022–2024.
+
+**Metrics:**
+- **Primary: PR-AUC.** Only ~14% of rows are podiums. PR-AUC measures whether the real podium finishers are ranked at the top, and it isn't flattered by the many easy "no podium" rows at the back of the grid.
+- **Secondary: ROC-AUC.** How well the two classes are separated overall; useful for comparison with other work, but optimistic when one class is rare.
+- **F1, precision, recall** at a probability **threshold** chosen to maximise **F1 on validation**. Compared with a **top 3 per race** rule, which uses the fact that every race has exactly 3 podiums.
+
+**Rules:** hyperparameters and thresholds are chosen on **validation** only. The test seasons are used **once**, at the end (6.6), for the final scores.
+""")
+
+code(r'''
+from sklearn.metrics import precision_recall_curve
+
+MODEL_SPECS = {
+    "logistic regression": (LogisticRegression(max_iter=5000),
+                            {"C": [0.01, 0.1, 1.0, 10.0], "class_weight": [None, "balanced"]},
+                            lambda: PodiumPreprocessor(log_grid=LOG_GRID)),
+    "random forest": (RandomForestClassifier(n_estimators=400, n_jobs=-1, random_state=0),
+                      {"max_depth": [4, 6, 8, 12], "min_samples_leaf": [20, 50], "max_features": ["sqrt", 0.5],
+                       "class_weight": [None, "balanced_subsample"]},
+                      lambda: PodiumPreprocessor(cap=False, scale=False)),
+    "gradient boosting": (HistGradientBoostingClassifier(early_stopping=False, random_state=0),
+                          {"learning_rate": [0.03, 0.1], "max_iter": [100, 300], "max_depth": [3, None],
+                           "max_leaf_nodes": [7, 15], "min_samples_leaf": [40, 100], "l2_regularization": [1.0]},
+                          lambda: PodiumPreprocessor(impute=False, cap=False, scale=False)),
+    "neural network": (MLPClassifier(max_iter=500, early_stopping=True, validation_fraction=0.1,
+                                     n_iter_no_change=20, random_state=0),
+                       {"hidden_layer_sizes": [(16,), (32, 16), (64, 32)], "alpha": [1e-3, 1e-2, 1e-1, 1.0]},
+                       lambda: PodiumPreprocessor(log_grid=LOG_GRID)),
+}
+
+
+def scores(y, p, thr):
+    pred = (p >= thr).astype(int)
+    return {"PR-AUC": average_precision_score(y, p), "ROC-AUC": roc_auc_score(y, p), "F1": f1_score(y, pred),
+            "precision": precision_score(y, pred, zero_division=0), "recall": recall_score(y, pred)}
+
+
+def best_f1_threshold(y, p):
+    prec, rec, thr = precision_recall_curve(y, p)
+    f1 = 2 * prec[:-1] * rec[:-1] / np.clip(prec[:-1] + rec[:-1], 1e-12, None)
+    return float(thr[np.nanargmax(f1)])
+
+
+def top3_per_race(df, p):
+    rank = pd.Series(p, index=df.index).groupby(df["raceId"]).rank(ascending=False, method="first")
+    return (rank <= 3).astype(int).to_numpy()
+
+
+TUNING, BEST = {}, {}
+
+
+def tune(version, name, feats=None):
+    est, grid, make_prep = MODEL_SPECS[name]
+    feats = feats or FEATS
+    d = DATA[version]
+    rows, best = [], None
+    for params in ParameterGrid(grid):
+        pipe = make_pipeline(make_prep(), clone(est).set_params(**params))
+        pipe.fit(d["train"][feats], d["train"]["podium"])
+        p = pipe.predict_proba(d["validation"][feats])[:, 1]
+        s = average_precision_score(d["validation"]["podium"], p)
+        rows.append({**{k: str(v) for k, v in params.items()}, "val PR-AUC": round(s, 4)})
+        if best is None or s > best["val PR-AUC"]:
+            best = {"val PR-AUC": s, "pipe": pipe, "params": params, "p_val": p, "feats": feats}
+    best["threshold"] = best_f1_threshold(d["validation"]["podium"], best["p_val"])
+    TUNING[(version, name)] = pd.DataFrame(rows).sort_values("val PR-AUC", ascending=False).reset_index(drop=True)
+    BEST[(version, name)] = best
+    return best
+''')
+
+# ---------------------------------------------------------------- 6.1
+md(r"""
+## 6.1 Naive reference and baseline: logistic regression
+""")
+
+code(r'''
+for v in ["A", "B"]:
+    d = DATA[v]
+    ref_feats = ["grid", "pit_lane_start"]
+    ref_prep = PodiumPreprocessor(log_grid=LOG_GRID).fit(d["train"][FEATS])
+    lr_ref = LogisticRegression(max_iter=5000).fit(ref_prep.transform(d["train"][FEATS])[ref_feats], d["train"]["podium"])
+    p_val = lr_ref.predict_proba(ref_prep.transform(d["validation"][FEATS])[ref_feats])[:, 1]
+    BEST[(v, "grid only (reference)")] = {
+        "val PR-AUC": average_precision_score(d["validation"]["podium"], p_val), "params": {},
+        "pipe": None, "ref": (ref_prep, lr_ref, ref_feats), "p_val": p_val,
+        "threshold": best_f1_threshold(d["validation"]["podium"], p_val), "feats": FEATS}
+    b = tune(v, "logistic regression")
+    print(f"Model {v}: grid-only reference {BEST[(v, 'grid only (reference)')]['val PR-AUC']:.4f} | "
+          f"logistic regression {b['val PR-AUC']:.4f} with {b['params']}")
+display(TUNING[("A", "logistic regression")].head(8))
+''')
+
+md(r"""
+**Baseline:** the grid-only reference reaches 0.677 validation PR-AUC. Logistic regression with all 18 features reaches **0.733** for model A (C = 0.1, no class weights) and **0.730** for model B (C = 10, balanced class weights). Class weights don't help model A; they shift the predicted probabilities but barely change the ranking, which is what PR-AUC measures.
+""")
+
+# ---------------------------------------------------------------- 6.2
+md(r"""
+## 6.2 Random forest
+""")
+
+code(r'''
+for v in ["A", "B"]:
+    b = tune(v, "random forest")
+    print(f"Model {v}: random forest {b['val PR-AUC']:.4f} with {b['params']}")
+display(TUNING[("A", "random forest")].head(8))
+''')
+
+md(r"""
+## 6.3 Gradient boosting
+""")
+
+code(r'''
+for v in ["A", "B"]:
+    b = tune(v, "gradient boosting")
+    print(f"Model {v}: gradient boosting {b['val PR-AUC']:.4f} with {b['params']}")
+display(TUNING[("A", "gradient boosting")].head(8))
+''')
+
+md(r"""
+## 6.4 Shallow neural network
+""")
+
+code(r'''
+for v in ["A", "B"]:
+    b = tune(v, "neural network")
+    print(f"Model {v}: neural network {b['val PR-AUC']:.4f} with {b['params']}")
+display(TUNING[("A", "neural network")].head(9))
+''')
+
+md(r"""
+**Tuning results** (best validation PR-AUC per model):
+
+| | logistic regression | random forest | gradient boosting | neural network |
+|---|---|---|---|---|
+| **A** | 0.733 | **0.742** | 0.740 | 0.734 |
+| **B** | 0.730 | 0.734 | 0.729 | **0.740** |
+
+- All tuned models are within **~0.01** of each other, much less than the validation noise (±0.047). The ranking between them is **not reliable**; they all extract about the same information from the 18 features.
+- Gradient boosting overfitted with its first, larger settings (training 0.82 vs validation 0.70). Its best settings are now small, regularised trees (depth 3, 7 leaves, 100 rounds, learning rate 0.03).
+- The best settings of the forest and the boosting model lie at the edge of the grids. A check beyond the edges (documented in `Section 5 and 6 by Claude.md`) gained at most +0.0007, so the grids are wide enough.
+""")
+
+# ---------------------------------------------------------------- 6.5
+md(r"""
+## 6.5 Further attempts to improve the models (validation only)
+
+After the main models were tuned, Claude tried six more ideas that could plausibly improve the predictions. They are tried **in order**, each one starting from the **current best model** of each version. Each is judged on **validation PR-AUC** only; the test seasons stay untouched.
+
+**Adoption rule** (to avoid chasing noise in 60 validation races): an idea that applies to both versions is adopted only if it improves the current best model of **both A and B**. An idea for model B only must improve model B. Each result shows the 95% race-resampling interval of the gain.
+
+| Attempt | Idea | Why it might help |
+|---|---|---|
+| I1 | **Race-relative features:** within each race, the rank of the team's points share, the team's recent podium rate, the driver's recent podium rate and recent average finish | a podium is a **relative** outcome (top 3 of *this* field) |
+| I2 | **Per-race normalisation:** rescale each race's probabilities so they add up to 3 | every race has exactly 3 podiums; the raw probabilities don't know that |
+| I3 | **Recency weights (model B):** older seasons count less (weight halves every 10 years) | 1950s racing is very different; the model should learn mostly from recent seasons |
+| I4 | **Training window (model B):** start training in 1970, 1980 or 1994 instead of 1950 | the same question as I3, answered by cutting instead of down-weighting |
+| I5 | **Monotonic constraints for gradient boosting:** e.g. a better grid slot or a better championship position can never *lower* the predicted chance | stops the trees from learning noisy zig-zags; usually generalises better |
+| I6 | **Ensemble:** average the probabilities of the tuned logistic regression, random forest, gradient boosting and neural network | different model families make different mistakes |
+""")
+
+code(r'''
+FAMILIES = ["logistic regression", "random forest", "gradient boosting", "neural network"]
+IMPROVEMENTS = []
+
+
+def make_model(name, params, mono=None):
+    est, grid, make_prep = MODEL_SPECS[name]
+    est = clone(est).set_params(**params)
+    if mono is not None:
+        est.set_params(monotonic_cst=mono)
+    return make_pipeline(make_prep(), est)
+
+
+def fit_model(version, name, params, feats, start_year=None, weights=None, mono=None):
+    tr = DATA[version]["train"]
+    if start_year is not None:
+        tr = tr[tr["year"] >= start_year]
+    pipe = make_model(name, params, mono)
+    fit_kw = {} if weights is None else {f"{pipe.steps[-1][0]}__sample_weight": weights(tr)}
+    return pipe.fit(tr[feats], tr["podium"], **fit_kw)
+
+
+def normalise_per_race(df, p):
+    s = pd.Series(p, index=df.index)
+    return (3 * s / s.groupby(df["raceId"]).transform("sum")).clip(upper=1.0).to_numpy()
+
+
+def cur_predict(version, split, cur=None):
+    cur = cur or CURRENT[version]
+    df = DATA[version][split]
+    if "members" in cur:
+        p = np.mean([m.predict_proba(df[cur["feats"]])[:, 1] for m in cur["members"]], axis=0)
+    else:
+        p = cur["pipe"].predict_proba(df[cur["feats"]])[:, 1]
+    return normalise_per_race(df, p) if cur.get("normalise") else p
+
+
+def boot_gain(version, p_old, p_new):
+    va = DATA[version]["validation"]
+    y, race = va["podium"].to_numpy(), va["raceId"].to_numpy()
+    idx = [np.concatenate([np.flatnonzero(race == r) for r in races]) for races in BOOT_RACES]
+    g = [average_precision_score(y[i], p_new[i]) - average_precision_score(y[i], p_old[i]) for i in idx]
+    return np.percentile(g, [2.5, 97.5])
+
+
+def try_candidate(attempt, version, cand):
+    """Score a candidate on validation against the current best model; return (improved?, score)."""
+    y = DATA[version]["validation"]["podium"]
+    p_old, p_new = cur_predict(version, "validation"), cur_predict(version, "validation", cand)
+    before, after = average_precision_score(y, p_old), average_precision_score(y, p_new)
+    lo, hi = boot_gain(version, p_old, p_new)
+    IMPROVEMENTS.append({"attempt": attempt, "version": version, "current best": CURRENT[version]["label"],
+                         "candidate": cand["label"], "val PR-AUC before": round(before, 4), "val PR-AUC after": round(after, 4),
+                         "gain": round(after - before, 4), "gain 95% interval": f"[{lo:+.3f}, {hi:+.3f}]"})
+    return after > before
+
+
+def adopt(attempt, cands):
+    """cands: {version: candidate}. Adopt only if every version in cands improves."""
+    ok = {v: try_candidate(attempt, v, c) for v, c in cands.items()}
+    adopted = all(ok.values())
+    for v, c in cands.items():
+        IMPROVEMENTS[-len(cands) + list(cands).index(v)]["decision"] = "adopt" if adopted else "reject"
+        if adopted:
+            c["steps"] = CURRENT[v]["steps"] + [attempt]
+            CURRENT[v] = c
+    display(pd.DataFrame(IMPROVEMENTS[-len(cands):]))
+    print(f"{attempt}: {'ADOPTED' if adopted else 'rejected'}")
+    return adopted
+
+
+CURRENT = {}
+for v in ["A", "B"]:
+    name = max(FAMILIES, key=lambda n: BEST[(v, n)]["val PR-AUC"])
+    CURRENT[v] = {"label": name, "family": name, "params": BEST[(v, name)]["params"], "pipe": BEST[(v, name)]["pipe"],
+                  "feats": FEATS, "steps": [], "start_year": None, "weights": None, "mono": None}
+print("Starting point (best tuned model per version):", {v: CURRENT[v]["label"] for v in CURRENT})
+''')
+
+md(r"""
+### I1: race-relative features
+""")
+
+code(r'''
+REL_SOURCE = ["cons_points_share", f"cons_podium_rate_{FORM_WINDOW}", f"drv_podium_rate_{FORM_WINDOW}", f"drv_avg_finish_{FORM_WINDOW}"]
+REL_FEATS = [f"race_rank_{c}" for c in REL_SOURCE]
+for c, name in zip(REL_SOURCE, REL_FEATS):
+    ascending = c.startswith("drv_avg_finish")             # lower average finish = stronger
+    for v in DATA:
+        for s in DATA[v]:
+            df = DATA[v][s]
+            df[name] = df.groupby("raceId")[c].rank(ascending=ascending, method="average", na_option="bottom")
+
+
+def variant(v, **changes):
+    c = {k: val for k, val in CURRENT[v].items() if k not in ("pipe", "members")}
+    c.update(changes)
+    c["pipe"] = fit_model(v, c["family"], c["params"], c["feats"], c["start_year"], c["weights"], c["mono"])
+    return c
+
+
+adopt("I1 race-relative features",
+      {v: variant(v, feats=CURRENT[v]["feats"] + REL_FEATS, label=CURRENT[v]["label"] + " + race ranks") for v in ["A", "B"]})
+''')
+
+md(r"""
+### I2: per-race normalisation of probabilities
+""")
+
+code(r'''
+adopt("I2 per-race normalisation",
+      {v: {**CURRENT[v], "normalise": True, "label": CURRENT[v]["label"] + " + per-race normalisation"} for v in ["A", "B"]})
+''')
+
+md(r"""
+### I3: recency weights (model B)
+
+Applied to every model family that accepts sample weights (logistic regression, random forest, gradient boosting), each with its tuned settings. The best weighted model must beat the current best model B.
+""")
+
+code(r'''
+HALF_LIFE = 10
+recency = lambda tr: (0.5 ** ((2018 - tr["year"].astype(float)) / HALF_LIFE)).to_numpy()
+weighted = {}
+for name in ["logistic regression", "random forest", "gradient boosting"]:
+    c = {"label": f"{name} + recency weights", "family": name, "params": BEST[("B", name)]["params"],
+         "feats": CURRENT["B"]["feats"], "steps": [], "start_year": None, "weights": recency, "mono": None,
+         "normalise": CURRENT["B"].get("normalise", False)}
+    c["pipe"] = fit_model("B", name, c["params"], c["feats"], weights=recency)
+    unweighted = average_precision_score(DATA["B"]["validation"]["podium"], BEST[("B", name)]["p_val"])
+    weighted[name] = (average_precision_score(DATA["B"]["validation"]["podium"], cur_predict("B", "validation", c)), unweighted, c)
+display(pd.DataFrame({n: {"val PR-AUC without weights": round(w[1], 4), "val PR-AUC with recency weights": round(w[0], 4)}
+                      for n, w in weighted.items()}).T)
+best_w = max(weighted, key=lambda n: weighted[n][0])
+adopt("I3 recency weights (model B)", {"B": weighted[best_w][2]})
+''')
+
+md(r"""
+### I4: training window for model B
+""")
+
+code(r'''
+window_scores = {}
+for start in [1950, 1970, 1980, 1994]:
+    c = variant("B", start_year=start, label=f"{CURRENT['B']['family']} trained {start}-2018")
+    window_scores[start] = (average_precision_score(DATA["B"]["validation"]["podium"], cur_predict("B", "validation", c)), c)
+display(pd.Series({k: round(v[0], 4) for k, v in window_scores.items()}, name="validation PR-AUC")
+        .rename_axis("model B training starts in").to_frame().T)
+best_start = max(window_scores, key=lambda k: window_scores[k][0])
+if best_start != 1950:
+    adopt("I4 training window (model B)", {"B": window_scores[best_start][1]})
+else:
+    print("I4: starting in 1950 is already best -> nothing to adopt")
+''')
+
+md(r"""
+### I5: monotonic constraints for gradient boosting
+""")
+
+code(r'''
+# +1: higher value can only raise the chance; -1: can only lower it; 0: free.
+MONO_SIGN = {"grid": -1, "gap_q1_pct": -1, "reached_q3": 1, "drv_champ_pos": -1, "cons_points_share": 1,
+             f"drv_podium_rate_{FORM_WINDOW}": 1, f"drv_avg_finish_{FORM_WINDOW}": -1, f"cons_podium_rate_{FORM_WINDOW}": 1}
+
+
+def mono_vector(version, feats):
+    cols = PodiumPreprocessor(impute=False, cap=False, scale=False).fit(DATA[version]["train"][feats]).columns_
+    return [MONO_SIGN.get(c, 0) for c in cols]
+
+
+mono_cands, mono_rows = {}, {}
+for v in ["A", "B"]:
+    feats_v = CURRENT[v]["feats"]
+    c = {"label": "gradient boosting + monotonic constraints", "family": "gradient boosting",
+         "params": BEST[(v, "gradient boosting")]["params"], "feats": feats_v, "steps": [],
+         "start_year": CURRENT[v]["start_year"] if CURRENT[v]["family"] == "gradient boosting" else None,
+         "weights": None, "mono": mono_vector(v, feats_v), "normalise": CURRENT[v].get("normalise", False)}
+    c["pipe"] = fit_model(v, "gradient boosting", c["params"], feats_v, c["start_year"], mono=c["mono"])
+    plain = fit_model(v, "gradient boosting", c["params"], feats_v, c["start_year"])
+    mono_rows[v] = {"gradient boosting (tuned)": average_precision_score(DATA[v]["validation"]["podium"], plain.predict_proba(DATA[v]["validation"][feats_v])[:, 1]),
+                    "+ monotonic constraints": average_precision_score(DATA[v]["validation"]["podium"], c["pipe"].predict_proba(DATA[v]["validation"][feats_v])[:, 1])}
+    mono_cands[v] = c
+display(pd.DataFrame(mono_rows).round(4).rename_axis("validation PR-AUC"))
+adopt("I5 monotonic gradient boosting", mono_cands)
+''')
+
+md(r"""
+### I6: ensemble of the four tuned models
+""")
+
+code(r'''
+ens = {}
+for v in ["A", "B"]:
+    members = [fit_model(v, n, BEST[(v, n)]["params"], CURRENT[v]["feats"]) for n in FAMILIES]
+    ens[v] = {"label": "ensemble (LR + RF + GB + NN)", "members": members, "feats": CURRENT[v]["feats"],
+              "normalise": CURRENT[v].get("normalise", False)}
+adopt("I6 ensemble of four models", ens)
+
+IMPROVEMENTS_DF = pd.DataFrame(IMPROVEMENTS)
+display(IMPROVEMENTS_DF)
+print("Final model per version:", {v: (CURRENT[v]["label"], CURRENT[v]["steps"]) for v in CURRENT})
+''')
+
+md(r"""
+**What the further attempts show:** **none was adopted**; the tuned single models stay.
+- **I1 race ranks** made things worse (A −0.015, B −0.021, both intervals below 0). The absolute features already order the drivers of a race, and the ranks only add near-duplicate columns.
+- **I2 per-race normalisation** hurt clearly (A −0.070). PR-AUC ranks drivers across **all** races; rescaling each race to sum to 3 makes the 3rd-best car of a one-sided race look as likely as a real contender in an open race.
+- **I3 recency weights** helped each model family a little (e.g. gradient boosting B 0.729 → 0.732), but the best weighted model (0.734) stays below the current best model B (neural network, 0.740).
+- **I4 training window:** starting in 1950 (0.740) beats 1970 (0.723), 1980 (0.698) and 1994 (0.734). The neural network benefits from more data, even old data, thanks to the `quali_missing` flag.
+- **I5 monotonic constraints** left gradient boosting about the same for A (0.7397 → 0.7392) and a bit worse for B (0.7289 → 0.7242).
+- **I6 ensemble:** 0.739 (A) and 0.735 (B), slightly below the best single models.
+- **Conclusion:** with these 18 pre-race features, the tuned models are already close to what the data can tell. Bigger gains would need **new information** (see 6.7), not different modeling tricks.
+""")
+
+md(r"""
+## 6.6 Final comparison: train, validation and the unseen test seasons
+
+Every model is evaluated with its tuned settings and its **validation-chosen threshold**. This is the **first and only time the test seasons (2022–2024) are used**. Nothing is changed after seeing these numbers.
+""")
+
+code(r'''
+def predict(version, name, split):
+    b = BEST[(version, name)]
+    df = DATA[version][split]
+    if name == "grid only (reference)":
+        prep, lr, cols = b["ref"]
+        return lr.predict_proba(prep.transform(df[FEATS])[cols])[:, 1]
+    return b["pipe"].predict_proba(df[b["feats"]])[:, 1]
+
+
+MODEL_ORDER = ["grid only (reference)", "logistic regression", "random forest", "gradient boosting", "neural network"]
+rows = []
+for v in ["A", "B"]:
+    for name in MODEL_ORDER:
+        thr = BEST[(v, name)]["threshold"]
+        for split in ["train", "validation", "test"]:
+            df = DATA[v][split]
+            p = predict(v, name, split)
+            r = {"version": v, "model": name, "set": split, **scores(df["podium"], p, thr), "threshold": thr}
+            r["F1 (top 3 per race)"] = f1_score(df["podium"], top3_per_race(df, p))
+            rows.append(r)
+COMPARISON = pd.DataFrame(rows)
+num = ["PR-AUC", "ROC-AUC", "F1", "precision", "recall", "threshold", "F1 (top 3 per race)"]
+COMPARISON[num] = COMPARISON[num].round(3)
+for split in ["validation", "test"]:
+    display(Markdown(f"**{split.capitalize()} set**"))
+    display(COMPARISON[COMPARISON["set"] == split].drop(columns="set").reset_index(drop=True))
+display(Markdown("**Training set** (to check for overfitting)"))
+display(COMPARISON[COMPARISON["set"] == "train"].drop(columns=["set"]).reset_index(drop=True))
+''')
+
+code(r'''
+fig, axes = plt.subplots(1, 3, figsize=(18, 4.6))
+colors = dict(zip(MODEL_ORDER, ["#8C8C8C", "#4C72B0", "#55A868", "#C44E52", "#8172B3"]))
+for ax, v in zip(axes[:2], ["A", "B"]):
+    for name in MODEL_ORDER:
+        df = DATA[v]["test"]
+        prec, rec, _ = precision_recall_curve(df["podium"], predict(v, name, "test"))
+        ax.plot(rec, prec, color=colors[name], label=f"{name} ({average_precision_score(df['podium'], predict(v, name, 'test')):.3f})")
+    ax.axhline(DATA[v]["validation"]["podium"].mean(), color="black", ls=":", lw=0.8, label="random guess (val rate)")
+    ax.set_xlabel("recall")
+    ax.set_ylabel("precision")
+    ax.set_title(f"Model {v}: precision-recall on the TEST seasons")
+    ax.legend(fontsize=7, loc="lower left")
+piv = COMPARISON[COMPARISON["set"] != "train"].pivot_table(index=["model"], columns=["version", "set"], values="PR-AUC").loc[MODEL_ORDER]
+piv.plot.barh(ax=axes[2], color=["#9EB9E0", "#4C72B0", "#F2C6A0", "#DD8452"])
+axes[2].invert_yaxis()
+axes[2].set_xlim(0.5, 0.9)
+axes[2].set_xlabel("PR-AUC")
+axes[2].set_title("PR-AUC by model, version and set")
+axes[2].legend(fontsize=7, title=None)
+plt.tight_layout()
+plt.show()
+''')
+
+md(r"""
+**Results on the unseen test seasons (2022–2024):**
+- **Every model beats the grid-only reference**, by +0.06 to +0.08 PR-AUC (reference 0.647). ROC-AUC is ~0.94 for all models (reference 0.91).
+- **Model A:** logistic regression 0.710, random forest 0.706, gradient boosting 0.718, neural network 0.709. **Model B:** 0.723, 0.718, 0.721, 0.704.
+- **Test scores are 0.02–0.04 below validation.** This is expected: 2022 brought completely new car rules, and choosing the best of many settings on validation makes the validation scores slightly optimistic.
+- **A vs B:** about equal. The selected models score 0.706 (A) and 0.704 (B); the best test scores are 0.718 (A) and 0.723 (B). 50 extra seasons of older data neither help nor hurt clearly; the qualifying information (complete from 2003) matters more than more years.
+- **The model chosen on validation is not the best on test** (random forest for A, neural network for B, while gradient boosting and logistic regression score higher on test). The differences are within noise, so no model is clearly better than the others. Notably, the simple **logistic regression is as good as the complex models**, a strong point for the baseline.
+- **F1 at the validation threshold:** 0.65–0.69 on test (precision 0.61–0.66, recall 0.65–0.77). The **top 3 per race** rule gives very similar F1 (0.64–0.67), so knowing that each race has exactly 3 podiums doesn't improve the yes/no predictions.
+- **No overfitting:** training PR-AUC is not higher than validation (model A 0.70). Model B's training score is lower (0.61), because the old seasons are harder to predict (more retirements, missing qualifying).
+""")
+
+code(r'''
+# Final model per version (tuned + every adopted improvement, all decided on validation), evaluated on test once.
+final_rows = []
+for v in ["A", "B"]:
+    p_va = cur_predict(v, "validation")
+    thr = best_f1_threshold(DATA[v]["validation"]["podium"], p_va)
+    for split in ["train", "validation", "test"]:
+        df = DATA[v][split]
+        p = cur_predict(v, split)
+        final_rows.append({"version": v, "final model": CURRENT[v]["label"], "set": split,
+                           **scores(df["podium"], p, thr), "threshold": thr,
+                           "F1 (top 3 per race)": f1_score(df["podium"], top3_per_race(df, p))})
+FINAL = pd.DataFrame(final_rows)
+FINAL[num] = FINAL[num].round(3)
+print("Adopted improvements:", {v: CURRENT[v]["steps"] or "none" for v in CURRENT})
+display(FINAL)
+''')
+
+md(r"""
+**Final models** (chosen on validation, no improvement adopted):
+
+| | model A | model B |
+|---|---|---|
+| Model | random forest (depth 8, ≥ 50 rows per leaf, √features, balanced class weights) | neural network (2 hidden layers: 64 and 32, alpha 0.01) |
+| Validation PR-AUC / ROC-AUC | 0.742 / 0.935 | 0.740 / 0.940 |
+| **Test PR-AUC / ROC-AUC** | **0.706 / 0.937** | **0.704 / 0.937** |
+| Test F1 / precision / recall | 0.668 / 0.647 / 0.691 (threshold 0.754) | 0.660 / 0.659 / 0.662 (threshold 0.405) |
+
+In plain words: on races the model has never seen, about **2 out of 3 of its podium predictions are correct**, and it finds **about 2 out of 3 of the real podium finishers**. Starting position alone gets about 0.65 on both.
+""")
+
+md(r"""
+## 6.7 Limitations
+
+- **Small validation period:** 60 races give a PR-AUC uncertainty of about ±0.047. Differences between the tuned models (~0.01) are not significant, so the choice of "best model" is partly luck.
+- **Probabilities are not calibrated** for every model: the balanced-weight random forest needs a threshold of 0.75, because class weights push its probabilities up. The ranking (PR-AUC, ROC-AUC) is unaffected, but the raw probabilities should not be read as real chances without calibration.
+- **Era sensitivity:** the test seasons follow a big rule change (2022), and model B mixes very different eras; qualifying data is missing or patchy before 2003 (flagged, but not recoverable).
+- **What the features can't know:** crashes, weather, safety cars, strategy and reliability on race day. These decide many podiums and set a ceiling on any pre-race model.
+- **Data limitations from cleaning:** about 49 formation-lap non-starters may remain as starters (2.6); 1950s shared drives follow a documented proxy rule.
+- **Design choices:** no refit on train + validation before the test (cleaner, but uses less data); the neural network's early stopping holds out a random 10% of training rows (not a season-based split).
+- **Not causal:** a feature being useful to the model doesn't mean it causes podiums.
+""")
+
+
 nb = {
     "cells": cells,
     "metadata": {

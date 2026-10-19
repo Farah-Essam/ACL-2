@@ -1,0 +1,158 @@
+{
+ "model_base": {
+  "raceId": "Int64",
+  "driverId": "Int64",
+  "constructorId": "Int64",
+  "year": "Int64",
+  "round": "Int64",
+  "date": "datetime64[ns]",
+  "circuitId": "Int64",
+  "grid": "Int64",
+  "pit_lane_start": "boolean",
+  "podium": "int8"
+ },
+ "results_full": {
+  "resultId": "Int64",
+  "raceId": "Int64",
+  "driverId": "Int64",
+  "constructorId": "Int64",
+  "number": "Int64",
+  "grid": "Int64",
+  "positionOrder": "Int64",
+  "points": "float64",
+  "laps": "Int64",
+  "milliseconds": "Int64",
+  "fastestLap": "Int64",
+  "rank": "Int64",
+  "fastestLapSpeed": "float64",
+  "statusId": "Int64",
+  "fastestLapTime_sec": "float64",
+  "status": "object",
+  "status_category": "object",
+  "podium": "int8",
+  "pit_lane_start": "boolean",
+  "year": "Int64",
+  "round": "Int64",
+  "date": "datetime64[ns]",
+  "circuitId": "Int64",
+  "race_name": "object"
+ },
+ "results": {
+  "resultId": "Int64",
+  "raceId": "Int64",
+  "driverId": "Int64",
+  "constructorId": "Int64",
+  "number": "Int64",
+  "grid": "Int64",
+  "positionOrder": "Int64",
+  "points": "float64",
+  "laps": "Int64",
+  "milliseconds": "Int64",
+  "fastestLap": "Int64",
+  "rank": "Int64",
+  "fastestLapSpeed": "float64",
+  "statusId": "Int64",
+  "fastestLapTime_sec": "float64",
+  "status": "object",
+  "status_category": "object",
+  "podium": "int8",
+  "pit_lane_start": "boolean"
+ },
+ "qualifying": {
+  "qualifyId": "Int64",
+  "raceId": "Int64",
+  "driverId": "Int64",
+  "number": "Int64",
+  "position": "Int64",
+  "q1_sec": "float64",
+  "q2_sec": "float64",
+  "q3_sec": "float64"
+ },
+ "races": {
+  "raceId": "Int64",
+  "year": "Int64",
+  "round": "Int64",
+  "circuitId": "Int64",
+  "name": "object",
+  "date": "datetime64[ns]",
+  "start_utc": "datetime64[ns]"
+ },
+ "drivers": {
+  "driverId": "Int64",
+  "driverRef": "object",
+  "forename": "object",
+  "surname": "object",
+  "dob": "datetime64[ns]",
+  "nationality": "object",
+  "home_country": "object"
+ },
+ "constructors": {
+  "constructorId": "Int64",
+  "constructorRef": "object",
+  "name": "object",
+  "nationality": "object"
+ },
+ "circuits": {
+  "circuitId": "Int64",
+  "name": "object",
+  "location": "object",
+  "country": "object"
+ },
+ "status": {
+  "statusId": "Int64",
+  "status": "object",
+  "status_category": "object"
+ },
+ "driver_standings": {
+  "driverStandingsId": "Int64",
+  "raceId": "Int64",
+  "driverId": "Int64",
+  "points": "float64",
+  "position": "Int64",
+  "wins": "Int64"
+ },
+ "constructor_standings": {
+  "constructorStandingsId": "Int64",
+  "raceId": "Int64",
+  "constructorId": "Int64",
+  "points": "float64",
+  "position": "Int64",
+  "wins": "Int64"
+ },
+ "driver_standings_prerace": {
+  "raceId": "Int64",
+  "driverId": "Int64",
+  "pre_points": "float64",
+  "pre_position": "Int64",
+  "pre_wins": "Int64"
+ },
+ "constructor_standings_prerace": {
+  "raceId": "Int64",
+  "constructorId": "Int64",
+  "pre_points": "float64",
+  "pre_position": "Int64",
+  "pre_wins": "Int64"
+ },
+ "sprint_results": {
+  "resultId": "Int64",
+  "raceId": "Int64",
+  "driverId": "Int64",
+  "constructorId": "Int64",
+  "number": "Int64",
+  "grid": "Int64",
+  "positionOrder": "Int64",
+  "points": "float64",
+  "laps": "Int64",
+  "milliseconds": "Int64",
+  "fastestLap": "Int64",
+  "statusId": "Int64",
+  "fastestLapTime_sec": "float64",
+  "pit_lane_start": "boolean"
+ },
+ "constructor_results": {
+  "constructorResultsId": "Int64",
+  "raceId": "Int64",
+  "constructorId": "Int64",
+  "points": "float64"
+ }
+}
